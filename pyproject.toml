@@ -1,0 +1,106 @@
+[project]
+name = "z4j-brain"
+version = "1.0.1"
+description = "z4j brain - server, dashboard, and API (AGPL v3)"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "AGPL-3.0-or-later" }
+authors = [{ name = "z4j contributors" }]
+keywords = ["z4j", "brain", "task", "control-plane", "celery"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Framework :: FastAPI",
+    "Intended Audience :: Developers",
+    "Intended Audience :: System Administrators",
+    "License :: OSI Approved :: GNU Affero General Public License v3 or later (AGPLv3+)",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: System :: Distributed Computing",
+    "Topic :: System :: Monitoring",
+    "Topic :: System :: Systems Administration",
+    "Typing :: Typed",
+]
+dependencies = [
+    "z4j-core",
+    "fastapi>=0.136",
+    "uvicorn[standard]>=0.45",
+    "pydantic[email]>=2.13.3",
+    "pydantic-settings>=2.14",
+    "sqlalchemy[asyncio]>=2.0.49",
+    "alembic>=1.18.4",
+    "websockets>=16",
+    "httpx>=0.28.1",
+    "argon2-cffi>=25.1",
+    "structlog>=25.5",
+    "prometheus-client>=0.25",
+    "python-multipart>=0.0.26",
+    "itsdangerous>=2.2",
+    "aiosqlite>=0.22.1",
+    # Tasks-page xlsx export. Pure Python, write-only, ~1 MB, no
+    # native deps, no optional extra needed - operators who want
+    # xlsx output just get it. We specifically do NOT use
+    # ``openpyxl`` (read+write, ~5 MB with et_xmlfile / jdcal)
+    # because z4j's use case is export-only; xlsxwriter is the
+    # boring choice pandas itself ships as its default xlsx
+    # engine.
+    "xlsxwriter>=3.2.9",
+]
+
+[project.optional-dependencies]
+postgres = [
+    "asyncpg>=0.31",
+]
+test = [
+    "pytest>=9.0.3",
+    "pytest-asyncio>=1.3.0",
+    "pytest-cov>=7.1.0",
+    "httpx>=0.28.1",
+    "aiosqlite>=0.22.1",
+    "freezegun>=1.5.5",
+    "hypothesis>=6.152.1",
+]
+test-integration = [
+    "testcontainers[postgres]>=4.14.2",
+    "psycopg[binary]>=3.3.3",
+]
+
+[project.scripts]
+z4j-brain = "z4j_brain.cli:main"
+
+[project.urls]
+Homepage = "https://z4j.com"
+Source = "https://github.com/z4jdev/z4j-brain"
+Documentation = "https://z4j.dev"
+Issues = "https://github.com/z4jdev/z4j-brain/issues"
+Changelog = "https://github.com/z4jdev/z4j-brain/blob/main/CHANGELOG.md"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+# Bundle the built dashboard SPA into BOTH the sdist and the wheel.
+# ``make dash-bundle`` copies ``packages/z4j-brain/dashboard/dist``
+# into ``backend/src/z4j_brain/dashboard/dist`` before build, but
+# ``dist/`` is gitignored repo-wide so hatchling filters it by
+# default. The build-wide ``artifacts`` directive lifts that filter
+# for both the sdist and the wheel, which matters because
+# ``uv build`` goes sdist-first (wheel from extracted sdist) - the
+# dashboard has to survive the sdist for the wheel to see it.
+# Without this, ``pip install z4j-brain`` lands Python code only
+# and ``z4j-brain serve`` 404s on ``/`` because there's no SPA to
+# serve. The brain's main.py has a fallback that looks for the
+# bundled dist next to the installed z4j_brain module.
+[tool.hatch.build]
+artifacts = [
+  "backend/src/z4j_brain/dashboard/**",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["backend/src/z4j_brain"]
+
+[tool.hatch.build.targets.wheel.sources]
+"backend/src" = ""

@@ -1,0 +1,957 @@
+"""Notification delivery channels.
+
+Each channel is a small async function that takes a config dict
+(from NotificationChannel.config) and a payload dict (the
+notification body), delivers the notification, and returns a
+:class:`DeliveryResult`.
+
+Channels are stateless - they don't hold connections or sessions.
+The NotificationService constructs a fresh delivery on every fire.
+Retry logic is owned by the service, not the channel.
+
+Channel config shapes:
+
+- webhook: {"url": "https://...", "headers": {"X-Custom": "val"},
+            "hmac_secret": "optional-secret-for-signing"}
+- email:   {"smtp_host": "smtp.gmail.com", "smtp_port": 587,
+            "smtp_user": "...", "smtp_pass": "...",
+            "smtp_tls": true, "from_addr": "alerts@example.com",
+            "to_addrs": ["ops@example.com"]}
+- slack:   {"webhook_url": "https://hooks.slack.com/services/..."}
+- telegram: {"bot_token": "123456:ABC-DEF", "chat_id": "-100123456"}
+"""
+
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import hmac
+import ipaddress
+import re
+import json
+import logging
+import socket
+import time
+from dataclasses import dataclass
+from typing import Any
+from urllib.parse import urlparse
+
+import httpx
+
+logger = logging.getLogger("z4j.brain.notifications.channels")
+
+#: Timeout for all outbound HTTP requests from notification channels.
+_TIMEOUT = httpx.Timeout(10.0, connect=5.0)
+
+# ---------------------------------------------------------------------------
+# Shared HTTP client (PERF-04).
+# ---------------------------------------------------------------------------
+#
+# The FastAPI lifespan installs a single ``httpx.AsyncClient`` at startup
+# and calls :func:`set_shared_client` with it. Dispatchers then use
+# :func:`_post` which reuses that pooled client (keep-alive + connection
+# pool) instead of building a fresh TCP+TLS connection for every
+# delivery. Tests and CLI paths that don't run the lifespan fall back
+# to an ad-hoc short-lived client.
+_shared_client: httpx.AsyncClient | None = None
+
+
+def set_shared_client(client: httpx.AsyncClient | None) -> None:
+    """Install (or clear) the process-wide shared HTTP client.
+
+    Called from the FastAPI lifespan at startup with the pooled
+    client, and again at shutdown with ``None``.
+    """
+    global _shared_client
+    _shared_client = client
+
+
+#: Hard cap on response body bytes we read from a webhook target.
+#: Hostile webhooks could otherwise stream multi-GB responses
+#: within the request timeout window and exhaust dispatcher
+#: memory (R3 finding M14). 8 KiB is more than enough to capture
+#: a useful error message.
+_MAX_RESPONSE_BYTES = 8 * 1024
+
+
+async def resolve_and_pin(url: str) -> tuple[str | None, str | None]:
+    """Validate + return ``(error, safe_ip)``.
+
+    Runs the same static URL checks + DNS-then-block-list
+    validation as :func:`validate_webhook_url`, but also returns
+    the first **safe resolved IP** so callers can connect to that
+    exact IP instead of re-resolving the hostname at request time.
+
+    This closes the DNS-rebinding window (R3 finding M15) - an
+    attacker who controls a domain's DNS and flips the A record
+    between validation and the actual HTTP connection would
+    otherwise get a private IP dialled despite the upfront check.
+    By pinning the validated IP, the connect step cannot be
+    redirected by DNS.
+    """
+    static_error, hostname = _static_url_checks(url)
+    if static_error is not None:
+        return static_error, None
+    assert hostname is not None
+
+    ips = await _resolve_cached(hostname)
+    if not ips:
+        return f"cannot resolve hostname '{hostname}'", None
+
+    safe_ip: str | None = None
+    for raw_ip in ips:
+        try:
+            ip = ipaddress.ip_address(raw_ip)
+        except ValueError:
+            continue
+        blocked = False
+        for network in _BLOCKED_NETWORKS:
+            if ip in network:
+                blocked = True
+                return (
+                    f"target IP {ip} is in blocked range {network}",
+                    None,
+                )
+        if not blocked and safe_ip is None:
+            safe_ip = raw_ip
+    if safe_ip is None:
+        return f"no usable IP resolved for '{hostname}'", None
+    return None, safe_ip
+
+
+def _pin_url_to_ip(url: str, safe_ip: str) -> tuple[httpx.URL, str, int]:
+    """Return ``(pinned_url, original_host, port)``.
+
+    Rewrites the URL's host to the already-validated IP so the TCP
+    connect targets exactly that IP. Callers still set the
+    ``Host`` header + ``sni_hostname`` extension to the original
+    hostname so virtual-host routing and TLS SNI / certificate
+    verification keep working against the real domain, not the IP.
+    """
+    parsed = httpx.URL(url)
+    original_host = parsed.host
+    scheme = parsed.scheme or "https"
+    default_port = 443 if scheme == "https" else 80
+    port = parsed.port or default_port
+    # Bracket IPv6 literals for the URL host field.
+    ip_for_url = f"[{safe_ip}]" if ":" in safe_ip else safe_ip
+    pinned = parsed.copy_with(host=ip_for_url)
+    return pinned, original_host, port
+
+
+async def _post(
+    url: str,
+    *,
+    pin_ip: str | None = None,
+    **kwargs: Any,
+) -> httpx.Response:
+    """POST ``url`` and return the response with body bounded.
+
+    Uses httpx's streaming mode so an attacker-controlled webhook
+    target streaming gigabytes back hits our ``_MAX_RESPONSE_BYTES``
+    cap instead of buffering the whole response into memory. The
+    returned response has its ``.content`` already populated with
+    the truncated bytes so callers can use ``resp.text`` /
+    ``resp.json()`` normally - they just see at most
+    ``_MAX_RESPONSE_BYTES`` of it.
+
+    When ``pin_ip`` is provided, the TCP connect targets that
+    exact IP (DNS-rebinding defence, M15). The ``Host`` header
+    and TLS ``sni_hostname`` extension are set to the original
+    URL's hostname so virtual-host routing and TLS cert
+    verification keep working against the real domain.
+    """
+    headers = kwargs.pop("headers", None) or {}
+    request_url = url
+    extensions: dict[str, Any] = {}
+    if pin_ip is not None:
+        pinned, original_host, _port = _pin_url_to_ip(url, pin_ip)
+        request_url = str(pinned)
+        # Only set Host header if the caller hasn't already - otherwise
+        # we'd clobber an intentional override.
+        headers = {"Host": original_host, **headers}
+        # Tell httpx/httpcore to use the original hostname for TLS
+        # SNI AND for certificate hostname verification, even
+        # though the socket connects to ``safe_ip``.
+        extensions = {"sni_hostname": original_host}
+
+    client_owner: httpx.AsyncClient
+    using_shared = _shared_client is not None
+    if using_shared:
+        client_owner = _shared_client  # type: ignore[assignment]
+    else:
+        client_owner = httpx.AsyncClient(
+            timeout=_TIMEOUT,
+            follow_redirects=False,
+        )
+    try:
+        req = client_owner.build_request(
+            "POST",
+            request_url,
+            headers=headers,
+            extensions=extensions or None,
+            **kwargs,
+        )
+        resp = await client_owner.send(req, stream=True)
+        try:
+            buf = bytearray()
+            async for chunk in resp.aiter_raw():
+                buf.extend(chunk)
+                if len(buf) >= _MAX_RESPONSE_BYTES:
+                    del buf[_MAX_RESPONSE_BYTES:]
+                    break
+        finally:
+            await resp.aclose()
+        # Re-attach the bounded body so callers can use the public
+        # httpx API (``resp.text``, ``resp.json()``) without
+        # touching the streaming machinery themselves.
+        resp = httpx.Response(
+            status_code=resp.status_code,
+            headers=resp.headers,
+            content=bytes(buf),
+            request=req,
+        )
+        return resp
+    finally:
+        if not using_shared:
+            await client_owner.aclose()
+
+#: Allowed URL schemes for webhook targets.
+_ALLOWED_SCHEMES = frozenset({"https", "http"})
+
+#: Private/reserved IP ranges that must never be targeted by webhooks.
+_BLOCKED_NETWORKS = [
+    ipaddress.ip_network("0.0.0.0/8"),        # "this network" (RFC 1122)
+    ipaddress.ip_network("10.0.0.0/8"),
+    ipaddress.ip_network("172.16.0.0/12"),
+    ipaddress.ip_network("192.168.0.0/16"),
+    ipaddress.ip_network("127.0.0.0/8"),
+    ipaddress.ip_network("169.254.0.0/16"),  # link-local / AWS metadata
+    ipaddress.ip_network("::/128"),           # IPv6 unspecified
+    ipaddress.ip_network("::1/128"),
+    ipaddress.ip_network("fc00::/7"),  # IPv6 private
+    ipaddress.ip_network("fe80::/10"),  # IPv6 link-local
+]
+
+
+def _static_url_checks(url: str) -> tuple[str | None, str | None]:
+    """Cheap URL checks that don't require DNS.
+
+    Returns ``(error, hostname)``. If ``error`` is non-None the URL
+    is rejected without a DNS lookup (faster for validation paths).
+    """
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return "invalid URL", None
+
+    if parsed.scheme not in _ALLOWED_SCHEMES:
+        return f"scheme '{parsed.scheme}' not allowed (use http or https)", None
+
+    hostname = parsed.hostname
+    if not hostname:
+        return "URL has no hostname", None
+
+    return None, hostname
+
+
+# Short-lived in-process DNS cache (PERF-05). Keyed by hostname,
+# value is (expires_monotonic, [ip_strings]). Empty list = NXDOMAIN /
+# resolver failure (so repeated misses are also cached briefly).
+_DNS_CACHE: dict[str, tuple[float, list[str]]] = {}
+_DNS_TTL = 30.0
+
+
+async def _resolve_cached(hostname: str) -> list[str]:
+    """Resolve ``hostname`` with a short TTL cache.
+
+    Returns a list of IP strings (may be empty if resolution failed).
+    Uses ``asyncio.to_thread`` so the event loop never blocks on a
+    slow resolver. Cache hits return without crossing the GIL.
+    """
+    now = time.monotonic()
+    entry = _DNS_CACHE.get(hostname)
+    if entry is not None and entry[0] > now:
+        return entry[1]
+    try:
+        infos = await asyncio.to_thread(
+            socket.getaddrinfo, hostname, None, socket.AF_UNSPEC,
+        )
+    except socket.gaierror:
+        _DNS_CACHE[hostname] = (now + _DNS_TTL, [])
+        return []
+    ips: list[str] = []
+    for _family, _type, _proto, _canonname, sockaddr in infos:
+        ips.append(sockaddr[0])
+    _DNS_CACHE[hostname] = (now + _DNS_TTL, ips)
+    return ips
+
+
+async def validate_webhook_url(url: str) -> str | None:
+    """Validate a webhook URL is safe to request (async-safe).
+
+    Returns an error string if the URL is blocked, or None if safe.
+    Blocks private IPs, loopback, link-local, and non-HTTP(S) schemes.
+
+    Uses ``getaddrinfo`` via ``asyncio.to_thread`` (cached for a short
+    TTL) so the event loop is not blocked on slow DNS resolvers and
+    bursts of deliveries to the same host hit the cache.
+
+    Limitation: DNS rebinding attacks are possible if an attacker
+    controls a domain's DNS and changes the A record between
+    validation and the actual HTTP request. The httpx client is
+    configured with ``follow_redirects=False`` to prevent
+    redirect-based SSRF. Full DNS pinning would require a custom
+    httpx transport.
+    """
+    static_error, hostname = _static_url_checks(url)
+    if static_error is not None:
+        return static_error
+    assert hostname is not None
+
+    ips = await _resolve_cached(hostname)
+    if not ips:
+        return f"cannot resolve hostname '{hostname}'"
+
+    for raw_ip in ips:
+        try:
+            ip = ipaddress.ip_address(raw_ip)
+        except ValueError:
+            continue
+        for network in _BLOCKED_NETWORKS:
+            if ip in network:
+                return f"target IP {ip} is in blocked range {network}"
+
+    return None
+
+
+#: Telegram bot-token shape: ``<numeric-id>:<base62-secret>``.
+#: Forbids ``@``, ``/``, ``.`` etc. so a malformed token cannot
+#: smuggle ``user@attacker.internal:8080/x`` into the URL that
+#: ``deliver_telegram`` constructs. Match-exact (fullmatch) -
+#: trailing whitespace, newlines, or null bytes are rejected.
+_TELEGRAM_BOT_TOKEN_RE = re.compile(r"^\d+:[A-Za-z0-9_-]+$")
+
+#: Telegram chat_id shape: signed integer (groups can be negative)
+#: or ``@channel_handle``. Anything else would affect URL parsing.
+_TELEGRAM_CHAT_ID_RE = re.compile(r"^(-?\d+|@[A-Za-z0-9_]+)$")
+
+
+def validate_telegram_config(config: dict[str, Any]) -> str | None:
+    """Validate a telegram channel config. Returns None if safe.
+
+    Closes the userinfo-smuggling SSRF: without strict validation
+    an admin could supply ``bot_token = "123:abc@attacker.internal:8080/x"``,
+    which httpx parses as userinfo and dials the attacker's host.
+    Both the project-admin-managed channel path and the user-
+    managed channel path MUST call this - the earlier code only
+    wired it into the project path (external audit High #2).
+    """
+    bot_token = config.get("bot_token")
+    if bot_token is not None:
+        if not isinstance(bot_token, str) or not _TELEGRAM_BOT_TOKEN_RE.fullmatch(
+            bot_token,
+        ):
+            return "telegram bot_token must match \\d+:[A-Za-z0-9_-]+"
+    chat_id = config.get("chat_id")
+    if chat_id is not None:
+        if isinstance(chat_id, int):
+            chat_id = str(chat_id)
+        if not isinstance(chat_id, str) or not _TELEGRAM_CHAT_ID_RE.fullmatch(
+            chat_id,
+        ):
+            return (
+                "telegram chat_id must be a signed integer "
+                "or @-prefixed handle"
+            )
+    return None
+
+
+#: Ports we permit for SMTP delivery. Standard SMTP ports - a few
+#: common + the Postfix submission port. Rejects Redis (6379),
+#: Postgres (5432), SSH (22), HTTP admin panels (8000-8999),
+#: cloud metadata (80 on 169.254.169.254), etc.
+_SMTP_PORT_ALLOWLIST: frozenset[int] = frozenset({
+    25,   # classic SMTP (rare for egress but kept for legacy)
+    465,  # SMTPS (implicit TLS)
+    587,  # submission port (STARTTLS) - the modern default
+    2525, # common alternate for residential ISPs / cloud providers
+})
+
+
+async def validate_smtp_config(config: dict[str, Any]) -> str | None:
+    """Validate an email/SMTP channel config. Returns None if safe.
+
+    Email channels were an unrestricted server-side egress
+    primitive - any authenticated user who could create a
+    personal email channel got a blind internal-network
+    reachability tool because dispatch ``aiosmtplib.send(hostname=host,
+    port=port, ...)`` ran against arbitrary host/port values.
+    This validator refuses:
+
+    - Non-string / empty ``smtp_host``
+    - Private / loopback / link-local IPs (via the same
+      ``_BLOCKED_NETWORKS`` guard used for webhook URLs)
+    - Non-standard ``smtp_port`` (allowlist above)
+
+    Called by both the project-channel and user-channel validators
+    (external audit High #3).
+    """
+    host = config.get("smtp_host")
+    if host is not None:
+        if not isinstance(host, str) or not host.strip():
+            return "smtp_host is required"
+        # Reject literal IP targeting private / loopback ranges.
+        # A hostname is resolved via the same DNS cache we use
+        # for webhook URLs - reuses the existing guard.
+        stripped = host.strip()
+        try:
+            ip = ipaddress.ip_address(stripped)
+        except ValueError:
+            ip = None
+        if ip is not None:
+            for network in _BLOCKED_NETWORKS:
+                if ip in network:
+                    return f"smtp_host IP {ip} is in blocked range {network}"
+        else:
+            # Resolve + check every A/AAAA. Same pattern as
+            # ``validate_webhook_url``.
+            ips = await _resolve_cached(stripped)
+            if not ips:
+                return f"cannot resolve smtp_host '{stripped}'"
+            for raw_ip in ips:
+                try:
+                    resolved = ipaddress.ip_address(raw_ip)
+                except ValueError:
+                    continue
+                for network in _BLOCKED_NETWORKS:
+                    if resolved in network:
+                        return (
+                            f"smtp_host '{stripped}' resolves to {resolved} "
+                            f"in blocked range {network}"
+                        )
+    port_raw = config.get("smtp_port")
+    if port_raw is not None:
+        try:
+            port = int(port_raw)
+        except (TypeError, ValueError):
+            return "smtp_port must be an integer"
+        if port not in _SMTP_PORT_ALLOWLIST:
+            return (
+                f"smtp_port {port} is not in the allowlist "
+                f"{sorted(_SMTP_PORT_ALLOWLIST)}"
+            )
+    return None
+
+
+# Synchronous alias used by legacy dispatcher paths. New code should
+# prefer :func:`validate_webhook_url` so the event loop is not blocked
+# on DNS.
+def _validate_webhook_url(url: str) -> str | None:
+    static_error, hostname = _static_url_checks(url)
+    if static_error is not None:
+        return static_error
+    assert hostname is not None
+    try:
+        resolved = socket.getaddrinfo(hostname, None, socket.AF_UNSPEC)
+    except socket.gaierror:
+        return f"cannot resolve hostname '{hostname}'"
+    for _family, _type, _proto, _canonname, sockaddr in resolved:
+        try:
+            ip = ipaddress.ip_address(sockaddr[0])
+        except ValueError:
+            continue
+        for network in _BLOCKED_NETWORKS:
+            if ip in network:
+                return f"target IP {ip} is in blocked range {network}"
+    return None
+
+
+# Header names that are NEVER allowed to be set by user config.
+# Prevents auth-header injection and request-smuggling tricks.
+_BLOCKED_HEADER_NAMES = frozenset({
+    "host",
+    "authorization",
+    "cookie",
+    "proxy-authorization",
+    "x-forwarded-for",
+    "x-forwarded-host",
+    "x-forwarded-proto",
+    "x-real-ip",
+    "content-length",
+    "transfer-encoding",
+    "connection",
+    "upgrade",
+    "te",
+})
+
+
+def validate_webhook_headers(
+    headers: dict[str, Any] | None,
+) -> tuple[str | None, dict[str, str]]:
+    """Sanitize a user-supplied custom-header dict.
+
+    Returns ``(error, safe_headers)``. Rejects reserved / hop-by-hop
+    / auth headers, and any key or value containing CR/LF. Caps the
+    total number of headers and total size.
+    """
+    if not headers:
+        return None, {}
+    if not isinstance(headers, dict):
+        return "custom headers must be a JSON object", {}
+    if len(headers) > 20:
+        return "too many custom headers (max 20)", {}
+
+    safe: dict[str, str] = {}
+    for key, value in headers.items():
+        if not isinstance(key, str) or not isinstance(value, (str, int, float)):
+            return f"header '{key}' has unsupported type", {}
+        name = key.strip()
+        val = str(value)
+        if not name:
+            return "custom header name is empty", {}
+        if name.lower() in _BLOCKED_HEADER_NAMES:
+            return f"header '{name}' is reserved and cannot be set", {}
+        if "\r" in name or "\n" in name or "\r" in val or "\n" in val:
+            return f"header '{name}' contains CR/LF", {}
+        if len(name) > 100 or len(val) > 1024:
+            return f"header '{name}' exceeds size limit", {}
+        safe[name] = val
+    return None, safe
+
+
+@dataclass(frozen=True, slots=True)
+class DeliveryResult:
+    """Outcome of a single delivery attempt."""
+
+    success: bool
+    status_code: int | None = None
+    response_body: str | None = None
+    error: str | None = None
+
+
+# ---------------------------------------------------------------------------
+# Webhook
+# ---------------------------------------------------------------------------
+
+
+async def deliver_webhook(
+    config: dict[str, Any],
+    payload: dict[str, Any],
+) -> DeliveryResult:
+    """POST JSON payload to the configured URL.
+
+    If ``hmac_secret`` is set in the config, the request body is
+    signed with HMAC-SHA256 and the signature is sent in the
+    ``X-Z4J-Signature`` header so the receiver can verify
+    authenticity.
+    """
+    url = config.get("url", "")
+    if not url:
+        return DeliveryResult(success=False, error="webhook URL is empty")
+
+    # SSRF protection: validate scheme and block private/internal IPs.
+    # Uses the async-safe validator so DNS lookup does not block the
+    # event loop.
+    ssrf_error = await validate_webhook_url(url)
+    if ssrf_error:
+        return DeliveryResult(success=False, error=f"blocked: {ssrf_error}")
+
+    # Sanitize user-supplied headers at dispatch (the create/update
+    # endpoints also reject these, but we re-validate in case a row
+    # predates the validation).
+    header_error, safe_custom_headers = validate_webhook_headers(
+        config.get("headers"),
+    )
+    if header_error:
+        return DeliveryResult(
+            success=False,
+            error=f"blocked: unsafe headers: {header_error}",
+        )
+
+    body = json.dumps(payload, default=str, ensure_ascii=False)
+    headers: dict[str, str] = {
+        "Content-Type": "application/json",
+        "User-Agent": "z4j-brain/notification-webhook",
+        **safe_custom_headers,
+    }
+
+    hmac_secret = config.get("hmac_secret")
+    if hmac_secret:
+        sig = hmac.new(
+            hmac_secret.encode("utf-8"),
+            body.encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
+        headers["X-Z4J-Signature"] = f"sha256={sig}"
+
+    try:
+        # Re-validate + pin the target IP at dispatch time (M15
+        # DNS-rebinding defence). Even though the config was
+        # validated at PATCH/POST time, an attacker who controls
+        # the hostname's DNS could flip the A record between
+        # then and now - so we resolve again and connect to the
+        # safe IP directly.
+        err, safe_ip = await resolve_and_pin(url)
+        if err is not None:
+            return DeliveryResult(
+                success=False, error=f"unsafe URL at dispatch: {err}",
+            )
+        resp = await _post(
+            url, content=body, headers=headers, pin_ip=safe_ip,
+        )
+        return DeliveryResult(
+            success=200 <= resp.status_code < 300,
+            status_code=resp.status_code,
+            response_body=resp.text[:1000],
+        )
+    except Exception as exc:
+        return DeliveryResult(success=False, error=str(exc)[:500])
+
+
+# ---------------------------------------------------------------------------
+# Email (SMTP - bring your own credentials)
+# ---------------------------------------------------------------------------
+
+
+async def deliver_email(
+    config: dict[str, Any],
+    payload: dict[str, Any],
+) -> DeliveryResult:
+    """Send an email via SMTP.
+
+    Uses ``aiosmtplib`` for async delivery. Supports STARTTLS
+    (port 587, the Gmail app-password flow) and implicit TLS
+    (port 465). No OAuth - just SMTP credentials.
+    """
+    try:
+        import aiosmtplib
+        from email.mime.text import MIMEText
+    except ImportError:
+        return DeliveryResult(
+            success=False,
+            error="aiosmtplib is not installed; email notifications unavailable",
+        )
+
+    host = config.get("smtp_host", "")
+    port = int(config.get("smtp_port", 587))
+    user = config.get("smtp_user", "")
+    password = config.get("smtp_pass", "")
+    use_tls = config.get("smtp_tls", True)
+    from_addr = config.get("from_addr", user)
+    # Transactional path: payload.to_addrs overrides the channel's
+    # configured recipients. Used for invitation emails + password
+    # reset - the recipient is the user being invited/reset, not
+    # the channel's default alert list.
+    to_addrs = payload.get("to_addrs") or config.get("to_addrs", [])
+
+    if not host or not to_addrs:
+        return DeliveryResult(success=False, error="SMTP config incomplete")
+
+    # DNS-rebinding defence at dispatch time (R5 H2). The SMTP
+    # dispatch used to do a fresh DNS resolution in
+    # ``aiosmtplib.send`` which bypassed the PATCH-time
+    # validation. We resolve+validate here so the TCP connect
+    # targets a pre-checked public IP, not whatever the
+    # resolver hands us now. TLS hostname verification still
+    # uses the original ``host`` value (passed as the
+    # ``server_hostname`` in the start_tls context below).
+    try:
+        import ipaddress as _ipaddress
+
+        resolved_host = host
+        try:
+            already_ip = _ipaddress.ip_address(host.strip())
+        except ValueError:
+            already_ip = None
+        if already_ip is None:
+            ips = await _resolve_cached(host)
+            safe_ip: str | None = None
+            for raw_ip in ips:
+                try:
+                    parsed_ip = _ipaddress.ip_address(raw_ip)
+                except ValueError:
+                    continue
+                blocked = any(
+                    parsed_ip in net for net in _BLOCKED_NETWORKS
+                )
+                if blocked:
+                    return DeliveryResult(
+                        success=False,
+                        error=(
+                            f"smtp_host '{host}' resolved to "
+                            f"blocked IP {parsed_ip} at dispatch"
+                        ),
+                    )
+                if safe_ip is None:
+                    safe_ip = raw_ip
+            if safe_ip is None:
+                return DeliveryResult(
+                    success=False,
+                    error=f"smtp_host '{host}' did not resolve",
+                )
+            resolved_host = safe_ip
+    except Exception as exc:  # noqa: BLE001
+        return DeliveryResult(
+            success=False, error=f"smtp_host validation failed: {exc}",
+        )
+
+    subject = _build_email_subject(payload)
+    body_text = _build_email_body(payload)
+
+    msg = MIMEText(body_text, "plain", "utf-8")
+    msg["Subject"] = subject
+    msg["From"] = from_addr
+    msg["To"] = ", ".join(to_addrs)
+
+    try:
+        # Dial ``resolved_host`` (the IP we just validated) but
+        # pass the original ``host`` as ``tls_hostname`` so TLS
+        # cert verification still checks the real hostname.
+        # aiosmtplib supports both ``hostname`` (socket target)
+        # and ``tls_hostname`` (SNI + cert verify) as of 3.0.
+        await aiosmtplib.send(
+            msg,
+            hostname=resolved_host,
+            port=port,
+            username=user or None,
+            password=password or None,
+            start_tls=use_tls,
+            timeout=10,
+            tls_hostname=host if resolved_host != host else None,
+        )
+        return DeliveryResult(success=True, status_code=250)
+    except TypeError:
+        # Older aiosmtplib (pre-3.0) lacks ``tls_hostname`` -
+        # fall back to the pre-M15 behaviour. Private-IP block
+        # at validation time still protects against the usual
+        # case; DNS rebinding between PATCH and dispatch
+        # degrades to the earlier "mostly safe" posture.
+        try:
+            await aiosmtplib.send(
+                msg,
+                hostname=resolved_host,
+                port=port,
+                username=user or None,
+                password=password or None,
+                start_tls=use_tls,
+                timeout=10,
+            )
+            return DeliveryResult(success=True, status_code=250)
+        except Exception as exc:
+            return DeliveryResult(success=False, error=str(exc)[:500])
+    except Exception as exc:
+        return DeliveryResult(success=False, error=str(exc)[:500])
+
+
+def _build_email_subject(payload: dict[str, Any]) -> str:
+    # Transactional-email path (invitations / password reset / setup):
+    # the caller provides an explicit subject. Fall through to the
+    # task-notification template when absent.
+    override = payload.get("subject")
+    if override:
+        return str(override)[:200]
+    trigger = payload.get("trigger", "notification")
+    task_name = payload.get("task_name", "")
+    priority = payload.get("priority", "normal")
+    prefix = f"[{priority.upper()}] " if priority != "normal" else ""
+    return f"{prefix}z4j: {trigger} - {task_name}" if task_name else f"{prefix}z4j: {trigger}"
+
+
+def _build_email_body(payload: dict[str, Any]) -> str:
+    # Transactional path: the caller provides a pre-formatted body.
+    override = payload.get("body")
+    if override:
+        return str(override)
+    lines = [
+        f"Trigger: {payload.get('trigger', '?')}",
+        f"Task: {payload.get('task_name', '?')}",
+        f"Task ID: {payload.get('task_id', '?')}",
+        f"Priority: {payload.get('priority', 'normal')}",
+        f"State: {payload.get('state', '?')}",
+        f"Project: {payload.get('project_slug', '?')}",
+    ]
+    exception = payload.get("exception")
+    if exception:
+        lines.append(f"\nException: {exception}")
+    traceback = payload.get("traceback")
+    if traceback:
+        lines.append(f"\nTraceback:\n{traceback[:2000]}")
+    lines.append(f"\n- z4j notification engine")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Slack (incoming webhook - no OAuth needed)
+# ---------------------------------------------------------------------------
+
+
+async def deliver_slack(
+    config: dict[str, Any],
+    payload: dict[str, Any],
+) -> DeliveryResult:
+    """POST a Block Kit message to a Slack incoming webhook URL."""
+    webhook_url = config.get("webhook_url", "")
+    if not webhook_url:
+        return DeliveryResult(success=False, error="Slack webhook URL is empty")
+
+    # SSRF protection - Slack webhooks live at hooks.slack.com, but
+    # since config is user-controlled we still run the same checks
+    # that the webhook dispatcher does.
+    ssrf_error = await validate_webhook_url(webhook_url)
+    if ssrf_error:
+        return DeliveryResult(success=False, error=f"blocked: {ssrf_error}")
+
+    trigger = payload.get("trigger", "notification")
+    task_name = payload.get("task_name", "")
+    priority = payload.get("priority", "normal")
+    state = payload.get("state", "")
+    task_id = payload.get("task_id", "")
+
+    emoji = {"critical": "🔴", "high": "🟠", "normal": "🔵", "low": "⚪"}.get(
+        priority, "🔵",
+    )
+
+    blocks = [
+        {
+            "type": "header",
+            "text": {
+                "type": "plain_text",
+                "text": f"{emoji} z4j: {trigger}",
+            },
+        },
+        {
+            "type": "section",
+            "fields": [
+                {"type": "mrkdwn", "text": f"*Task:*\n`{task_name}`"},
+                {"type": "mrkdwn", "text": f"*State:*\n{state}"},
+                {"type": "mrkdwn", "text": f"*Priority:*\n{priority}"},
+                {"type": "mrkdwn", "text": f"*ID:*\n`{task_id[:12]}`"},
+            ],
+        },
+    ]
+
+    exception = payload.get("exception")
+    if exception:
+        blocks.append({
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": f"*Exception:*\n```{exception[:500]}```",
+            },
+        })
+
+    body = {"blocks": blocks}
+
+    try:
+        # M15: re-validate + pin the Slack webhook's IP at
+        # dispatch time (same rationale as the generic webhook
+        # dispatcher above).
+        err, safe_ip = await resolve_and_pin(webhook_url)
+        if err is not None:
+            return DeliveryResult(
+                success=False,
+                error=f"unsafe slack URL at dispatch: {err}",
+            )
+        resp = await _post(
+            webhook_url,
+            json=body,
+            headers={"Content-Type": "application/json"},
+            pin_ip=safe_ip,
+        )
+        return DeliveryResult(
+            success=resp.status_code == 200,
+            status_code=resp.status_code,
+            response_body=resp.text[:500],
+        )
+    except Exception as exc:
+        return DeliveryResult(success=False, error=str(exc)[:500])
+
+
+# ---------------------------------------------------------------------------
+# Telegram (bot API - just a token + chat ID)
+# ---------------------------------------------------------------------------
+
+
+async def deliver_telegram(
+    config: dict[str, Any],
+    payload: dict[str, Any],
+) -> DeliveryResult:
+    """Send a message via the Telegram Bot API.
+
+    Requires a bot token (from @BotFather) and a chat ID (the
+    group or user to message). No OAuth, no webhook setup - just
+    a POST to ``api.telegram.org``.
+    """
+    bot_token = config.get("bot_token", "")
+    chat_id = config.get("chat_id", "")
+    if not bot_token or not chat_id:
+        return DeliveryResult(
+            success=False,
+            error="Telegram config incomplete (need bot_token + chat_id)",
+        )
+
+    trigger = payload.get("trigger", "notification")
+    task_name = payload.get("task_name", "")
+    priority = payload.get("priority", "normal")
+    state = payload.get("state", "")
+
+    emoji = {"critical": "🔴", "high": "🟠", "normal": "🔵", "low": "⚪"}.get(
+        priority, "🔵",
+    )
+
+    lines = [
+        f"{emoji} *z4j: {trigger}*",
+        f"Task: `{task_name}`",
+        f"State: {state}",
+        f"Priority: {priority}",
+    ]
+    exception = payload.get("exception")
+    if exception:
+        lines.append(f"Exception: `{exception[:300]}`")
+
+    text = "\n".join(lines)
+    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+
+    try:
+        resp = await _post(
+            url,
+            json={
+                "chat_id": chat_id,
+                "text": text,
+                "parse_mode": "Markdown",
+            },
+        )
+        return DeliveryResult(
+            success=resp.status_code == 200,
+            status_code=resp.status_code,
+            response_body=resp.text[:500],
+        )
+    except Exception as exc:
+        return DeliveryResult(success=False, error=str(exc)[:500])
+
+
+# ---------------------------------------------------------------------------
+# Dispatch router
+# ---------------------------------------------------------------------------
+
+
+CHANNEL_DISPATCHERS = {
+    "webhook": deliver_webhook,
+    "email": deliver_email,
+    "slack": deliver_slack,
+    "telegram": deliver_telegram,
+}
+
+
+__all__ = [
+    "CHANNEL_DISPATCHERS",
+    "DeliveryResult",
+    "deliver_email",
+    "deliver_slack",
+    "deliver_telegram",
+    "deliver_webhook",
+    "set_shared_client",
+    "validate_webhook_headers",
+    "validate_webhook_url",
+]

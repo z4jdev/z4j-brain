@@ -1,0 +1,472 @@
+/**
+ * Hooks for the per-user notification system.
+ *
+ * Three resource families:
+ *
+ * - Project channels (admin-managed shared destinations)
+ *   GET/POST/PATCH/DELETE /projects/{slug}/notifications/channels
+ *
+ * - User channels (personal destinations)
+ *   GET/POST/PATCH/DELETE /user/channels
+ *
+ * - User subscriptions (per-user, per-(project,trigger) routing rules)
+ *   GET/POST/PATCH/DELETE /user/subscriptions
+ *
+ * - User notifications (the in-app inbox)
+ *   GET /user/notifications
+ *   GET /user/notifications/unread-count
+ *   POST /user/notifications/{id}/read
+ *   POST /user/notifications/read-all
+ *
+ * - Project default subscriptions (admin onboarding templates)
+ *   GET/POST/DELETE /projects/{slug}/notifications/defaults
+ *
+ * - Delivery audit log (admin-only)
+ *   GET /projects/{slug}/notifications/deliveries
+ */
+import {
+  useMutation,
+  useQuery,
+  useQueryClient,
+} from "@tanstack/react-query";
+import { api } from "@/lib/api";
+
+// ---------------------------------------------------------------------------
+// Types
+// ---------------------------------------------------------------------------
+
+export type ChannelType = "webhook" | "email" | "slack" | "telegram";
+
+export type TriggerType =
+  | "task.failed"
+  | "task.succeeded"
+  | "task.retried"
+  | "task.slow"
+  | "agent.offline"
+  | "agent.online";
+
+// -- Project channels (shared) ------------------------------------------------
+
+export interface NotificationChannel {
+  id: string;
+  project_id: string;
+  name: string;
+  type: ChannelType;
+  config: Record<string, unknown>;
+  is_active: boolean;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface CreateChannelRequest {
+  name: string;
+  type: ChannelType;
+  config: Record<string, unknown>;
+  is_active?: boolean;
+}
+
+export interface UpdateChannelRequest {
+  name?: string;
+  config?: Record<string, unknown>;
+  is_active?: boolean;
+}
+
+// -- User channels ------------------------------------------------------------
+
+export interface UserChannel {
+  id: string;
+  name: string;
+  type: ChannelType;
+  config: Record<string, unknown>;
+  is_verified: boolean;
+  is_active: boolean;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface CreateUserChannelRequest {
+  name: string;
+  type: ChannelType;
+  config: Record<string, unknown>;
+  is_active?: boolean;
+}
+
+export interface UpdateUserChannelRequest {
+  name?: string;
+  config?: Record<string, unknown>;
+  is_active?: boolean;
+}
+
+// -- User subscriptions -------------------------------------------------------
+
+export interface UserSubscription {
+  id: string;
+  user_id: string;
+  project_id: string;
+  trigger: TriggerType;
+  filters: Record<string, unknown>;
+  in_app: boolean;
+  project_channel_ids: string[];
+  user_channel_ids: string[];
+  muted_until: string | null;
+  cooldown_seconds: number;
+  last_fired_at: string | null;
+  is_active: boolean;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface CreateSubscriptionRequest {
+  project_id: string;
+  trigger: TriggerType;
+  filters?: Record<string, unknown>;
+  in_app?: boolean;
+  project_channel_ids?: string[];
+  user_channel_ids?: string[];
+  cooldown_seconds?: number;
+}
+
+export interface UpdateSubscriptionRequest {
+  filters?: Record<string, unknown>;
+  in_app?: boolean;
+  project_channel_ids?: string[];
+  user_channel_ids?: string[];
+  cooldown_seconds?: number;
+  muted_until?: string | null;
+  is_active?: boolean;
+}
+
+// -- In-app notifications (the bell) ------------------------------------------
+
+export interface UserNotification {
+  id: string;
+  project_id: string;
+  subscription_id: string | null;
+  trigger: TriggerType;
+  reason: "subscribed" | "default" | "mentioned";
+  title: string;
+  body: string | null;
+  data: Record<string, unknown>;
+  read_at: string | null;
+  created_at: string;
+}
+
+// -- Project default subscriptions (admin) ------------------------------------
+
+export interface ProjectDefaultSubscription {
+  id: string;
+  project_id: string;
+  trigger: TriggerType;
+  filters: Record<string, unknown>;
+  in_app: boolean;
+  project_channel_ids: string[];
+  cooldown_seconds: number;
+  created_at: string;
+}
+
+export interface CreateDefaultSubscriptionRequest {
+  trigger: TriggerType;
+  filters?: Record<string, unknown>;
+  in_app?: boolean;
+  project_channel_ids?: string[];
+  cooldown_seconds?: number;
+}
+
+// -- Delivery audit log -------------------------------------------------------
+
+export interface NotificationDelivery {
+  id: string;
+  subscription_id: string | null;
+  channel_id: string | null;
+  user_channel_id: string | null;
+  trigger: TriggerType;
+  task_id: string | null;
+  task_name: string | null;
+  status: "sent" | "failed" | "skipped";
+  response_code: number | null;
+  error: string | null;
+  sent_at: string;
+}
+
+// ---------------------------------------------------------------------------
+// Project channels
+// ---------------------------------------------------------------------------
+
+export function useChannels(slug: string) {
+  return useQuery<NotificationChannel[]>({
+    queryKey: ["notification-channels", slug],
+    queryFn: () =>
+      api.get<NotificationChannel[]>(`/projects/${slug}/notifications/channels`),
+    enabled: !!slug,
+  });
+}
+
+export function useCreateChannel(slug: string) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (body: CreateChannelRequest) =>
+      api.post<NotificationChannel>(
+        `/projects/${slug}/notifications/channels`,
+        body,
+      ),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["notification-channels", slug] });
+    },
+  });
+}
+
+export function useUpdateChannel(slug: string) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ id, body }: { id: string; body: UpdateChannelRequest }) =>
+      api.patch<NotificationChannel>(
+        `/projects/${slug}/notifications/channels/${id}`,
+        body,
+      ),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["notification-channels", slug] });
+    },
+  });
+}
+
+export function useDeleteChannel(slug: string) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (id: string) =>
+      api.delete<void>(`/projects/${slug}/notifications/channels/${id}`),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["notification-channels", slug] });
+      qc.invalidateQueries({ queryKey: ["user-subscriptions"] });
+    },
+  });
+}
+
+// ---------------------------------------------------------------------------
+// User channels
+// ---------------------------------------------------------------------------
+
+export function useUserChannels() {
+  return useQuery<UserChannel[]>({
+    queryKey: ["user-channels"],
+    queryFn: () => api.get<UserChannel[]>(`/user/channels`),
+  });
+}
+
+export function useCreateUserChannel() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (body: CreateUserChannelRequest) =>
+      api.post<UserChannel>(`/user/channels`, body),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["user-channels"] });
+    },
+  });
+}
+
+export function useUpdateUserChannel() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ id, body }: { id: string; body: UpdateUserChannelRequest }) =>
+      api.patch<UserChannel>(`/user/channels/${id}`, body),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["user-channels"] });
+    },
+  });
+}
+
+export function useDeleteUserChannel() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (id: string) => api.delete<void>(`/user/channels/${id}`),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["user-channels"] });
+      qc.invalidateQueries({ queryKey: ["user-subscriptions"] });
+    },
+  });
+}
+
+// ---------------------------------------------------------------------------
+// User subscriptions
+// ---------------------------------------------------------------------------
+
+export function useUserSubscriptions(projectId?: string) {
+  return useQuery<UserSubscription[]>({
+    queryKey: ["user-subscriptions", projectId ?? "all"],
+    queryFn: () => {
+      const url = projectId
+        ? `/user/subscriptions?project_id=${encodeURIComponent(projectId)}`
+        : `/user/subscriptions`;
+      return api.get<UserSubscription[]>(url);
+    },
+  });
+}
+
+export function useCreateUserSubscription() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (body: CreateSubscriptionRequest) =>
+      api.post<UserSubscription>(`/user/subscriptions`, body),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["user-subscriptions"] });
+    },
+  });
+}
+
+export function useUpdateUserSubscription() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({
+      id,
+      body,
+    }: {
+      id: string;
+      body: UpdateSubscriptionRequest;
+    }) => api.patch<UserSubscription>(`/user/subscriptions/${id}`, body),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["user-subscriptions"] });
+    },
+  });
+}
+
+export function useDeleteUserSubscription() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (id: string) => api.delete<void>(`/user/subscriptions/${id}`),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["user-subscriptions"] });
+    },
+  });
+}
+
+// ---------------------------------------------------------------------------
+// User notifications (the in-app bell)
+// ---------------------------------------------------------------------------
+
+export function useUserNotifications(opts?: {
+  unreadOnly?: boolean;
+  limit?: number;
+}) {
+  const params = new URLSearchParams();
+  if (opts?.unreadOnly) params.set("unread_only", "true");
+  if (opts?.limit) params.set("limit", String(opts.limit));
+  const qs = params.toString();
+  return useQuery<UserNotification[]>({
+    queryKey: [
+      "user-notifications",
+      opts?.unreadOnly ?? false,
+      opts?.limit ?? 50,
+    ],
+    queryFn: () =>
+      api.get<UserNotification[]>(
+        qs ? `/user/notifications?${qs}` : `/user/notifications`,
+      ),
+    refetchInterval: 30_000,
+    staleTime: 15_000,
+  });
+}
+
+export function useUnreadCount() {
+  return useQuery<{ unread: number }>({
+    queryKey: ["user-notifications-unread-count"],
+    queryFn: () =>
+      api.get<{ unread: number }>(`/user/notifications/unread-count`),
+    refetchInterval: 30_000,
+    staleTime: 15_000,
+  });
+}
+
+export function useMarkRead() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (id: string) =>
+      api.post<void>(`/user/notifications/${id}/read`, {}),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["user-notifications"] });
+      qc.invalidateQueries({ queryKey: ["user-notifications-unread-count"] });
+    },
+  });
+}
+
+export function useMarkAllRead() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: () => api.post<void>(`/user/notifications/read-all`, {}),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["user-notifications"] });
+      qc.invalidateQueries({ queryKey: ["user-notifications-unread-count"] });
+    },
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Project default subscriptions (admin)
+// ---------------------------------------------------------------------------
+
+export function useDefaultSubscriptions(slug: string) {
+  return useQuery<ProjectDefaultSubscription[]>({
+    queryKey: ["project-default-subscriptions", slug],
+    queryFn: () =>
+      api.get<ProjectDefaultSubscription[]>(
+        `/projects/${slug}/notifications/defaults`,
+      ),
+    enabled: !!slug,
+  });
+}
+
+export function useCreateDefaultSubscription(slug: string) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (body: CreateDefaultSubscriptionRequest) =>
+      api.post<ProjectDefaultSubscription>(
+        `/projects/${slug}/notifications/defaults`,
+        body,
+      ),
+    onSuccess: () => {
+      qc.invalidateQueries({
+        queryKey: ["project-default-subscriptions", slug],
+      });
+    },
+  });
+}
+
+export function useDeleteDefaultSubscription(slug: string) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (id: string) =>
+      api.delete<void>(`/projects/${slug}/notifications/defaults/${id}`),
+    onSuccess: () => {
+      qc.invalidateQueries({
+        queryKey: ["project-default-subscriptions", slug],
+      });
+    },
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Delivery audit log (admin-only)
+// ---------------------------------------------------------------------------
+
+/** Paged delivery list envelope - matches DeliveryListPublic on the
+ *  backend (POL-2). The dashboard still exposes the raw item array
+ *  via ``data.items`` so existing callers can migrate incrementally. */
+export interface NotificationDeliveryList {
+  items: NotificationDelivery[];
+  next_cursor: string | null;
+}
+
+export function useDeliveries(slug: string, limit = 50, cursor?: string | null) {
+  return useQuery<NotificationDeliveryList>({
+    queryKey: ["notification-deliveries", slug, limit, cursor ?? null],
+    queryFn: () => {
+      const params: Record<string, string | number> = { limit };
+      if (cursor) params.cursor = cursor;
+      return api.get<NotificationDeliveryList>(
+        `/projects/${slug}/notifications/deliveries`,
+        params,
+      );
+    },
+    enabled: !!slug,
+    staleTime: 30_000,
+  });
+}
+
