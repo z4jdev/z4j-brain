@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.3] - 2026-04-22
+
+### Fixed
+
+- **`z4j-brain serve` now works zero-config on a fresh install.** Before this fix, `pip install z4j-brain && z4j-brain serve` crashed with a Pydantic `ValidationError: secret + session_secret Field required`. The CLI auto-defaulted `Z4J_DATABASE_URL` to `~/.z4j/z4j.db` but did NOT auto-mint HMAC signing keys, so the operator had to manually export `Z4J_SECRET` and `Z4J_SESSION_SECRET` before the first run. The Docker entrypoint had always done this, but the bare-metal CLI did not.
+- The CLI now mirrors the Docker entrypoint: on first boot, mints fresh `Z4J_SECRET` + `Z4J_SESSION_SECRET` via `secrets.token_urlsafe(48)`, persists them to `~/.z4j/secret.env` (chmod 600 on Unix), and reuses them on subsequent boots so sessions, tokens, and the audit-log HMAC chain survive across restarts. Prints a clear warning that this is evaluation mode and operators must set the secrets explicitly for production.
+- Also auto-defaults `Z4J_ENVIRONMENT=dev` and `Z4J_ALLOWED_HOSTS=["localhost","127.0.0.1"]` for SQLite mode so the production-mode invariant validators don't reject the dev boot.
+
+### Documentation
+
+- README's "Quick start" rewritten: `pip install z4j-brain && z4j-brain serve` is now the entire flow. The previous instructions had operators manually generating secrets via `secrets.token_urlsafe`, which was friction we should never have shipped.
+
+### Compatibility
+
+- All operator-facing env var contracts are unchanged. Anyone who already sets `Z4J_SECRET`, `Z4J_SESSION_SECRET`, etc. via env vars or compose files sees no behavior change. The auto-mint kicks in only when those env vars are unset.
+
 ## [1.0.1] - 2026-04-22
 
 ### Removed

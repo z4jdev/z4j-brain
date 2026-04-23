@@ -1,34 +1,38 @@
 # z4j-brain
 
 **License:** AGPL v3 - commercial license available (contact `licensing@z4j.com`).
-**Status:** v1.0.1 (production-ready).
+**Status:** v1.0.3 (production-ready).
 
 The z4j brain: FastAPI backend + React dashboard in a single Python
 package. This is the server half of z4j. Agents connect to it over
 WebSocket (or HTTPS long-poll fallback) and users interact with it
 through the dashboard served from the same process.
 
-## Quick start
+## Quick start - 30 seconds
 
 ```bash
 pip install z4j-brain
-
-# Generate the two required HMAC signing secrets
-export Z4J_SECRET=$(python -c "import secrets; print(secrets.token_urlsafe(48))")
-export Z4J_SESSION_SECRET=$(python -c "import secrets; print(secrets.token_urlsafe(48))")
-
-z4j-brain migrate upgrade head
 z4j-brain serve
 ```
 
-That's it. The wheel ships with:
+That's the whole thing. Open <http://localhost:7700/> and follow the
+first-boot setup URL printed to your terminal.
 
-- An embedded SQLite database (via `aiosqlite`) so no database server
-  is required.
-- The built React dashboard, served at `/` from the same process.
-- Alembic migrations and an `alembic.ini` resolved from the installed
-  package, so `z4j-brain migrate upgrade head` works from any working
-  directory.
+The first run automatically:
+
+- Creates `~/.z4j/z4j.db` (SQLite, bundled - no Postgres needed for
+  evaluation).
+- Mints HMAC signing keys to `~/.z4j/secret.env` so sessions and
+  audit-log chaining survive across restarts.
+- Runs Alembic migrations to head.
+- Boots the FastAPI backend + React dashboard on `:7700`.
+
+Everything is self-contained in the `~/.z4j/` directory. To start
+fresh, delete that directory and re-run.
+
+For production, set `Z4J_SECRET`, `Z4J_SESSION_SECRET`, `Z4J_DATABASE_URL`,
+`Z4J_PUBLIC_URL`, and `Z4J_ALLOWED_HOSTS` explicitly via env vars and
+back up the secret store. See [Configuration](#configuration) below.
 
 ## First boot
 

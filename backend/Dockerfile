@@ -146,6 +146,21 @@ RUN set -eux; \
 # ---------------------------------------------------------------------------
 FROM python:${PYTHON_VERSION}-slim-${DEBIAN_RELEASE} AS runtime
 
+# OCI image metadata. Version is injected at build time via --build-arg
+# Z4J_VERSION=... so we never have to keep a hardcoded version in sync
+# with pyproject.toml. ``org.opencontainers.image.*`` labels are what
+# Docker Hub, GitHub Container Registry, Syft, Trivy, and Docker Scout
+# consume to render "Source", "License", etc.
+ARG Z4J_VERSION=dev
+LABEL org.opencontainers.image.title="z4j" \
+      org.opencontainers.image.description="z4j: open-source control plane for Python task infrastructure" \
+      org.opencontainers.image.version="${Z4J_VERSION}" \
+      org.opencontainers.image.source="https://github.com/z4jdev/z4j-brain" \
+      org.opencontainers.image.url="https://pypi.org/project/z4j-brain/" \
+      org.opencontainers.image.documentation="https://z4j.dev" \
+      org.opencontainers.image.vendor="z4j contributors" \
+      org.opencontainers.image.licenses="AGPL-3.0-or-later"
+
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PATH="/opt/venv/bin:${PATH}" \

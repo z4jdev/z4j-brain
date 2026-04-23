@@ -154,6 +154,69 @@ def _run_serve(args: argparse.Namespace) -> int:
             "(set Z4J_DATABASE_URL for Postgres)",
         )
 
+    # Auto-bootstrap HMAC secrets so ``pip install z4j-brain && z4j-brain
+    # serve`` works zero-config on a fresh machine. Mirrors the Docker
+    # image entrypoint behavior. Persisted to ``~/.z4j/secret.env`` so
+    # tokens, sessions, and the audit-log HMAC chain survive across
+    # restarts.
+    #
+    # Precedence:
+    #   1. explicit env (operator-provided) -> use as-is
+    #   2. ``~/.z4j/secret.env`` exists from a previous boot -> source
+    #   3. neither -> mint fresh + persist to ``~/.z4j/secret.env``
+    #
+    # In production the operator must set Z4J_SECRET + Z4J_SESSION_SECRET
+    # explicitly (case 1). Auto-mint is for dev / homelab / evaluation.
+    if not os.environ.get("Z4J_SECRET"):
+        data_dir = Path.home() / ".z4j"
+        data_dir.mkdir(parents=True, exist_ok=True)
+        secret_env = data_dir / "secret.env"
+        if secret_env.exists():
+            for line in secret_env.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                os.environ.setdefault(k.strip(), v.strip())
+            print(  # noqa: T201
+                f"z4j-brain: loaded persisted Z4J_SECRET from {secret_env}",
+            )
+        else:
+            import secrets as _secrets  # local alias to avoid shadowing
+
+            new_secret = _secrets.token_urlsafe(48)
+            new_session = _secrets.token_urlsafe(48)
+            secret_env.write_text(
+                f"Z4J_SECRET={new_secret}\nZ4J_SESSION_SECRET={new_session}\n",
+                encoding="utf-8",
+            )
+            try:
+                # chmod 600 on Unix; no-op on Windows (NTFS uses ACLs).
+                # Best-effort: we don't fail the boot if chmod is denied.
+                secret_env.chmod(0o600)
+            except OSError:
+                pass
+            os.environ["Z4J_SECRET"] = new_secret
+            os.environ["Z4J_SESSION_SECRET"] = new_session
+            print(  # noqa: T201
+                f"z4j-brain: minted fresh Z4J_SECRET + Z4J_SESSION_SECRET, "
+                f"persisted to {secret_env}",
+            )
+            print(  # noqa: T201
+                "z4j-brain: WARNING - evaluation mode. For production, set "
+                "Z4J_SECRET + Z4J_SESSION_SECRET explicitly via env vars and "
+                "back up the secret store.",
+            )
+
+    # In dev mode the brain's settings validators expect localhost-friendly
+    # values for allowed_hosts + a non-https public_url. Set sane defaults
+    # if the operator hasn't pinned them. Mirrors the Docker entrypoint.
+    if not os.environ.get("Z4J_DATABASE_URL", "").startswith("postgresql"):
+        os.environ.setdefault("Z4J_ENVIRONMENT", "dev")
+        os.environ.setdefault(
+            "Z4J_ALLOWED_HOSTS", '["localhost","127.0.0.1"]',
+        )
+
     # Auto-migrate before serve. The bare-metal quickstart used to
     # leave migrations to a manual ``z4j-brain migrate upgrade head``
     # step - easy to forget, and the first request would then blow
