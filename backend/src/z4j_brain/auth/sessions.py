@@ -22,7 +22,7 @@ from __future__ import annotations
 import secrets
 import uuid
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 
 from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
@@ -199,7 +199,21 @@ def is_session_live(
         return False
     if (
         user_password_changed_at is not None
-        and _aware_utc(row.issued_at) <= _aware_utc(user_password_changed_at)
+        # 1-second grace window. The session's ``issued_at`` comes
+        # from the DB's ``func.now()`` which is SECOND-precision on
+        # SQLite but microsecond-precision on Postgres. The user's
+        # ``password_changed_at`` is always Python-side
+        # microsecond-precision. Without the grace, a session minted
+        # in the same wall-clock second as a password change looks
+        # "older" on SQLite (microsecond 0 <= microsecond N) and
+        # gets rejected - breaking every session that the setup
+        # flow and password-change flow mint immediately after
+        # writing the user row. The grace is safe: no attacker can
+        # exploit a 1-second window here (a compromised session
+        # needs a valid cookie signature, which requires the
+        # current secret, which changes when the operator rotates).
+        and _aware_utc(row.issued_at)
+        < _aware_utc(user_password_changed_at) - timedelta(seconds=1)
     ):
         return False
     return True

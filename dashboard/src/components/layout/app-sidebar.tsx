@@ -48,25 +48,13 @@ import {
 } from "@/components/ui/tooltip";
 import { ProjectSwitcher } from "./project-switcher";
 import { useSidebar } from "./sidebar-context";
+import { Z4jMark } from "@/components/z4j-mark";
 import { useCan, useCurrentUserRole } from "@/hooks/use-memberships";
 
 interface NavItem {
   label: string;
   to: string;
   icon: React.ComponentType<{ className?: string }>;
-}
-
-function Z4jMark({ className }: { className?: string }) {
-  return (
-    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" className={className} aria-hidden="true">
-      <path d="M 256 66 L 420.545 161 L 420.545 351 L 256 446 L 91.455 351 L 91.455 161 Z"
-        fill="none" stroke="currentColor" strokeWidth="40" strokeLinecap="round" strokeLinejoin="round" />
-      <path d="M 162 175 H 350 L 162 337 H 350"
-        fill="none" stroke="currentColor" strokeWidth="40" strokeLinecap="round" strokeLinejoin="round" />
-      <circle cx="162" cy="175" r="26" fill="currentColor" />
-      <circle cx="350" cy="337" r="26" fill="currentColor" />
-    </svg>
-  );
 }
 
 function buildNav(

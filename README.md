@@ -12,11 +12,16 @@ through the dashboard served from the same process.
 
 ```bash
 pip install z4j-brain
-z4j-brain serve
+z4j serve
 ```
 
 That's the whole thing. Open <http://localhost:7700/> and follow the
 first-boot setup URL printed to your terminal.
+
+> The CLI ships under two names: `z4j` (primary, recommended) and
+> `z4j-brain` (back-compat alias for users on 1.0.0-1.0.4 docs).
+> Both call the exact same code path - `z4j serve` and
+> `z4j-brain serve` are interchangeable.
 
 The first run automatically:
 
@@ -36,7 +41,7 @@ back up the secret store. See [Configuration](#configuration) below.
 
 ## First boot
 
-On first run the brain has no admin account yet, so `z4j-brain serve`
+On first run the brain has no admin account yet, so `z4j serve`
 prints a one-time setup URL to stdout:
 
 ```
@@ -120,8 +125,8 @@ If you want PostgreSQL instead of the default SQLite, install the
 ```bash
 pip install "z4j-brain[postgres]"
 export Z4J_DATABASE_URL=postgresql+asyncpg://user:pass@host/z4j
-z4j-brain migrate upgrade head
-z4j-brain serve
+z4j migrate upgrade head
+z4j serve
 ```
 
 PostgreSQL unlocks the `LISTEN/NOTIFY`-based multi-worker registry

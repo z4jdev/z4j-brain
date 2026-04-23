@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.5] - 2026-04-23
+
+### Added
+
+- **`z4j` as the primary CLI command name.** The brain wheel now ships two console scripts that call the same entry point: `z4j` (primary, recommended for new docs) and `z4j-brain` (back-compat alias for users on 1.0.0-1.0.4 documentation). `z4j serve`, `z4j check`, `z4j createsuperuser`, etc. all work exactly like their `z4j-brain` equivalents. The `--help` banner auto-detects which name was invoked and shows matching examples. The shorter name matches the package name on PyPI (`pip install z4j`), the brand (z4j.com / z4j.dev), and reduces friction (3 chars vs 9 chars, no hyphen to fat-finger).
+- **Five new operator subcommands** (Django/Flask-style):
+  - `z4j reset [--force] [--nuke-secrets]` - wipe every runtime row in the brain DB and put the install back into pre-first-boot state. Refuses without `--force` for safety.
+  - `z4j createsuperuser --email X --password-stdin` - alias for `bootstrap-admin` using the Django-familiar verb. Auto-runs migrations on a truly fresh install.
+  - `z4j changepassword <email> --password-stdin` - reset a user's password from the CLI; bumps `password_changed_at` so any existing session for that user is invalidated on next request.
+  - `z4j check` - non-destructive validation: config loads, DB reachable, alembic at head. Returns 0 on green.
+  - `z4j status` - high-level state summary: version, alembic head, environment, DB URL, row counts (users, projects, agents, tasks, sessions, audit rows).
+- Help banner restructured: top-level `z4j --help` now includes a "Common flows" cheat-sheet for the most-used commands.
+
+### Fixed
+
+- **Session liveness check incorrectly killed sessions issued in the same wall-clock second as a password change.** SQLite's `func.now()` is second-precision; Python's `datetime.now()` is microsecond-precision; the comparison `issued_at <= password_changed_at` was true within the second, so every session minted by setup-complete or password-change failed the next request with 401. Added a 1-second grace window. SQLite users hit this on every fresh install. Fix in [auth/sessions.py:202](packages/z4j-brain/backend/src/z4j_brain/auth/sessions.py#L202).
+- **Dashboard `/login` route didn't check setup-status.** Users navigating directly to `/login` (bookmark, refresh after logout) on a brain with no admin saw the login form, typed credentials, got 401-invalid-credentials forever. Now the route's `beforeLoad` calls `/setup/status` first and hard-redirects to `/setup` when `first_boot=true`. Fix in [dashboard/src/routes/login.tsx](packages/z4j-brain/dashboard/src/routes/login.tsx).
+- Dropped the misleading "first time here? run the first-boot setup" link from the login page (redundant with the new beforeLoad redirect; would have only been visible during a tiny race window).
+- **Version display reports the brain wheel version** (1.0.5) instead of z4j-core's protocol version (1.0.1). Previously every operator-facing surface (startup banner, `/api/v1/health`, `z4j version`) reported "1.0.1" no matter which brain wheel was installed, because `__version__` re-exported `z4j_core.version.__version__`. Now reads from `importlib.metadata.version("z4j-brain")` with the protocol version still exposed as `protocol_version` for code that needs it. Fix in [backend/src/z4j_brain/__init__.py](packages/z4j-brain/backend/src/z4j_brain/__init__.py).
+- **Schema-version-mismatch error now surfaces actionable detail.** When the DB was migrated by a newer brain than the running code, the operator-visible message was just "REFUSING TO START: ... See logs above for details" (with no details actually shown). Now logs the full message: which version is in the DB, which is in the code, what to do.
+
+### Notes
+
+- The `z4j-brain` script name continues to work indefinitely. We may remove it in a future major version once all docs and known installs have migrated, but no removal is scheduled.
+
 ## [1.0.4] - 2026-04-23
 
 ### Fixed

@@ -24,12 +24,43 @@ from z4j_brain import __version__
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    """Entry point installed as the ``z4j-brain`` console script."""
+    """Entry point installed as the ``z4j`` (and back-compat ``z4j-brain``)
+    console script.
+    """
+    # Auto-detect the prog name from how the user invoked us. When
+    # they typed ``z4j --help`` we want examples to read ``z4j ...``;
+    # when they typed ``z4j-brain --help`` we want ``z4j-brain ...``.
+    # Falls back to ``z4j`` (the canonical name) if argv[0] is the
+    # python -m form or anything we can't parse.
+    invoked = Path(sys.argv[0]).stem if sys.argv and sys.argv[0] else "z4j"
+    prog = invoked if invoked in {"z4j", "z4j-brain"} else "z4j"
+
     parser = argparse.ArgumentParser(
-        prog="z4j-brain",
-        description="z4j brain server (AGPL v3)",
+        prog=prog,
+        description=(
+            "z4j brain server (AGPL v3) - operator CLI.\n"
+            "\n"
+            "Common flows:\n"
+            f"  {prog} serve                     # start the dashboard + API\n"
+            f"  {prog} check                     # validate config + DB\n"
+            f"  {prog} status                    # current-state summary\n"
+            f"  {prog} createsuperuser ...       # create the first admin\n"
+            f"  {prog} changepassword <email>    # reset a user's password\n"
+            f"  {prog} reset [--all]             # nuke DB state\n"
+            f"  {prog} migrate upgrade head      # run alembic migrations\n"
+            f"  {prog} audit verify              # verify audit-log HMAC chain\n"
+            f"  {prog} version                   # print installed version\n"
+            "\n"
+            f"Run `{prog} <command> --help` for per-command flags."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    sub = parser.add_subparsers(dest="command", required=False)
+    sub = parser.add_subparsers(
+        dest="command",
+        required=False,
+        title="commands",
+        metavar="<command>",
+    )
 
     # serve
     serve = sub.add_parser("serve", help="run uvicorn against create_app")
@@ -66,8 +97,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     audit_verify.add_argument(
         "--limit",
         type=int,
-        default=10_000,
-        help="maximum number of rows to verify (default: 10000)",
+        default=5_000,
+        help=(
+            "maximum number of rows to verify per invocation "
+            "(default: 5000, hard cap: 5000). The repository's "
+            "stream_for_verify returns up to N rows from the "
+            "oldest entry; re-run for more if your audit log "
+            "is larger."
+        ),
     )
 
     # bootstrap-admin: imperative first-boot admin creation.
@@ -96,13 +133,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="password on the command line (NOT recommended - visible in ps/history)",
     )
 
-    # reset-setup
+    # reset-setup (narrow: only pending tokens + setup.* audit rows;
+    # refuses if admin exists). The broader `reset` below wipes
+    # everything including the admin. Both exist because they solve
+    # different problems.
     reset_setup = sub.add_parser(
         "reset-setup",
         help=(
-            "wipe the first-boot setup state (pending tokens + recent "
-            "rate-limit attempts) so the next `serve` mints a fresh "
-            "token. REFUSES if an admin user already exists."
+            "wipe pending first-boot tokens + recent setup audit rows. "
+            "REFUSES if an admin user already exists."
         ),
     )
     reset_setup.add_argument(
@@ -111,8 +150,110 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="proceed without the safety prompt (for scripts)",
     )
 
+    # reset (destructive; full DB wipe)
+    reset = sub.add_parser(
+        "reset",
+        help=(
+            "wipe every runtime table (users, sessions, projects, "
+            "agents, tasks, events, schedules, audit, ...). Schema "
+            "stays; alembic doesn't re-run. Pre-first-boot state "
+            "after this."
+        ),
+        description=(
+            "Wipe every runtime table and put the brain back into "
+            "pre-first-boot state. After this command, the next "
+            "`serve` mints a fresh setup token and prints a new "
+            "one-time admin-creation URL.\n"
+            "\n"
+            "Does NOT touch:\n"
+            "  - the alembic schema (run `migrate downgrade base` for that)\n"
+            "  - ~/.z4j/secret.env (unless --nuke-secrets)\n"
+            "  - ~/.z4j/z4j.db file (rows only, not the file itself)\n"
+            "\n"
+            "REQUIRES --force to proceed. Destructive. Irrecoverable."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    reset.add_argument(
+        "--force",
+        action="store_true",
+        help="proceed without the safety prompt (required to wipe)",
+    )
+    reset.add_argument(
+        "--nuke-secrets",
+        action="store_true",
+        help=(
+            "also delete ~/.z4j/secret.env so the next serve mints "
+            "fresh HMAC keys. Any existing session cookies + agent "
+            "tokens become invalid."
+        ),
+    )
+
+    # createsuperuser (alias to bootstrap-admin; Django-familiar name)
+    createsuperuser = sub.add_parser(
+        "createsuperuser",
+        help="create an admin user (Django-style alias for bootstrap-admin)",
+    )
+    createsuperuser.add_argument(
+        "--email", required=True, help="admin email address",
+    )
+    createsuperuser.add_argument(
+        "--display-name", default=None, help="optional display name",
+    )
+    createsuperuser_pw = createsuperuser.add_mutually_exclusive_group(
+        required=True,
+    )
+    createsuperuser_pw.add_argument(
+        "--password-stdin",
+        action="store_true",
+        help="read the password from stdin (recommended)",
+    )
+    createsuperuser_pw.add_argument(
+        "--password",
+        default=None,
+        help="password on the command line (NOT recommended)",
+    )
+
+    # changepassword
+    changepassword = sub.add_parser(
+        "changepassword",
+        help="change a user's password (admin recovery / CLI-only ops)",
+    )
+    changepassword.add_argument("email", help="email of the user to reset")
+    changepassword_pw = changepassword.add_mutually_exclusive_group(
+        required=True,
+    )
+    changepassword_pw.add_argument(
+        "--password-stdin",
+        action="store_true",
+        help="read the password from stdin (recommended)",
+    )
+    changepassword_pw.add_argument(
+        "--password",
+        default=None,
+        help="password on the command line (NOT recommended)",
+    )
+
+    # check
+    sub.add_parser(
+        "check",
+        help=(
+            "validate config + DB connectivity + that alembic is "
+            "at head. Non-destructive. Exit 0 = healthy."
+        ),
+    )
+
+    # status
+    sub.add_parser(
+        "status",
+        help=(
+            "print a summary of current brain state: user count, "
+            "project count, agent count, recent task activity."
+        ),
+    )
+
     # version
-    sub.add_parser("version", help="print version")
+    sub.add_parser("version", help="print installed z4j-brain version")
 
     args = parser.parse_args(argv)
 
@@ -134,6 +275,23 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "reset-setup":
         return _run_reset_setup(args)
+
+    if args.command == "reset":
+        return _run_reset(args)
+
+    if args.command == "createsuperuser":
+        # Identical shape to bootstrap-admin; dispatch through the
+        # same implementation to keep one code path.
+        return _run_bootstrap_admin(args)
+
+    if args.command == "changepassword":
+        return _run_changepassword(args)
+
+    if args.command == "check":
+        return _run_check(args)
+
+    if args.command == "status":
+        return _run_status(args)
 
     parser.error(f"unknown command {args.command!r}")
     return 2
@@ -326,6 +484,10 @@ def _run_migrate(args: argparse.Namespace) -> int:
     import os
     from alembic.config import main as alembic_main
 
+    # Bootstrap env (DB URL + secrets) so alembic's env.py can
+    # instantiate Settings(). Fresh installs don't have these yet.
+    _bootstrap_env_for_management_commands()
+
     candidates: list[Path] = []
     env_path = os.environ.get("Z4J_ALEMBIC_INI")
     if env_path:
@@ -416,6 +578,10 @@ def _run_audit_verify(args: argparse.Namespace) -> int:
     """
     import asyncio
 
+    # Bootstrap env so fresh / bare-metal installs don't crash with
+    # a Settings ValidationError before we even open the DB.
+    _bootstrap_env_for_management_commands()
+
     from z4j_brain.domain.audit_service import AuditService
     from z4j_brain.persistence.database import (
         DatabaseManager,
@@ -478,48 +644,20 @@ def _run_reset_setup(args: argparse.Namespace) -> int:
     lockout. Run this command, then restart the brain.
     """
     import asyncio
-    import os
     import sys
     from pathlib import Path
 
-    # Apply the same env-var defaulting that ``serve`` does so this
-    # works zero-config out of the box.
-    if not os.environ.get("Z4J_DATABASE_URL"):
-        data_dir = Path.home() / ".z4j"
-        db_path = data_dir / "z4j.db"
-        if not db_path.exists():
-            print(  # noqa: T201
-                f"z4j-brain reset-setup: no DB found at {db_path}. "
-                "Nothing to reset - run `z4j-brain serve` to bootstrap.",
-                file=sys.stderr,
-            )
-            return 0
-        os.environ["Z4J_DATABASE_URL"] = f"sqlite+aiosqlite:///{db_path}"
-        os.environ.setdefault("Z4J_REGISTRY_BACKEND", "local")
+    # Refuse early if there's no DB to reset (pre-first-boot state).
+    db_path = Path.home() / ".z4j" / "z4j.db"
+    if not db_path.exists():
+        print(  # noqa: T201
+            f"z4j-brain reset-setup: no DB found at {db_path}. "
+            "Nothing to reset - run `z4j-brain serve` to bootstrap.",
+            file=sys.stderr,
+        )
+        return 0
 
-    # Bootstrap secrets the same way serve does, so Settings()
-    # validates. Reset-setup never mints a NEW secret - if there's
-    # no secret.env we have nothing to reset against.
-    if not os.environ.get("Z4J_SECRET"):
-        secret_env = Path.home() / ".z4j" / "secret.env"
-        if not secret_env.exists():
-            print(  # noqa: T201
-                f"z4j-brain reset-setup: no {secret_env} found. "
-                "Run `z4j-brain serve` first to bootstrap secrets.",
-                file=sys.stderr,
-            )
-            return 1
-        for line in secret_env.read_text(encoding="utf-8").splitlines():
-            line = line.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            k, v = line.split("=", 1)
-            os.environ.setdefault(k.strip(), v.strip())
-
-    os.environ.setdefault("Z4J_ENVIRONMENT", "dev")
-    os.environ.setdefault(
-        "Z4J_ALLOWED_HOSTS", '["localhost","127.0.0.1"]',
-    )
+    _bootstrap_env_for_management_commands()
 
     from sqlalchemy import delete, select
 
@@ -591,6 +729,478 @@ def _run_reset_setup(args: argparse.Namespace) -> int:
     return asyncio.run(_run())
 
 
+# ---------------------------------------------------------------------------
+# Full-DB reset, user mgmt, health checks, status
+# ---------------------------------------------------------------------------
+
+_TABLES_TO_WIPE_ORDER: tuple[str, ...] = (
+    # Child rows first (FK constraints). Schema stays intact; only
+    # the rows vanish. If you add a new table in a migration, append
+    # it here so `reset` stays complete.
+    "audit_log",
+    "sessions",
+    "first_boot_tokens",
+    "password_reset_tokens",
+    "api_keys",
+    "commands",
+    "events",
+    "task_annotations",
+    "tasks",
+    "schedules",
+    "queues",
+    "workers",
+    "agents",
+    "notification_deliveries",
+    "user_notifications",
+    "user_subscriptions",
+    "user_channels",
+    "user_preferences",
+    "notification_channels",
+    "alert_events",
+    "project_default_subscriptions",
+    "project_config",
+    "memberships",
+    "invitations",
+    "projects",
+    "export_jobs",
+    "extension_store",
+    "feature_flags",
+    "saved_views",
+    "users",
+    "z4j_meta",
+)
+
+
+def _bootstrap_env_for_management_commands() -> None:
+    """Set Z4J_* env vars so Settings() and alembic's env.py can
+    construct. Mirrors the early part of ``_run_serve`` but stops
+    before instantiating anything - callers that need Settings +
+    engine use :func:`_build_settings_from_env` which wraps this.
+
+    Idempotent: safe to call multiple times. Only mints secrets
+    when ``~/.z4j/secret.env`` doesn't exist.
+    """
+    import os
+    from pathlib import Path
+
+    if not os.environ.get("Z4J_DATABASE_URL"):
+        data_dir = Path.home() / ".z4j"
+        data_dir.mkdir(parents=True, exist_ok=True)
+        db_path = data_dir / "z4j.db"
+        os.environ["Z4J_DATABASE_URL"] = f"sqlite+aiosqlite:///{db_path}"
+        os.environ.setdefault("Z4J_REGISTRY_BACKEND", "local")
+
+    if not os.environ.get("Z4J_SECRET"):
+        secret_env = Path.home() / ".z4j" / "secret.env"
+        if secret_env.exists():
+            for line in secret_env.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                os.environ.setdefault(k.strip(), v.strip())
+        else:
+            # Mint fresh secrets so management commands work on a
+            # never-served install. `serve` will re-use these on
+            # its first boot.
+            import secrets as _secrets
+
+            secret_env.parent.mkdir(parents=True, exist_ok=True)
+            new_secret = _secrets.token_urlsafe(48)
+            new_session = _secrets.token_urlsafe(48)
+            secret_env.write_text(
+                f"Z4J_SECRET={new_secret}\nZ4J_SESSION_SECRET={new_session}\n",
+                encoding="utf-8",
+            )
+            try:
+                secret_env.chmod(0o600)
+            except OSError:
+                pass
+            os.environ["Z4J_SECRET"] = new_secret
+            os.environ["Z4J_SESSION_SECRET"] = new_session
+
+    os.environ.setdefault("Z4J_ENVIRONMENT", "dev")
+    os.environ.setdefault(
+        "Z4J_ALLOWED_HOSTS", '["localhost","127.0.0.1"]',
+    )
+
+
+def _build_settings_from_env() -> tuple["Any", "Any"]:
+    """Shared bootstrap for commands that need a DB engine.
+
+    Calls :func:`_bootstrap_env_for_management_commands` then
+    constructs ``Settings`` + an ``AsyncEngine``.
+    """
+    _bootstrap_env_for_management_commands()
+
+    from z4j_brain.persistence.database import create_engine_from_settings
+    from z4j_brain.settings import Settings
+
+    settings = Settings()  # type: ignore[call-arg]
+    engine = create_engine_from_settings(settings)
+    return settings, engine
+
+
+def _run_reset(args: argparse.Namespace) -> int:
+    """Wipe every runtime table + optionally the persisted secrets.
+
+    Destructive: this command irrecoverably deletes all user data in
+    the brain's database (users, projects, agents, tasks, events,
+    schedules, audit log, notifications, etc.). Schema is preserved;
+    alembic does not re-run.
+
+    After this, the brain is in pre-first-boot state: the next
+    ``serve`` mints a fresh setup token and prints a new admin-
+    creation URL, just like a brand-new install.
+
+    Use when:
+      - starting over on a dev / evaluation machine
+      - recovering from a test that left junk data
+      - cleaning a staging environment between runs
+
+    Do NOT use on production without a DB backup. There is no undo.
+    """
+    import asyncio
+    import sys
+    from pathlib import Path
+
+    import structlog
+
+    from sqlalchemy import text
+
+    if not args.force:
+        print(  # noqa: T201
+            "z4j-brain reset: REQUIRED --force flag missing.\n"
+            "\n"
+            "This command wipes every runtime row in the brain's DB\n"
+            "(users, projects, agents, tasks, events, audit log,\n"
+            "sessions, ...). Irrecoverable without a backup.\n"
+            "\n"
+            "If you really mean it:\n"
+            "  z4j-brain reset --force\n"
+            "  z4j-brain reset --force --nuke-secrets   # also resets HMAC keys",
+            file=sys.stderr,
+        )
+        return 1
+
+    settings, engine = _build_settings_from_env()
+
+    async def _wipe() -> int:
+        from z4j_brain.persistence.database import DatabaseManager
+
+        db = DatabaseManager(engine)
+        try:
+            async with db.session() as session:
+                wiped_total = 0
+                for table in _TABLES_TO_WIPE_ORDER:
+                    try:
+                        result = await session.execute(
+                            text(f"DELETE FROM {table}"),
+                        )
+                        wiped_total += result.rowcount or 0
+                    except Exception as exc:  # noqa: BLE001
+                        # Table might not exist in older schemas.
+                        # Log and continue - other tables still need
+                        # to be wiped.
+                        print(  # noqa: T201
+                            f"  warning: skipping {table}: "
+                            f"{type(exc).__name__}: {exc}",
+                            file=sys.stderr,
+                        )
+                await session.commit()
+                print(  # noqa: T201
+                    f"z4j-brain reset: wiped {wiped_total:,} rows "
+                    f"across {len(_TABLES_TO_WIPE_ORDER)} tables.",
+                )
+        finally:
+            await db.dispose()
+
+        if args.nuke_secrets:
+            secret_env = Path.home() / ".z4j" / "secret.env"
+            if secret_env.exists():
+                secret_env.unlink()
+                print(  # noqa: T201
+                    f"z4j-brain reset: deleted {secret_env} "
+                    "(next serve will mint fresh HMAC keys)",
+                )
+
+        print(  # noqa: T201
+            "z4j-brain reset: done. Run `z4j-brain serve` to see "
+            "the new first-boot setup URL.",
+        )
+        return 0
+
+    # Silence structlog's boot-time warnings during reset.
+    structlog.reset_defaults()
+    return asyncio.run(_wipe())
+
+
+def _run_changepassword(args: argparse.Namespace) -> int:
+    """Reset a user's password from the CLI.
+
+    Invalidates every existing session for the user (by bumping
+    ``password_changed_at``), so sessions issued before this
+    command fail the live-session check on their next request.
+    """
+    import asyncio
+    import getpass
+    import sys
+    from datetime import UTC, datetime
+
+    from sqlalchemy import select
+
+    password = _read_password_from_args(args)
+    if password is None:
+        return 2
+
+    settings, engine = _build_settings_from_env()
+
+    async def _run() -> int:
+        from z4j_brain.auth.passwords import PasswordHasher
+        from z4j_brain.persistence.database import DatabaseManager
+        from z4j_brain.persistence.models import User
+
+        hasher = PasswordHasher(settings)
+        try:
+            hasher.validate_policy(password)
+        except Exception as exc:  # noqa: BLE001
+            print(  # noqa: T201
+                f"z4j-brain changepassword: password rejected: {exc}",
+                file=sys.stderr,
+            )
+            return 3
+
+        db = DatabaseManager(engine)
+        try:
+            async with db.session() as session:
+                user = (
+                    await session.execute(
+                        select(User).where(User.email == args.email.lower()),
+                    )
+                ).scalars().first()
+                if user is None:
+                    print(  # noqa: T201
+                        f"z4j-brain changepassword: no user with email "
+                        f"{args.email!r}",
+                        file=sys.stderr,
+                    )
+                    return 4
+                user.password_hash = hasher.hash(password)
+                user.password_changed_at = datetime.now(UTC)
+                user.failed_login_count = 0
+                user.locked_until = None
+                await session.commit()
+                print(  # noqa: T201
+                    f"z4j-brain changepassword: password updated for "
+                    f"{user.email}. All existing sessions are now invalid.",
+                )
+                return 0
+        finally:
+            await db.dispose()
+
+    return asyncio.run(_run())
+
+
+def _read_password_from_args(args: argparse.Namespace) -> str | None:
+    """Shared helper for password reading (stdin vs flag)."""
+    import sys
+
+    if getattr(args, "password_stdin", False):
+        password = sys.stdin.read().strip()
+        if not password:
+            print(  # noqa: T201
+                "error: empty password from stdin",
+                file=sys.stderr,
+            )
+            return None
+        return password
+    if getattr(args, "password", None):
+        print(  # noqa: T201
+            "WARNING: password passed on the command line is visible "
+            "in shell history and `ps`. Prefer --password-stdin.",
+            file=sys.stderr,
+        )
+        return args.password
+    print(  # noqa: T201
+        "error: must provide --password or --password-stdin",
+        file=sys.stderr,
+    )
+    return None
+
+
+def _run_check(args: argparse.Namespace) -> int:
+    """Validate config + DB connectivity + migrations-at-head.
+
+    Non-destructive. Returns:
+      0 = all green
+      1 = config invalid
+      2 = DB unreachable
+      3 = schema not at alembic head (operator must run migrate)
+    """
+    import asyncio
+    import sys
+
+    from sqlalchemy import text
+
+    checks: list[tuple[str, str]] = []
+
+    try:
+        settings, engine = _build_settings_from_env()
+        checks.append(("config", "OK"))
+    except Exception as exc:  # noqa: BLE001
+        print(  # noqa: T201
+            f"z4j-brain check: config INVALID: "
+            f"{type(exc).__name__}: {exc}",
+            file=sys.stderr,
+        )
+        return 1
+
+    async def _db_check() -> int:
+        from z4j_brain.persistence.database import DatabaseManager
+
+        db = DatabaseManager(engine)
+        try:
+            try:
+                async with db.session() as session:
+                    await session.execute(text("SELECT 1"))
+                checks.append(("database connectivity", "OK"))
+            except Exception as exc:  # noqa: BLE001
+                print(  # noqa: T201
+                    f"z4j-brain check: DB unreachable: "
+                    f"{type(exc).__name__}: {exc}",
+                    file=sys.stderr,
+                )
+                return 2
+
+            try:
+                async with db.session() as session:
+                    row = (
+                        await session.execute(
+                            text(
+                                "SELECT version_num FROM alembic_version",
+                            ),
+                        )
+                    ).first()
+                    if row is None:
+                        checks.append(("alembic version", "NOT INITIALIZED"))
+                        print(  # noqa: T201
+                            "z4j-brain check: alembic_version table empty "
+                            "(run `z4j-brain migrate upgrade head`)",
+                            file=sys.stderr,
+                        )
+                        return 3
+                    checks.append(
+                        ("alembic version", f"at {row[0]}"),
+                    )
+            except Exception as exc:  # noqa: BLE001
+                # alembic_version table missing = fresh DB, not an error.
+                checks.append(
+                    ("alembic version", f"not present ({exc})"),
+                )
+        finally:
+            await db.dispose()
+        return 0
+
+    rc = asyncio.run(_db_check())
+    for name, status in checks:
+        print(f"  {name:30s}  {status}")  # noqa: T201
+    if rc == 0:
+        print("z4j-brain check: all green.")  # noqa: T201
+    return rc
+
+
+def _run_status(args: argparse.Namespace) -> int:
+    """Print a high-level summary of brain state.
+
+    Intended for quick "what's going on" visibility - not a full
+    health check (see `check` for that). Counts rows across the
+    user-visible tables and shows the alembic HEAD revision.
+    """
+    import asyncio
+
+    from sqlalchemy import func, select, text
+
+    settings, engine = _build_settings_from_env()
+
+    async def _run() -> int:
+        from z4j_brain.persistence.database import DatabaseManager
+        from z4j_brain.persistence.models import (
+            Agent,
+            AuditLog,
+            Project,
+            Session as SessionModel,
+            Task,
+            User,
+        )
+
+        db = DatabaseManager(engine)
+        try:
+            async with db.session() as session:
+                async def _count(model: type) -> "int | str":
+                    """Return row count, or 'n/a' if the table doesn't
+                    exist yet (fresh DB, never migrated). Each call uses
+                    a SAVEPOINT so a missing table on one model doesn't
+                    poison the session for the others.
+                    """
+                    try:
+                        async with session.begin_nested():
+                            row = (
+                                await session.execute(
+                                    select(func.count()).select_from(model),
+                                )
+                            ).scalar_one()
+                            return int(row or 0)
+                    except Exception:  # noqa: BLE001
+                        return "n/a"
+
+                users = await _count(User)
+                projects = await _count(Project)
+                agents = await _count(Agent)
+                tasks = await _count(Task)
+                sessions = await _count(SessionModel)
+                audit_rows = await _count(AuditLog)
+
+                try:
+                    rev_row = (
+                        await session.execute(
+                            text(
+                                "SELECT version_num FROM alembic_version",
+                            ),
+                        )
+                    ).first()
+                    rev = rev_row[0] if rev_row else "(none)"
+                except Exception:  # noqa: BLE001
+                    rev = "(alembic_version missing)"
+
+            def _fmt(v: "int | str") -> str:
+                return f"{v:>8,}" if isinstance(v, int) else f"{v:>8}"
+
+            print("z4j status")  # noqa: T201
+            print(f"  version             {__version__}")  # noqa: T201
+            print(f"  alembic head        {rev}")  # noqa: T201
+            print(f"  environment         {settings.environment}")  # noqa: T201
+            print(f"  database            {settings.database_url.split('@')[-1]}")  # noqa: T201
+            print("")  # noqa: T201
+            print("  row counts:")  # noqa: T201
+            print(f"    users             {_fmt(users)}")  # noqa: T201
+            print(f"    projects          {_fmt(projects)}")  # noqa: T201
+            print(f"    agents            {_fmt(agents)}")  # noqa: T201
+            print(f"    tasks             {_fmt(tasks)}")  # noqa: T201
+            print(f"    active sessions   {_fmt(sessions)}")  # noqa: T201
+            print(f"    audit rows        {_fmt(audit_rows)}")  # noqa: T201
+            if any(v == "n/a" for v in (users, projects, agents, tasks, sessions, audit_rows)):
+                print("")  # noqa: T201
+                print(  # noqa: T201
+                    "  (n/a = table not present yet; run "
+                    "`z4j migrate upgrade head`)",
+                )
+            return 0
+        finally:
+            await db.dispose()
+
+    return asyncio.run(_run())
+
+
 def _run_bootstrap_admin(args: argparse.Namespace) -> int:
     """Imperatively create the first admin user + default project.
 
@@ -638,13 +1248,21 @@ def _run_bootstrap_admin(args: argparse.Namespace) -> int:
         print("error: empty password", file=sys.stderr)  # noqa: T201
         return 2
 
-    # Default to SQLite if no DATABASE_URL is set (mirror of serve).
-    if not os.environ.get("Z4J_DATABASE_URL"):
-        data_dir = Path.home() / ".z4j"
-        data_dir.mkdir(parents=True, exist_ok=True)
-        db_path = data_dir / "z4j.db"
-        os.environ["Z4J_DATABASE_URL"] = f"sqlite+aiosqlite:///{db_path}"
-        os.environ.setdefault("Z4J_REGISTRY_BACKEND", "local")
+    # Bootstrap env (DB URL + secrets) so Settings() + alembic can
+    # construct. Fresh-install supported.
+    _bootstrap_env_for_management_commands()
+
+    # Auto-migrate so tables exist on a truly fresh install.
+    # Idempotent: no-op if already at head.
+    try:
+        _auto_migrate()
+    except SystemExit:
+        print(  # noqa: T201
+            "z4j-brain bootstrap-admin: migrations failed. "
+            "Run `z4j-brain migrate upgrade head` manually first.",
+            file=sys.stderr,
+        )
+        return 2
 
     # Thread the env-var path inside run_first_boot_check so the
     # CLI and the env-var mode produce byte-identical outcomes.

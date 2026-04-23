@@ -1,6 +1,6 @@
 [project]
 name = "z4j-brain"
-version = "1.0.4"
+version = "1.0.5"
 description = "z4j brain - server, dashboard, and API (AGPL v3)"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -69,6 +69,16 @@ test-integration = [
 ]
 
 [project.scripts]
+# ``z4j`` is the primary command (matches the package name on
+# pypi.org/project/z4j and the brand at z4j.com / z4j.dev). It's
+# what new docs lead with: ``z4j serve``, ``z4j check``, etc.
+#
+# ``z4j-brain`` is kept as a back-compat alias for users on the
+# 1.0.0-1.0.4 docs. Both scripts call the SAME entry point - they
+# are bit-identical, no behavior difference. Either can be used
+# interchangeably. May be removed in a future major version once
+# all docs/installs have migrated to ``z4j``.
+z4j = "z4j_brain.cli:main"
 z4j-brain = "z4j_brain.cli:main"
 
 [project.urls]

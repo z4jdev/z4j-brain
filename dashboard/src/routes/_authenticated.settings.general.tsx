@@ -7,7 +7,7 @@
 import { createFileRoute } from "@tanstack/react-router";
 import { useQuery } from "@tanstack/react-query";
 import { api } from "@/lib/api";
-import { Info } from "lucide-react";
+import { ExternalLink, Info } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Card } from "@/components/ui/card";
 import { Skeleton } from "@/components/ui/skeleton";
@@ -229,7 +229,42 @@ function GeneralSettingsPage() {
           </div>
         </Card>
       )}
+
+      {/* About */}
+      <Card className="p-6">
+        <h3 className="text-sm font-semibold">About</h3>
+        <p className="mt-1 text-xs text-muted-foreground">
+          License and project resources.
+        </p>
+        <div className="mt-4">
+          <SettingsTable
+            rows={[["License", "AGPL-3.0-or-later"]]}
+          />
+        </div>
+        <div className="mt-4 flex flex-wrap gap-2">
+          <ResourceLink href="https://z4j.com" label="z4j.com" />
+          <ResourceLink href="https://z4j.dev" label="Documentation" />
+          <ResourceLink
+            href="https://github.com/z4jdev"
+            label="GitHub"
+          />
+        </div>
+      </Card>
     </div>
+  );
+}
+
+function ResourceLink({ href, label }: { href: string; label: string }) {
+  return (
+    <a
+      href={href}
+      target="_blank"
+      rel="noopener noreferrer"
+      className="inline-flex items-center gap-1.5 rounded-md border border-border bg-background px-3 py-1.5 text-xs font-medium text-foreground transition-colors hover:bg-muted"
+    >
+      {label}
+      <ExternalLink className="size-3.5 text-muted-foreground" />
+    </a>
   );
 }
 

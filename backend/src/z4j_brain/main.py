@@ -283,10 +283,14 @@ def create_app(
         try:
             async with db.session() as version_session:
                 await check_and_update_schema_version(version_session)
-        except SchemaVersionError:
+        except SchemaVersionError as exc:
+            # Surface the full actionable message (what DB has, what
+            # code has, what the operator should do). Previously this
+            # logged "See logs above for details" which referenced
+            # nothing the operator could actually see in stdout.
             logger.critical(
-                "z4j brain REFUSING TO START: database schema is newer "
-                "than the running code. See logs above for details.",
+                "z4j brain REFUSING TO START: %s",
+                str(exc),
             )
             raise
         except Exception:  # noqa: BLE001

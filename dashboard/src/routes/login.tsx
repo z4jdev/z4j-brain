@@ -1,6 +1,8 @@
 import { useState } from "react";
 import { createFileRoute, useNavigate } from "@tanstack/react-router";
-import { Activity, Eye, EyeOff, Loader2 } from "lucide-react";
+import { Eye, EyeOff, Loader2 } from "lucide-react";
+import { Z4jMark } from "@/components/z4j-mark";
+import { ThemeToggle } from "@/components/layout/theme-toggle";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -14,8 +16,26 @@ import {
   CardTitle,
 } from "@/components/ui/card";
 import { useLogin } from "@/hooks/use-auth";
+import { api, ApiError } from "@/lib/api";
+import type { SetupStatusResponse } from "@/lib/api-types";
 
 export const Route = createFileRoute("/login")({
+  // First-boot guard: if the brain has no admin yet, the login form
+  // would just produce 401 invalid_credentials forever (there's no
+  // user to authenticate). Hard-redirect to the inline /setup form
+  // served by the brain instead. Mirrors the check on the `/` index
+  // route - covers the case where the user navigates directly to
+  // /login (bookmark, refresh after a prior session).
+  beforeLoad: async () => {
+    try {
+      const status = await api.get<SetupStatusResponse>("/setup/status");
+      if (status.first_boot && typeof window !== "undefined") {
+        window.location.href = "/setup";
+      }
+    } catch (err) {
+      if (!(err instanceof ApiError)) throw err;
+    }
+  },
   component: LoginPage,
 });
 
@@ -38,11 +58,14 @@ function LoginPage() {
   }
 
   return (
-    <div className="grid min-h-screen w-full place-items-center bg-background p-6">
+    <div className="relative grid min-h-screen w-full place-items-center bg-background p-6">
+      <div className="absolute right-4 top-4">
+        <ThemeToggle />
+      </div>
       <div className="w-full max-w-sm space-y-6">
         <div className="flex items-center justify-center gap-3">
           <div className="flex size-10 items-center justify-center rounded-lg bg-primary text-primary-foreground shadow-lg shadow-primary/20">
-            <Activity className="size-5" />
+            <Z4jMark className="size-6" />
           </div>
           <div>
             <h1 className="text-xl font-semibold leading-none">z4j</h1>
@@ -110,15 +133,6 @@ function LoginPage() {
           </form>
         </Card>
 
-        <p className="text-center text-xs text-muted-foreground">
-          first time here?{" "}
-          <a
-            href="/setup"
-            className="text-primary underline-offset-4 hover:underline"
-          >
-            run the first-boot setup
-          </a>
-        </p>
       </div>
     </div>
   );
