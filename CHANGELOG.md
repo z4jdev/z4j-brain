@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.4] - 2026-04-23
+
+### Fixed
+
+- **Stale-DB cross-version safety net.** When the bare-metal CLI auto-mints a fresh `Z4J_SECRET` (case 3: no `~/.z4j/secret.env` present), it now also moves any pre-existing `~/.z4j/z4j.db` to `z4j.db.stale-bak` and clears the SQLite WAL/journal sidecars. This fixes a confusing failure mode where an operator who installed an older z4j-brain that crashed mid-bootstrap (DB created by alembic, secret never persisted) and then upgraded would get "invalid_token" errors on every setup attempt - the new install was minting first-boot tokens against a fresh secret, but the audit-log + token-hash chain in the DB was signed under the lost secret.
+- **Less-aggressive setup rate limit.** Bumped `first_boot_attempts_per_ip` default from 5 to 30 in the 15-minute window. The original threshold tripped on common operator UX patterns (form typos, stale browser tabs, double-submits) and the only escape was waiting 15 minutes or wiping `~/.z4j/`.
+- **Rate-limit lockout no longer self-perpetuates.** Each rate-limit-blocked request used to write a `setup.attempt` audit row, which the budget check then counted, pushing the lockout window forward indefinitely. Removed the audit write on the rate-limit branch (the original failures already in the table maintain the count for the full 15-minute TTL).
+- **Actionable error messages on setup failures.** The 404 responses for `no_active_token`, `expired`, and `invalid_token` now include operator-facing guidance ("Restart the brain to mint a fresh setup URL", "This setup link is from a previous server run...", etc.) instead of the opaque "setup token expired or already used".
+
+### Added
+
+- **`z4j-brain reset-setup` CLI command.** Wipes pending first-boot tokens and the `setup.*` audit-log rows so the next `serve` mints a fresh URL from a clean slate. Refuses if a first admin user already exists (security guardrail). For operators stuck in the rate-limit + stale-token loop without wanting to nuke `~/.z4j/`. Use `--force` to skip the prompt.
+
+### Compatibility
+
+- Backwards compatible. Operators who set `Z4J_SECRET`, `Z4J_SESSION_SECRET`, etc. via env vars or compose files are unaffected. The auto-cleanup branch only fires when the brain mints a fresh secret (i.e. when there's no pre-existing `~/.z4j/secret.env`).
+- The rate-limit budget bump is a default-value change. Operators who explicitly pinned `Z4J_FIRST_BOOT_ATTEMPTS_PER_IP` see no behavior change.
+- Setup error messages still return HTTP 404 + the same `details.reason` codes (`no_active_token`, `expired`, `invalid_token`); only the human-readable `message` changed. UI clients that parse `details.reason` are unaffected.
+
 ## [1.0.3] - 2026-04-22
 
 ### Fixed

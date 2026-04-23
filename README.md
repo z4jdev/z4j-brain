@@ -1,7 +1,7 @@
 # z4j-brain
 
 **License:** AGPL v3 - commercial license available (contact `licensing@z4j.com`).
-**Status:** v1.0.3 (production-ready).
+**Status:** v1.0.4 (production-ready).
 
 The z4j brain: FastAPI backend + React dashboard in a single Python
 package. This is the server half of z4j. Agents connect to it over

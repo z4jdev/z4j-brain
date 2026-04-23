@@ -235,7 +235,13 @@ class Settings(BaseSettings):
     #: Hard cap on setup-token verification attempts per IP per 15
     #: minutes. Defends the setup endpoint against brute-forcing the
     #: 256-bit token in the (unlikely) window between mint and consume.
-    first_boot_attempts_per_ip: int = Field(default=5, ge=1, le=100)
+    # Sliding-window cap on FAILED setup attempts per IP. Bumped from
+    # 5 to 30 in 1.0.4 because the original threshold tripped on common
+    # operator UX patterns (form validation typos, stale browser tabs
+    # from prior server runs, double-submits). The window is still 15
+    # minutes; the 30 ceiling protects against credential stuffing
+    # while leaving room for honest retries.
+    first_boot_attempts_per_ip: int = Field(default=30, ge=1, le=100)
 
     # ------------------------------------------------------------------
     # Network - host + proxy + body + timeouts

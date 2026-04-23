@@ -179,20 +179,21 @@ class SetupService:
         these to 410 / 422 / 429 / 409 / 503.
         """
         if not await self._check_attempt_budget(audit_log, ip):
-            await self._audit.record(
-                audit_log,
-                action="setup.attempt",
-                target_type="setup",
-                result="failed",
-                outcome="deny",
-                source_ip=ip,
-                user_agent=user_agent,
-                metadata={"reason": "rate_limited"},
-            )
+            # Deliberately do NOT write a setup.attempt audit row here.
+            # The budget check counts ALL setup.* rows in the window,
+            # so adding one per blocked request would perpetuate the
+            # lockout indefinitely - each retry would push the window
+            # forward by another row. The original failures that
+            # triggered the lockout are still in the table and still
+            # count for the full 15-minute TTL; that's the correct
+            # behavior. Use a non-counted action prefix if a future
+            # version wants to record the rate-limit signal.
             from z4j_brain.errors import RateLimitExceeded
 
             raise RateLimitExceeded(
-                "too many setup attempts from this address",
+                "too many setup attempts from this address. "
+                "Wait 15 minutes for the rate-limit window to clear, "
+                "or restart the brain to mint a fresh setup token.",
             )
 
         # Re-check the user count BEFORE consulting the token table.
@@ -220,7 +221,9 @@ class SetupService:
                 audit_log, ip=ip, user_agent=user_agent, reason="no_active_token",
             )
             raise NotFoundError(
-                "setup token expired or already used",
+                "No active setup token. Restart the brain to mint a "
+                "fresh setup URL, or run `z4j-brain reset-setup` to "
+                "explicitly reset the bootstrap state.",
                 details={"reason": "no_active_token"},
             )
 
@@ -231,7 +234,8 @@ class SetupService:
                 audit_log, ip=ip, user_agent=user_agent, reason="expired",
             )
             raise NotFoundError(
-                "setup token expired or already used",
+                "Setup token has expired (15-minute lifetime). "
+                "Restart the brain to mint a fresh setup URL.",
                 details={"reason": "expired"},
             )
 
@@ -244,7 +248,10 @@ class SetupService:
                 audit_log, ip=ip, user_agent=user_agent, reason="invalid_token",
             )
             raise NotFoundError(
-                "setup token expired or already used",
+                "This setup link is from a previous server run. The "
+                "current server has minted a new token - check your "
+                "terminal for the latest setup URL printed at startup, "
+                "or run `z4j-brain reset-setup` to mint a fresh one.",
                 details={"reason": "invalid_token"},
             )
 

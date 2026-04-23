@@ -96,6 +96,21 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="password on the command line (NOT recommended - visible in ps/history)",
     )
 
+    # reset-setup
+    reset_setup = sub.add_parser(
+        "reset-setup",
+        help=(
+            "wipe the first-boot setup state (pending tokens + recent "
+            "rate-limit attempts) so the next `serve` mints a fresh "
+            "token. REFUSES if an admin user already exists."
+        ),
+    )
+    reset_setup.add_argument(
+        "--force",
+        action="store_true",
+        help="proceed without the safety prompt (for scripts)",
+    )
+
     # version
     sub.add_parser("version", help="print version")
 
@@ -116,6 +131,9 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "bootstrap-admin":
         return _run_bootstrap_admin(args)
+
+    if args.command == "reset-setup":
+        return _run_reset_setup(args)
 
     parser.error(f"unknown command {args.command!r}")
     return 2
@@ -183,6 +201,43 @@ def _run_serve(args: argparse.Namespace) -> int:
             )
         else:
             import secrets as _secrets  # local alias to avoid shadowing
+
+            # Detect a stale DB from a prior install whose secret.env
+            # is gone. This happens when the operator did pip install
+            # of an older z4j-brain version that crashed mid-bootstrap
+            # (so the DB got created during alembic upgrade BUT the
+            # secret was never minted), then upgraded to a fixed
+            # version. Without this guard, we mint a fresh secret + a
+            # fresh first-boot token, but the DB already has the
+            # alembic schema PLUS audit-log rows signed under the old
+            # (lost) secret. Any future audit-log verification would
+            # fail, AND the operator gets confusing "invalid_token"
+            # errors because their browser may have a stale URL from
+            # the prior crashed run.
+            #
+            # When secret.env is brand new, the safe default is to
+            # also wipe z4j.db so we start truly fresh. The user
+            # already explicitly asked for fresh state by deleting
+            # (or never creating) secret.env. Backed up to .bak so
+            # they can recover if they did this by mistake.
+            stale_db = data_dir / "z4j.db"
+            if stale_db.exists():
+                backup = stale_db.with_suffix(".db.stale-bak")
+                # Replace any prior bak so we don't accumulate them
+                if backup.exists():
+                    backup.unlink()
+                stale_db.rename(backup)
+                # Also nuke SQLite's WAL + journal sidecars
+                for suffix in (".db-wal", ".db-shm", ".db-journal"):
+                    sidecar = data_dir / f"z4j{suffix}"
+                    if sidecar.exists():
+                        sidecar.unlink()
+                print(  # noqa: T201
+                    f"z4j-brain: found stale {stale_db.name} from a prior "
+                    f"install but no secret.env - moved aside to "
+                    f"{backup.name} so this install starts fresh. "
+                    "Delete the .stale-bak when you no longer need it.",
+                )
 
             new_secret = _secrets.token_urlsafe(48)
             new_session = _secrets.token_urlsafe(48)
@@ -404,6 +459,134 @@ def _run_audit_verify(args: argparse.Namespace) -> int:
                 print(f"  {mid}")  # noqa: T201
             return 1
         return 0
+
+    return asyncio.run(_run())
+
+
+def _run_reset_setup(args: argparse.Namespace) -> int:
+    """Wipe pending first-boot tokens and the recent setup audit-log
+    rows so the next ``serve`` mints a fresh token from a clean slate.
+
+    Refuses if a first admin already exists (that's a security hole,
+    not a recovery path - someone is trying to reset onboarding for
+    a configured brain). Use the dashboard's account-recovery flow
+    or restore from backup instead.
+
+    Use case: operator restarted the brain, the browser still has a
+    stale URL with the old token, every retry is failing with
+    "invalid_token", and the per-IP rate limit triggered a 15-minute
+    lockout. Run this command, then restart the brain.
+    """
+    import asyncio
+    import os
+    import sys
+    from pathlib import Path
+
+    # Apply the same env-var defaulting that ``serve`` does so this
+    # works zero-config out of the box.
+    if not os.environ.get("Z4J_DATABASE_URL"):
+        data_dir = Path.home() / ".z4j"
+        db_path = data_dir / "z4j.db"
+        if not db_path.exists():
+            print(  # noqa: T201
+                f"z4j-brain reset-setup: no DB found at {db_path}. "
+                "Nothing to reset - run `z4j-brain serve` to bootstrap.",
+                file=sys.stderr,
+            )
+            return 0
+        os.environ["Z4J_DATABASE_URL"] = f"sqlite+aiosqlite:///{db_path}"
+        os.environ.setdefault("Z4J_REGISTRY_BACKEND", "local")
+
+    # Bootstrap secrets the same way serve does, so Settings()
+    # validates. Reset-setup never mints a NEW secret - if there's
+    # no secret.env we have nothing to reset against.
+    if not os.environ.get("Z4J_SECRET"):
+        secret_env = Path.home() / ".z4j" / "secret.env"
+        if not secret_env.exists():
+            print(  # noqa: T201
+                f"z4j-brain reset-setup: no {secret_env} found. "
+                "Run `z4j-brain serve` first to bootstrap secrets.",
+                file=sys.stderr,
+            )
+            return 1
+        for line in secret_env.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            os.environ.setdefault(k.strip(), v.strip())
+
+    os.environ.setdefault("Z4J_ENVIRONMENT", "dev")
+    os.environ.setdefault(
+        "Z4J_ALLOWED_HOSTS", '["localhost","127.0.0.1"]',
+    )
+
+    from sqlalchemy import delete, select
+
+    from z4j_brain.persistence.database import (
+        DatabaseManager,
+        create_engine_from_settings,
+    )
+    from z4j_brain.persistence.models import (
+        AuditLog,
+        FirstBootToken,
+        User,
+    )
+    from z4j_brain.settings import Settings
+
+    settings = Settings()  # type: ignore[call-arg]
+    engine = create_engine_from_settings(settings)
+    db = DatabaseManager(engine)
+
+    async def _run() -> int:
+        try:
+            async with db.session() as session:
+                first_admin = (
+                    await session.execute(select(User).limit(1))
+                ).scalars().first()
+                if first_admin is not None:
+                    print(  # noqa: T201
+                        "z4j-brain reset-setup: REFUSED - an admin user "
+                        "already exists. Reset-setup is only for the "
+                        "pre-first-boot state. Use the dashboard's "
+                        "account-recovery flow or restore from backup "
+                        "if you need to regain access.",
+                        file=sys.stderr,
+                    )
+                    return 2
+
+                if not args.force:
+                    print(  # noqa: T201
+                        "About to wipe:\n"
+                        "  - all pending first-boot tokens\n"
+                        "  - audit-log rows where action like 'setup.%'\n"
+                        "Pass --force to proceed without this prompt. "
+                        "Cancelled (no --force).",
+                        file=sys.stderr,
+                    )
+                    return 1
+
+                tokens_deleted = (
+                    await session.execute(delete(FirstBootToken))
+                ).rowcount
+                audit_deleted = (
+                    await session.execute(
+                        delete(AuditLog).where(
+                            AuditLog.action.like("setup.%"),
+                        ),
+                    )
+                ).rowcount
+                await session.commit()
+
+                print(  # noqa: T201
+                    f"z4j-brain reset-setup: wiped {tokens_deleted} "
+                    f"pending token(s) and {audit_deleted} audit-log "
+                    "row(s). Run `z4j-brain serve` to mint a fresh "
+                    "setup URL.",
+                )
+                return 0
+        finally:
+            await db.dispose()
 
     return asyncio.run(_run())
 
