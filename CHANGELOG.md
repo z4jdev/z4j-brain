@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.8] - 2026-04-24
+
+### Added
+
+- **Persistent allow-list file at `~/.z4j/allowed-hosts`.** One hostname per line, `#` comments allowed. Read by `z4j serve` on every boot and merged into the auto-detected hostname/IP set. The answer to "where do I put my public DNS name (e.g. `tasks.example.com`) so I don't have to set `Z4J_ALLOWED_HOSTS` or pass `--allowed-host` every time".
+
+- **`z4j allowed-hosts` subcommand** to manage the file from the CLI:
+
+  ```bash
+  z4j allowed-hosts add tasks.example.com api.example.com
+  z4j allowed-hosts list
+  z4j allowed-hosts remove old-name.example.com
+  z4j allowed-hosts path
+  ```
+
+  All operations are atomic + idempotent. Edits take effect on the next `z4j serve` start.
+
+- **Boot banner now shows persisted file source.** When `~/.z4j/allowed-hosts` is non-empty, the startup output explicitly calls it out so operators can see exactly where each allowed host came from.
+
+### Security
+
+- **`invalid_host` 400 response no longer leaks internal hostnames in non-dev mode.** Previously the rejection payload included `rejected_host`, the full `allowed_hosts` array (with internal LAN IPs, Tailscale node names, hostnames), and a ready-to-paste `Z4J_ALLOWED_HOSTS=...` value - all visible to any unauthenticated HTTP client (web crawlers, attackers probing the surface, accidental scrapers). Mirrors Django's DEBUG-only detailed-error pattern:
+  - **dev mode** (default for SQLite/pip path): full detail in the response (the operator IS the HTTP client).
+  - **non-dev mode** (Postgres production): minimal body - just `{"error":"invalid_host","message":"Bad Request: invalid Host header.","request_id":"..."}`. The verbose detail is still in the operator-facing INFO log (`journalctl` / docker logs), correlatable via `request_id`. Crawlers and attackers learn nothing about internal infrastructure.
+
 ## [1.0.7] - 2026-04-23
 
 ### Added

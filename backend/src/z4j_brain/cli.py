@@ -265,6 +265,32 @@ def main(argv: Sequence[str] | None = None) -> int:
         ),
     )
 
+    # allowed-hosts (manage the persistent ~/.z4j/allowed-hosts file)
+    ah = sub.add_parser(
+        "allowed-hosts",
+        help=(
+            "manage the persistent Host: header allow-list at "
+            "~/.z4j/allowed-hosts. Hosts added here are merged into the "
+            "auto-detect set on every `z4j serve` start, so you don't "
+            "need to set Z4J_ALLOWED_HOSTS or pass --allowed-host every "
+            "time."
+        ),
+    )
+    ah_sub = ah.add_subparsers(
+        dest="ah_action",
+        required=True,
+        title="actions",
+        metavar="<action>",
+    )
+    ah_sub.add_parser("list", help="print the current persisted allow-list")
+    ah_add = ah_sub.add_parser("add", help="add one or more hosts to the file")
+    ah_add.add_argument("hosts", nargs="+", metavar="HOST",
+                        help="hostname or IP literal to allow")
+    ah_rm = ah_sub.add_parser("remove", help="remove one or more hosts from the file")
+    ah_rm.add_argument("hosts", nargs="+", metavar="HOST",
+                       help="hostname or IP literal to remove")
+    ah_sub.add_parser("path", help="print the file path the brain reads from")
+
     # version
     sub.add_parser("version", help="print installed z4j-brain version")
 
@@ -306,7 +332,72 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "status":
         return _run_status(args)
 
+    if args.command == "allowed-hosts":
+        return _run_allowed_hosts(args)
+
     parser.error(f"unknown command {args.command!r}")
+    return 2
+
+
+def _run_allowed_hosts(args: argparse.Namespace) -> int:
+    """Handle ``z4j allowed-hosts {list,add,remove,path}``.
+
+    Thin wrapper over :mod:`z4j_brain.allowed_hosts`. All actions
+    operate on the same on-disk file so a `serve` invocation reads
+    exactly what an earlier `add` wrote.
+    """
+    from z4j_brain.allowed_hosts import add, get_path, read_persisted, remove
+
+    action = args.ah_action
+
+    if action == "path":
+        print(get_path())  # noqa: T201
+        return 0
+
+    if action == "list":
+        path = get_path()
+        hosts = read_persisted()
+        if not hosts:
+            print(f"(no persisted hosts in {path})")  # noqa: T201
+            print(  # noqa: T201
+                "Add one with: z4j allowed-hosts add tasks.example.com",
+            )
+            return 0
+        print(f"# persisted hosts ({path}):")  # noqa: T201
+        for h in hosts:
+            print(f"  {h}")  # noqa: T201
+        print(  # noqa: T201
+            "\nThese are merged into the auto-detected hostname/IP "
+            "set on every `z4j serve` start.",
+        )
+        return 0
+
+    if action == "add":
+        added, skipped = add(args.hosts)
+        for h in added:
+            print(f"  added:   {h}")  # noqa: T201
+        for h in skipped:
+            print(f"  skipped: {h} (already present)")  # noqa: T201
+        if added:
+            print(  # noqa: T201
+                f"\nWrote {get_path()}. Restart `z4j serve` for the "
+                f"change to take effect.",
+            )
+        return 0
+
+    if action == "remove":
+        removed, not_found = remove(args.hosts)
+        for h in removed:
+            print(f"  removed:   {h}")  # noqa: T201
+        for h in not_found:
+            print(f"  not found: {h}")  # noqa: T201
+        if removed:
+            print(  # noqa: T201
+                f"\nWrote {get_path()}. Restart `z4j serve` for the "
+                f"change to take effect.",
+            )
+        return 0
+
     return 2
 
 
@@ -496,6 +587,18 @@ def _run_serve(args: argparse.Namespace) -> int:
             except Exception:  # noqa: BLE001
                 pass
 
+            # 3) Merge persisted allow-list from `~/.z4j/allowed-hosts`.
+            # Operators add custom domains here once via
+            # `z4j allowed-hosts add tasks.example.com`; the file is read
+            # on every boot. This is the answer to "where do I put my
+            # public DNS name so I don't have to pass --allowed-host
+            # every time".
+            from z4j_brain.allowed_hosts import read_persisted
+
+            for h in read_persisted():
+                if h and h.lower() not in {x.lower() for x in auto_hosts}:
+                    auto_hosts.append(h)
+
             os.environ["Z4J_ALLOWED_HOSTS"] = _json.dumps(auto_hosts)
 
     # Merge any --allowed-host CLI flags onto whatever env / auto-detect
@@ -553,15 +656,24 @@ def _run_serve(args: argparse.Namespace) -> int:
     # hit the brain with a wrong Host and read the (now improved) 400
     # response, which assumes the operator can reach the brain at all.
     if settings.allowed_hosts:
+        from z4j_brain.allowed_hosts import get_path as _ah_path
+        from z4j_brain.allowed_hosts import read_persisted as _ah_read
+
         bind = args.host or settings.bind_host
         port = args.port or settings.bind_port
         joined = ", ".join(settings.allowed_hosts)
         print(  # noqa: T201
             f"z4j-brain: serving on {bind}:{port}, accepting Host headers: {joined}",
         )
+        persisted = _ah_read()
+        if persisted:
+            print(  # noqa: T201
+                f"z4j-brain: persisted from {_ah_path()}: "
+                f"{', '.join(persisted)}",
+            )
         print(  # noqa: T201
-            f"z4j-brain: to add more, restart with `--allowed-host <name>` "
-            f"(repeatable) or set Z4J_ALLOWED_HOSTS",
+            f"z4j-brain: to add more, run `z4j allowed-hosts add <name>` "
+            f"(persists across restarts).",
         )
 
     uvicorn.run(

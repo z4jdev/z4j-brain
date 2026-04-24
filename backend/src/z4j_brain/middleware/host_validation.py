@@ -67,42 +67,80 @@ class HostValidationMiddleware(BaseHTTPMiddleware):
         host_header = request.headers.get("host", "")
         host = self._strip_port(host_header).lower()
         if host and host not in self._allowed:
-            # Log at INFO so the rejection is visible without curling
-            # the response body. The hint mirrors what the JSON payload
-            # below carries.
+            # Operator-facing log: ALWAYS verbose, regardless of mode.
+            # The operator runs `z4j serve` and watches stderr (or
+            # journalctl / docker logs); leaking detail there is fine.
+            # Public HTTP responses below are NOT verbose in production.
             logger.info(
                 "z4j: rejected request - Host header %r is not in the "
-                "allow-list. Allow it via `Z4J_ALLOWED_HOSTS=%s,...` or "
-                "restart with `z4j serve --allowed-host %s`.",
+                "allow-list. Persist it via `z4j allowed-hosts add %s` "
+                "or restart with `z4j serve --allowed-host %s`. Current "
+                "allow-list: %s",
                 host_header,
                 host,
                 host,
+                list(self._allowed_display),
             )
+            return self._build_rejection(request, host)
+        return await call_next(request)
+
+    def _build_rejection(self, request: Request, host: str) -> JSONResponse:
+        """Build the 400 response body.
+
+        Verbosity is gated on ``settings.environment == "dev"``:
+
+        - **dev mode** (laptop, single-operator, the operator IS the
+          HTTP client): include the rejected host, the full allow-list,
+          and a concrete fix command. Helpful "what do I do" message.
+        - **non-dev mode** (production, public-facing): minimal body -
+          just the error code + request_id. Operators read the full
+          detail from server logs (the INFO line above) which crawlers
+          and attackers cannot see. Mirrors Django's DEBUG-only
+          detailed-error pattern.
+
+        This avoids leaking internal hostnames, LAN IPs, Tailscale node
+        names, or a ready-to-paste env var value to anyone hitting the
+        brain through a public reverse proxy.
+        """
+        request_id = getattr(request.state, "request_id", None)
+        if self._dev:
             return JSONResponse(
                 status_code=400,
                 content={
                     "error": "invalid_host",
                     "message": (
                         f"Host header {host!r} is not in the configured "
-                        f"allow-list. The brain refuses unrecognized Host "
-                        f"headers to prevent cache-poisoning attacks."
+                        f"allow-list. The brain refuses unrecognized "
+                        f"Host headers to prevent cache-poisoning "
+                        f"attacks."
                     ),
-                    "request_id": getattr(request.state, "request_id", None),
+                    "request_id": request_id,
                     "details": {
                         "rejected_host": host,
                         "allowed_hosts": list(self._allowed_display),
                         "fix": (
-                            f"Add the host to the allow-list. Either set "
-                            f"Z4J_ALLOWED_HOSTS=\"{host},"
-                            f"{','.join(self._allowed_display) or 'localhost'}\" "
-                            f"in the brain's environment, OR restart with "
-                            f"`z4j serve --allowed-host {host}` "
-                            f"(repeatable). Then reload this page."
+                            f"Persist the host: run "
+                            f"`z4j allowed-hosts add {host}` and "
+                            f"restart `z4j serve`. (Or pin via "
+                            f"Z4J_ALLOWED_HOSTS env / "
+                            f"`z4j serve --allowed-host {host}`.) "
+                            f"Then reload this page."
                         ),
                     },
                 },
             )
-        return await call_next(request)
+        # Production: opaque body. Operator correlates via request_id
+        # against the verbose INFO log line above. Crawlers, scanners,
+        # and attackers learn nothing about internal hostnames or the
+        # configured allow-list.
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": "invalid_host",
+                "message": "Bad Request: invalid Host header.",
+                "request_id": request_id,
+            },
+        )
 
     @staticmethod
     def _strip_port(host: str) -> str:
