@@ -224,14 +224,24 @@ function TrendTooltip({ bucket }: { bucket: TrendBucket }) {
   );
 }
 
+// Match a trailing timezone marker (Z / ±HH:MM / ±HHMM). When the
+// backend serializes a naive Python datetime via isoformat() the
+// marker is missing, and the JS Date constructor would interpret it
+// as local time - producing tick labels that are off by the operator's
+// UTC offset. See lib/format.ts for the same fix in the global formatters.
+const _ZONE_SUFFIX = /(?:[zZ]|[+-]\d{2}:?\d{2})$/;
+function _parseAsUtc(iso: string): Date {
+  return new Date(_ZONE_SUFFIX.test(iso) ? iso : iso + "Z");
+}
+
 function formatTick(iso: string): string {
-  const d = new Date(iso);
+  const d = _parseAsUtc(iso);
   if (Number.isNaN(d.getTime())) return iso;
   return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
 }
 
 function formatTooltipTime(iso: string): string {
-  const d = new Date(iso);
+  const d = _parseAsUtc(iso);
   if (Number.isNaN(d.getTime())) return iso;
   return d.toLocaleString([], {
     month: "short",

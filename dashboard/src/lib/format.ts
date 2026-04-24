@@ -16,11 +16,49 @@
 
 const _RTF = new Intl.RelativeTimeFormat(undefined, { numeric: "auto" });
 
+// Detect a trailing timezone marker on an ISO-8601 string. Matches:
+//   "...Z"            (UTC)
+//   "...+00:00"       (offset with colon)
+//   "...+0000"        (offset without colon)
+//   "...-05:00"       (negative offset)
+const _ZONE_SUFFIX = /(?:[zZ]|[+-]\d{2}:?\d{2})$/;
+
+/**
+ * Parse a wire-format timestamp into a Date, treating the value as UTC
+ * when no timezone marker is present.
+ *
+ * The brain's REST API serializes timestamps via Python's
+ * ``datetime.isoformat()``. When the underlying ``datetime`` instance
+ * is naive (no ``tzinfo``), the wire string lacks ``Z`` / ``+00:00``,
+ * and the ``Date`` constructor follows ECMA-262 by interpreting it as
+ * **local time**. For an operator in EDT (UTC-4) reading a UTC-stored
+ * task that just ran, that produced "in 4 hours" for a value 5 minutes
+ * in the past - a confusing demo bug for anyone outside UTC.
+ *
+ * The defensive fix here normalises before parsing: if the string has
+ * no timezone marker, we append ``Z`` so the parse is unambiguously
+ * UTC. Strings that already carry a marker are passed through verbatim
+ * (the marker, whatever it is, takes precedence).
+ */
+function _parseAsUtc(value: string | Date): Date {
+  if (value instanceof Date) return value;
+  return new Date(_ZONE_SUFFIX.test(value) ? value : value + "Z");
+}
+
+/**
+ * Public parser: use this anywhere outside lib/format.ts that needs to
+ * read a wire-format timestamp into a Date. The same UTC-default rule
+ * applies (see _parseAsUtc above for the rationale).
+ */
+export function parseTimestamp(value: string | Date): Date {
+  return _parseAsUtc(value);
+}
+
 /** Render an ISO timestamp as "5 minutes ago". */
 export function formatRelative(value: string | Date | null | undefined): string {
   if (!value) return "-";
   try {
-    const date = typeof value === "string" ? new Date(value) : value;
+    const date = _parseAsUtc(value);
     const diffMs = date.getTime() - Date.now();
     const absSec = Math.abs(diffMs) / 1000;
     if (absSec < 45) return _RTF.format(Math.round(diffMs / 1000), "second");
@@ -34,13 +72,13 @@ export function formatRelative(value: string | Date | null | undefined): string 
   }
 }
 
-/** Render an ISO timestamp as "2026-04-11 14:30:05" (UTC-naive local time). */
+/** Render an ISO timestamp as "2026-04-11 14:30:05" in the operator's local timezone. */
 export function formatAbsolute(
   value: string | Date | null | undefined,
 ): string {
   if (!value) return "-";
   try {
-    const d = typeof value === "string" ? new Date(value) : value;
+    const d = _parseAsUtc(value);
     if (Number.isNaN(d.getTime())) return "-";
     const pad = (n: number) => n.toString().padStart(2, "0");
     return (

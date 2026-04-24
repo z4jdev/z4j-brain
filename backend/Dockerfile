@@ -3,16 +3,16 @@
 # z4j-brain unified image (backend + dashboard).
 #
 # Multi-stage build:
-#   1. dashboard-builder — Node 24 + pnpm. Compiles the
+#   1. dashboard-builder - Node 24 + pnpm. Compiles the
 #      TanStack Router + Vite dashboard to static HTML/CSS/JS.
-#   2. python-builder    — Python 3.14 + uv. Builds the brain
+#   2. python-builder    - Python 3.14 + uv. Builds the brain
 #      backend wheel and resolves all runtime deps into a venv.
-#   3. runtime           — Debian Trixie slim. Copies the venv
+#   3. runtime           - Debian Trixie slim. Copies the venv
 #      from stage 2 and the dashboard dist from stage 1, then
 #      runs as a non-root user under tini.
 #
 # We deliberately base on python:3.14-slim-trixie (Debian 13).
-# Alpine is not supported — see docs/CLAUDE.md §4.6 for the
+# Alpine is not supported - see docs/CLAUDE.md §4.6 for the
 # rationale (glibc wheels, asyncpg + argon2-cffi + uvloop
 # compile-from-source pain on musl, enterprise scanner baselines).
 #
@@ -25,7 +25,7 @@ ARG DEBIAN_RELEASE=trixie
 ARG NODE_VERSION=24
 
 # ---------------------------------------------------------------------------
-# Stage 1 — dashboard build
+# Stage 1 - dashboard build
 # ---------------------------------------------------------------------------
 FROM node:${NODE_VERSION}-bookworm-slim AS dashboard-builder
 
@@ -56,7 +56,7 @@ COPY packages/z4j-brain/dashboard/ ./
 RUN pnpm build
 
 # Source maps are emitted with ``sourcemap: "hidden"`` in
-# vite.config.ts — the bundle references them indirectly but the
+# vite.config.ts - the bundle references them indirectly but the
 # browser never auto-fetches them. Dropping them here (in the
 # dashboard-builder stage, before ``COPY --from=dashboard-builder``)
 # keeps the runtime dist/ layer ~3.5 MB smaller. Dropping them in a
@@ -64,7 +64,7 @@ RUN pnpm build
 RUN find dist -name '*.map' -delete
 
 # ---------------------------------------------------------------------------
-# Stage 2 — python builder
+# Stage 2 - python builder
 # ---------------------------------------------------------------------------
 FROM python:${PYTHON_VERSION}-slim-${DEBIAN_RELEASE} AS python-builder
 
@@ -85,7 +85,7 @@ RUN pip install --no-cache-dir "uv>=0.5.10"
 
 # IMPORTANT: do NOT copy the workspace root pyproject.toml here.
 # If uv sees a workspace root, it installs every workspace member
-# as an editable .pth pointing at the build context — and the
+# as an editable .pth pointing at the build context - and the
 # runtime stage doesn't have the build context, so imports fail
 # at startup with "No module named z4j_core". By copying the two
 # package trees into a non-workspace directory, uv builds real
@@ -142,7 +142,7 @@ RUN set -eux; \
         2>/dev/null || true
 
 # ---------------------------------------------------------------------------
-# Stage 3 — runtime
+# Stage 3 - runtime
 # ---------------------------------------------------------------------------
 FROM python:${PYTHON_VERSION}-slim-${DEBIAN_RELEASE} AS runtime
 
@@ -182,7 +182,7 @@ RUN apt-get update \
 # Backend venv from python-builder.
 COPY --from=python-builder /opt/venv /opt/venv
 
-# Dashboard dist from dashboard-builder. Static files only —
+# Dashboard dist from dashboard-builder. Static files only -
 # no Node runtime in the final image.
 COPY --from=dashboard-builder /dashboard/dist /app/dashboard/dist
 
@@ -230,7 +230,7 @@ RUN set -eux; \
 #
 # The source-tree alembic.ini uses `script_location = src/z4j_brain/migrations`
 # which only resolves when run from the backend source dir. In the
-# image we don't ship the source tree — only the installed wheel —
+# image we don't ship the source tree - only the installed wheel -
 # so we use Python package notation, which alembic resolves through
 # importlib against the wheel under /opt/venv. env.py is identical
 # in both layouts so no other config changes are needed.
@@ -286,14 +286,14 @@ RUN printf '%s\n' \
     '  echo "[z4j] using SQLite at /data/z4j.db (dev mode)"' \
     'fi' \
     '' \
-    '# Secret handling — persist across restarts so an evaluation' \
+    '# Secret handling - persist across restarts so an evaluation' \
     '# `docker run` that mints an agent token and sets up an admin' \
     '# user does not lose both on the next `docker restart`.' \
     '# Precedence:' \
-    '#   1. explicit env (op-provided) — use as-is' \
-    '#   2. /data/secret.env exists — source it (persisted from' \
+    '#   1. explicit env (op-provided) - use as-is' \
+    '#   2. /data/secret.env exists - source it (persisted from' \
     '#      a previous boot) so tokens/sessions remain valid' \
-    '#   3. neither — mint fresh + persist to /data/secret.env' \
+    '#   3. neither - mint fresh + persist to /data/secret.env' \
     'if [ -z "$Z4J_SECRET" ]; then' \
     '  if [ -f /data/secret.env ]; then' \
     '    # shellcheck disable=SC1091' \
@@ -309,7 +309,7 @@ RUN printf '%s\n' \
     '    } > /data/secret.env' \
     '    chmod 600 /data/secret.env' \
     '    echo "[z4j] minted fresh Z4J_SECRET + Z4J_SESSION_SECRET, persisted to /data/secret.env"' \
-    '    echo "[z4j] WARNING: evaluation mode — set Z4J_SECRET via env and back /data up for production"' \
+    '    echo "[z4j] WARNING: evaluation mode - set Z4J_SECRET via env and back /data up for production"' \
     '  fi' \
     '  export Z4J_SECRET Z4J_SESSION_SECRET' \
     'fi' \
@@ -342,7 +342,7 @@ CMD ["z4j-brain", "serve"]
 
 
 # ---------------------------------------------------------------------------
-# Stage 4 — dev-runtime (used by docker-compose.dev.yml only)
+# Stage 4 - dev-runtime (used by docker-compose.dev.yml only)
 # ---------------------------------------------------------------------------
 # Same venv as production but:
 #   - no dashboard dist (Vite serves the dashboard from a sibling
@@ -420,7 +420,7 @@ RUN printf '%s\n' \
 
 # Same entrypoint shim as production: run migrations to head, then
 # exec the actual server. The shim is simple enough that it does
-# not need a rebuild for hot-reload — uvicorn --reload watches the
+# not need a rebuild for hot-reload - uvicorn --reload watches the
 # mounted source paths and restarts the python process in place.
 RUN printf '%s\n' \
     '#!/bin/sh' \

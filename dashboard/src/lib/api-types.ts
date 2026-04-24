@@ -97,6 +97,12 @@ export interface AgentPublic {
    *  advertised protocol_version is older than the brain's
    *  CURRENT_PROTOCOL. */
   is_outdated: boolean;
+  /** Operator-supplied host label sent by the agent in the hello
+   *  frame's `host.name` field (from `Z4J_AGENT_NAME` / settings.Z4J
+   *  `agent_name`). Distinct from `name` (set at mint time). Useful
+   *  when one agent token is shared across multiple workers and you
+   *  want per-instance labels. Null if the agent never set it. */
+  host_name?: string | null;
 }
 
 export interface CreateAgentRequest {

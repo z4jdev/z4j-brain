@@ -79,23 +79,58 @@ class AgentRepository(BaseRepository[Agent]):
         engine_adapters: list[str],
         scheduler_adapters: list[str],
         capabilities: dict[str, Any],
+        host: dict[str, Any] | None = None,
     ) -> None:
-        """Set state=online + bump connect/seen + refresh handshake metadata."""
+        """Set state=online + bump connect/seen + refresh handshake metadata.
+
+        ``host`` carries the agent's optional ``host`` dict from the hello
+        frame's payload (currently the operator-provided ``host.name`` label).
+        Stored under ``agent_metadata['host']`` so it survives across the
+        existing schema without a migration. Dashboards surface
+        ``host.name`` next to the mint-time agent name.
+        """
         now = datetime.now(UTC)
-        await self.session.execute(
-            update(Agent)
-            .where(Agent.id == agent_id)
-            .values(
-                state=AgentState.ONLINE,
-                last_connect_at=now,
-                last_seen_at=now,
-                protocol_version=protocol_version,
-                framework_adapter=framework_adapter,
-                engine_adapters=engine_adapters,
-                scheduler_adapters=scheduler_adapters,
-                capabilities=capabilities,
-            ),
-        )
+        # Read-modify-write the JSONB metadata column so we don't trample
+        # other keys a future feature might add. Single round-trip via a
+        # SELECT-then-UPDATE is fine here - mark_online runs once per
+        # agent connection, not per frame.
+        if host:
+            row = await self.session.execute(
+                select(Agent.agent_metadata).where(Agent.id == agent_id),
+            )
+            current_meta = row.scalar_one_or_none() or {}
+            new_meta = dict(current_meta)
+            new_meta["host"] = dict(host)
+            await self.session.execute(
+                update(Agent)
+                .where(Agent.id == agent_id)
+                .values(
+                    state=AgentState.ONLINE,
+                    last_connect_at=now,
+                    last_seen_at=now,
+                    protocol_version=protocol_version,
+                    framework_adapter=framework_adapter,
+                    engine_adapters=engine_adapters,
+                    scheduler_adapters=scheduler_adapters,
+                    capabilities=capabilities,
+                    agent_metadata=new_meta,
+                ),
+            )
+        else:
+            await self.session.execute(
+                update(Agent)
+                .where(Agent.id == agent_id)
+                .values(
+                    state=AgentState.ONLINE,
+                    last_connect_at=now,
+                    last_seen_at=now,
+                    protocol_version=protocol_version,
+                    framework_adapter=framework_adapter,
+                    engine_adapters=engine_adapters,
+                    scheduler_adapters=scheduler_adapters,
+                    capabilities=capabilities,
+                ),
+            )
 
     async def mark_offline(self, agent_id: UUID) -> None:
         """Set state=offline. Idempotent."""

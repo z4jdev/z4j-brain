@@ -184,6 +184,11 @@ async def ws_agent(websocket: WebSocket) -> None:
             capabilities={
                 k: list(v) for k, v in first_frame.payload.capabilities.items()
             },
+            # Carries the agent's optional `host.name` label and any other
+            # host-level metadata. The agent (z4j-bare 1.0.3+) populates
+            # this from the operator's `Z4J_AGENT_NAME` env / settings.Z4J
+            # ``agent_name`` field. Persisted under agent_metadata['host'].
+            host=dict(first_frame.payload.host) if first_frame.payload.host else None,
         )
         await db_session.commit()
 

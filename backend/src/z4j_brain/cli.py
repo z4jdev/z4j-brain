@@ -78,6 +78,19 @@ def main(argv: Sequence[str] | None = None) -> int:
         default=None,
         help="password for the auto-created admin user",
     )
+    serve.add_argument(
+        "--allowed-host",
+        action="append",
+        default=[],
+        metavar="HOST",
+        help=(
+            "Add a host to the Host: header allow-list. Repeatable. "
+            "Merged with Z4J_ALLOWED_HOSTS env, the auto-detected system "
+            "hostname, and localhost. Use this when you reach the brain "
+            "via a hostname or IP that the auto-detect missed - e.g. "
+            "`--allowed-host brain.internal.lan`."
+        ),
+    )
 
     # migrate
     migrate = sub.add_parser("migrate", help="run an alembic command")
@@ -426,9 +439,47 @@ def _run_serve(args: argparse.Namespace) -> int:
     # if the operator hasn't pinned them. Mirrors the Docker entrypoint.
     if not os.environ.get("Z4J_DATABASE_URL", "").startswith("postgresql"):
         os.environ.setdefault("Z4J_ENVIRONMENT", "dev")
-        os.environ.setdefault(
-            "Z4J_ALLOWED_HOSTS", '["localhost","127.0.0.1"]',
-        )
+        # Smart default allow-list: localhost + the machine's own hostname
+        # and FQDN. Lets `pip install z4j && z4j serve` on a remote VM
+        # work without the operator having to set Z4J_ALLOWED_HOSTS for
+        # the hostname they already know they're reaching. Operator can
+        # override by setting Z4J_ALLOWED_HOSTS explicitly (env wins),
+        # or by adding --allowed-host flags (merged below).
+        if "Z4J_ALLOWED_HOSTS" not in os.environ:
+            import json as _json
+            import socket as _socket
+
+            auto_hosts: list[str] = ["localhost", "127.0.0.1", "[::1]"]
+            for fn_name in ("gethostname", "getfqdn"):
+                try:
+                    h = getattr(_socket, fn_name)()
+                    if h and h.lower() not in {x.lower() for x in auto_hosts}:
+                        auto_hosts.append(h)
+                except Exception:  # noqa: BLE001
+                    pass
+            os.environ["Z4J_ALLOWED_HOSTS"] = _json.dumps(auto_hosts)
+
+    # Merge any --allowed-host CLI flags onto whatever env / auto-detect
+    # produced. The CLI flag is a repeatable convenience for ad-hoc hosts
+    # ("this VM's DNS name", "an internal load balancer", ...) - it never
+    # replaces the env, only extends it.
+    if getattr(args, "allowed_host", None):
+        import json as _json
+
+        current = os.environ.get("Z4J_ALLOWED_HOSTS", "[]").strip()
+        try:
+            existing = _json.loads(current) if current else []
+            if not isinstance(existing, list):
+                existing = []
+        except Exception:  # noqa: BLE001
+            # Tolerate a comma-separated string in the env var - some
+            # operators reach for the shell-native form.
+            existing = [s.strip() for s in current.split(",") if s.strip()]
+        merged = list(existing)
+        for h in args.allowed_host:
+            if h and h not in merged:
+                merged.append(h)
+        os.environ["Z4J_ALLOWED_HOSTS"] = _json.dumps(merged)
 
     # Auto-migrate before serve. The bare-metal quickstart used to
     # leave migrations to a manual ``z4j-brain migrate upgrade head``
@@ -457,6 +508,23 @@ def _run_serve(args: argparse.Namespace) -> int:
     from z4j_brain.settings import Settings
 
     settings = Settings()  # type: ignore[call-arg]
+
+    # Tell the operator exactly which Host headers will be accepted.
+    # Without this banner the only way to learn what's whitelisted is to
+    # hit the brain with a wrong Host and read the (now improved) 400
+    # response, which assumes the operator can reach the brain at all.
+    if settings.allowed_hosts:
+        bind = args.host or settings.bind_host
+        port = args.port or settings.bind_port
+        joined = ", ".join(settings.allowed_hosts)
+        print(  # noqa: T201
+            f"z4j-brain: serving on {bind}:{port}, accepting Host headers: {joined}",
+        )
+        print(  # noqa: T201
+            f"z4j-brain: to add more, restart with `--allowed-host <name>` "
+            f"(repeatable) or set Z4J_ALLOWED_HOSTS",
+        )
+
     uvicorn.run(
         "z4j_brain.main:create_app",
         host=args.host or settings.bind_host,

@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.6] - 2026-04-23
+
+### Added
+
+- **`z4j serve --allowed-host` (repeatable)** for ad-hoc Host-header allow-list additions. Use when reaching the brain via a hostname or IP that the auto-detect missed:
+
+  ```bash
+  z4j serve --allowed-host brain.internal.lan --allowed-host 10.0.0.5
+  ```
+
+  Merges with `Z4J_ALLOWED_HOSTS` env (env wins), the auto-detected system hostname (see below), and localhost.
+
+- **Auto-detect the server's hostname + FQDN on the SQLite/dev path.** A fresh `pip install z4j && z4j serve` on a remote VM now accepts requests to that hostname out of the box without any `Z4J_ALLOWED_HOSTS` config. Previously the bare-metal pip default was `["localhost","127.0.0.1"]`, so accessing the brain via the server's actual hostname returned `invalid_host` 400. Auto-detect adds `socket.gethostname()` + `socket.getfqdn()` to the dev defaults. Production (Postgres) still requires `Z4J_ALLOWED_HOSTS` explicitly.
+
+- **Boot banner showing the resolved Host: allow-list.** Right after the first-boot setup-token banner, `z4j serve` now prints what it will accept, plus how to add more.
+
+- **Agent `host_name` exposed on the agents API.** The agent's hello frame already carried `host.name` (z4j-bare 1.0.3+, populated from `Z4J_AGENT_NAME` / `settings.Z4J["agent_name"]`). The brain now persists it under `agent_metadata.host` and exposes it as a `host_name` field on `GET /api/v1/projects/{slug}/agents`. Useful when one agent token is shared across multiple workers and you want per-instance labels in the dashboard.
+
+### Fixed
+
+- **`invalid_host` rejection error is now actionable.** Previously the response was a bare `{"error":"invalid_host","details":{}}`. The 400 now includes `rejected_host`, `allowed_hosts`, and a concrete `fix` string showing both the env-var form and the CLI-flag form. Also logs the rejection at INFO so operators see it in `journalctl` / docker logs without curling the response.
+
+- **Dashboard timestamps no longer render as "in 4 hours" for non-UTC operators.** The bug: backend serializes some datetime columns via Python's `datetime.isoformat()` which omits the timezone marker for naive datetimes; the dashboard's `new Date(value)` parser then interpreted the string as local time per ECMA-262, putting a UTC timestamp 4-6 hours into the future for an operator in EDT/CST/PDT. Fix is defensive on the frontend: the new `parseTimestamp` helper appends `Z` to any timestamp string with no timezone marker before parsing. Applies to `formatRelative`, `formatAbsolute`, the trends-chart tick labels, and notification mute states.
+
+- **Dashboard renders `host_name` on the agents page.** When the agent advertised an operator-supplied label via `Z4J_AGENT_NAME`, the brain previously stored it nowhere and the dashboard had no way to show it. Now visible as a "host: &lt;name&gt;" sub-label under the mint-time agent name on `/projects/{slug}/agents` (only when present and different from the mint-time name).
+
 ## [1.0.5] - 2026-04-23
 
 ### Added

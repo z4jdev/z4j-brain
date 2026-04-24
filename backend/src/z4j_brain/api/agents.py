@@ -73,6 +73,17 @@ class AgentPublic(BaseModel):
             "they have not advertised a real version yet."
         ),
     )
+    host_name: str | None = Field(
+        default=None,
+        description=(
+            "Operator-supplied host label sent by the agent in the "
+            "hello frame's ``host.name`` field. Distinct from ``name`` "
+            "(which is set at mint time on the brain side) - useful "
+            "when one agent token is shared across multiple worker "
+            "instances and you want per-instance labels in the "
+            "dashboard. Null if the agent never set Z4J_AGENT_NAME."
+        ),
+    )
 
 
 class CreateAgentRequest(BaseModel):
@@ -107,6 +118,17 @@ def _agent_payload(agent: "Agent") -> AgentPublic:
         agent.last_connect_at is not None
         and agent.protocol_version != CURRENT_PROTOCOL
     )
+    # Pull the operator-supplied host.name out of agent_metadata.host
+    # if the agent ever sent one in its hello frame. The metadata blob
+    # is bounded by the gateway (only the host dict is persisted there)
+    # so there's no risk of exposing internal fields.
+    meta = agent.agent_metadata or {}
+    host_blob = meta.get("host") if isinstance(meta, dict) else None
+    host_name: str | None = None
+    if isinstance(host_blob, dict):
+        candidate = host_blob.get("name")
+        if isinstance(candidate, str) and candidate:
+            host_name = candidate
     return AgentPublic(
         id=agent.id,
         project_id=agent.project_id,
@@ -121,6 +143,7 @@ def _agent_payload(agent: "Agent") -> AgentPublic:
         last_connect_at=agent.last_connect_at,
         created_at=agent.created_at,
         is_outdated=is_outdated,
+        host_name=host_name,
     )
 
 

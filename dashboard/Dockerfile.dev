@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.7
 #
-# Dashboard dev container — Vite + HMR.
+# Dashboard dev container - Vite + HMR.
 #
 # Used only by docker-compose.dev.yml. Production builds the
 # dashboard inside the unified brain image (see
@@ -27,7 +27,7 @@ COPY packages/z4j-brain/dashboard/package.json packages/z4j-brain/dashboard/pnpm
 RUN --mount=type=cache,target=/root/.local/share/pnpm/store \
     pnpm install
 
-# Copy initial source — at runtime this is overlaid by a bind mount
+# Copy initial source - at runtime this is overlaid by a bind mount
 # from the host so edits hot-reload.
 COPY packages/z4j-brain/dashboard/ ./
 

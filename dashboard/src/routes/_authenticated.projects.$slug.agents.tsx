@@ -171,6 +171,11 @@ function AgentsPage() {
                   <TableRow key={agent.id}>
                     <TableCell>
                       <div className="font-medium">{agent.name}</div>
+                      {agent.host_name && agent.host_name !== agent.name && (
+                        <div className="text-xs text-muted-foreground">
+                          host: <span className="font-mono">{agent.host_name}</span>
+                        </div>
+                      )}
                       <div className="font-mono text-xs text-muted-foreground">
                         {agent.id.slice(0, 8)}
                       </div>

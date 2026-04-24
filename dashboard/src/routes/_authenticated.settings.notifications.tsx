@@ -54,6 +54,7 @@ import {
 } from "@/hooks/use-notifications";
 import { useProjects } from "@/hooks/use-projects";
 import type { ProjectPublic } from "@/lib/api-types";
+import { parseTimestamp } from "@/lib/format";
 
 export const Route = createFileRoute("/_authenticated/settings/notifications")({
   component: NotificationsPage,
@@ -185,7 +186,7 @@ function NotificationsPage() {
                         </TableCell>
                         <TableCell>
                           {sub.muted_until &&
-                          new Date(sub.muted_until).getTime() >
+                          parseTimestamp(sub.muted_until).getTime() >
                             Date.now() ? (
                             <Badge variant="muted">
                               <BellOff className="size-3" />

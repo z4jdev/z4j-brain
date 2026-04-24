@@ -19,6 +19,7 @@ run the test suite.
 
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING
 
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
@@ -27,6 +28,8 @@ from starlette.responses import JSONResponse, Response
 
 if TYPE_CHECKING:
     from z4j_brain.settings import Settings
+
+logger = logging.getLogger("z4j.brain.host_validation")
 
 #: Always-allowed hosts in dev mode (in addition to the configured
 #: list). Tests do not have to set ``allowed_hosts``.
@@ -51,6 +54,10 @@ class HostValidationMiddleware(BaseHTTPMiddleware):
             configured |= _DEV_DEFAULTS
         self._allowed: frozenset[str] = frozenset(configured)
         self._dev = is_dev
+        # Frozen public list (preserve original case + order from settings)
+        # used in the rejection payload so operators see exactly what's
+        # whitelisted, not a lowercased+reordered version.
+        self._allowed_display: tuple[str, ...] = tuple(settings.allowed_hosts)
 
     async def dispatch(
         self,
@@ -60,13 +67,39 @@ class HostValidationMiddleware(BaseHTTPMiddleware):
         host_header = request.headers.get("host", "")
         host = self._strip_port(host_header).lower()
         if host and host not in self._allowed:
+            # Log at INFO so the rejection is visible without curling
+            # the response body. The hint mirrors what the JSON payload
+            # below carries.
+            logger.info(
+                "z4j: rejected request - Host header %r is not in the "
+                "allow-list. Allow it via `Z4J_ALLOWED_HOSTS=%s,...` or "
+                "restart with `z4j serve --allowed-host %s`.",
+                host_header,
+                host,
+                host,
+            )
             return JSONResponse(
                 status_code=400,
                 content={
                     "error": "invalid_host",
-                    "message": "request Host header is not in the configured allow-list",
+                    "message": (
+                        f"Host header {host!r} is not in the configured "
+                        f"allow-list. The brain refuses unrecognized Host "
+                        f"headers to prevent cache-poisoning attacks."
+                    ),
                     "request_id": getattr(request.state, "request_id", None),
-                    "details": {},
+                    "details": {
+                        "rejected_host": host,
+                        "allowed_hosts": list(self._allowed_display),
+                        "fix": (
+                            f"Add the host to the allow-list. Either set "
+                            f"Z4J_ALLOWED_HOSTS=\"{host},"
+                            f"{','.join(self._allowed_display) or 'localhost'}\" "
+                            f"in the brain's environment, OR restart with "
+                            f"`z4j serve --allowed-host {host}` "
+                            f"(repeatable). Then reload this page."
+                        ),
+                    },
                 },
             )
         return await call_next(request)
