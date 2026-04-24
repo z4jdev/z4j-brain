@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.12] - 2026-04-24
+
+### Fixed
+
+- **`GET /` returned `{"detail": "Not Found"}` after upgrade.** The 1.0.11 wheel on PyPI shipped the Python code without the bundled dashboard SPA (the `backend/src/z4j_brain/dashboard/dist/` directory was missing from the artifact), so the SPA catch-all at `main.py:558` never registered because `dashboard_dir.is_dir()` was false. Every fresh install of 1.0.11 that wasn't running behind a dev-mode ``vite`` got a bare 404 on every dashboard URL. The pre-build step that copies `packages/z4j-brain/dashboard/dist` → `backend/src/z4j_brain/dashboard/dist` is now verified explicitly before each wheel build, and the wheel-manifest check confirms `index.html` + `assets/` + 260+ files land inside the distribution. No code change; pure packaging fix.
+
+### Operator action
+
+`pip install -U z4j-brain` (or `pip install -U z4j`) and restart. No DB migrations, no config changes, no env vars.
+
+## [1.0.11] - 2026-04-24
+
+### Security
+
+- **`/metrics` gained optional bearer-token guard** (`Z4J_METRICS_TOKEN`) + a startup WARNING when unset. Prometheus labels expose project IDs, queue names, and task names - readable by anyone who can reach the endpoint. The startup warning now names the risk and the fix in a single line (audit Medium-1).
+- **`Config.model_validator` rejects `transport=longpoll` with empty / invalid `agent_id`.** Every framework adapter now surfaces `Z4J_AGENT_ID` + `Z4J_TRANSPORT` as explicit env reads (audit Medium-2). Prevents long-poll agents from starting without the identity UUID they need to enforce per-agent sequencing on the brain.
+- **`PurgeQueueRequest` carries `confirm_token` + `force` fields** so the agent's HMAC-of-`(queue, depth)` check actually fires on purge commands. Before this, the check existed but the fields were missing from the Pydantic model, so FastAPI silently dropped them before validation (audit Medium-3).
+- **Schedule commands route via `_pick_scheduler_agent`** (online + scheduler-support) instead of `next(iter(list_for_project))`. An offline agent could be selected and the command would hang until timeout (audit Medium-4).
+
+### Added
+
+- **`Z4J_METRICS_TOKEN` env var** to require `Authorization: Bearer <token>` on `/metrics`. Startup WARNING when unset.
+- **Django system check for `Z4J_HMAC_SECRET`** - `manage.py check` fails loudly when the secret is missing (audit Low-1).
+- **`clamp_buffer_path` promoted to public helper** in `z4j_bare.storage`. Django / Flask / FastAPI adapters now apply the same root-whitelist clamp the bare `install_agent` entry point uses - closes the gap where a framework-adapter operator could set `Z4J_BUFFER_PATH` outside the `~/.z4j` / `$TMPDIR/z4j-{uid}` roots (audit Low-2).
+- **`admin_project_list_cap` + `tasks_export_max_rows`** as tunable Settings, preventing unbounded memory growth for operators with very large project / task sets (audit Low-3).
+- **Notification channel test endpoints** - unsaved-config preflight + per-channel dry-run.
+
+### Changed
+
+- Bumped minimum `z4j-core` to `>=1.0.5` (longpoll agent_id validator). Adapter packages also bumped to pick up the promoted `clamp_buffer_path`: `z4j-bare>=1.0.7`, `z4j-django>=1.0.7`, `z4j-flask>=1.0.4`, `z4j-fastapi>=1.0.4`.
+
 ## [1.0.10] - 2026-04-24
 
 ### Fixed
