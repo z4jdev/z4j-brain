@@ -91,6 +91,18 @@ def main(argv: Sequence[str] | None = None) -> int:
             "`--allowed-host brain.internal.lan`."
         ),
     )
+    serve.add_argument(
+        "--debug-host-errors",
+        action="store_true",
+        help=(
+            "DEV ONLY: include the rejected Host header, the configured "
+            "allow-list, and a fix command in the body of the 400 response. "
+            "Default behaviour returns a minimal `{error,message,request_id}` "
+            "body so reverse-proxy / public-internet callers cannot enumerate "
+            "internal hostnames. Sets Z4J_DEBUG_HOST_ERRORS=1 for the "
+            "middleware. Refused entirely outside dev mode."
+        ),
+    )
 
     # migrate
     migrate = sub.add_parser("migrate", help="run an alembic command")
@@ -291,6 +303,56 @@ def main(argv: Sequence[str] | None = None) -> int:
                        help="hostname or IP literal to remove")
     ah_sub.add_parser("path", help="print the file path the brain reads from")
 
+    # doctor
+    sub.add_parser(
+        "doctor",
+        help=(
+            "run a full health + configuration audit: check (config/DB/"
+            "migrations) + status (counts) + warnings for common pitfalls "
+            "(dev mode + public bind, no admin user, secrets file "
+            "un-backed-up, etc.). Use this before exposing the brain to "
+            "the internet or before a release."
+        ),
+    )
+
+    # backup
+    backup = sub.add_parser(
+        "backup",
+        help=(
+            "snapshot the brain database to a single file. SQLite uses "
+            "VACUUM INTO (online; brain keeps serving). PostgreSQL "
+            "shells out to pg_dump (custom format)."
+        ),
+    )
+    backup.add_argument(
+        "--output",
+        "-o",
+        required=True,
+        metavar="PATH",
+        help="output file path (e.g. ./z4j-2026-04-24.dump)",
+    )
+
+    # restore
+    restore = sub.add_parser(
+        "restore",
+        help=(
+            "restore the brain database from a backup file. STOP the "
+            "brain process before running. SQLite replaces the live "
+            "DB file (existing one preserved as .pre-restore-bak). "
+            "PostgreSQL uses pg_restore --clean --if-exists."
+        ),
+    )
+    restore.add_argument(
+        "source",
+        metavar="PATH",
+        help="path to a backup file produced by `z4j backup`",
+    )
+    restore.add_argument(
+        "--force",
+        action="store_true",
+        help="acknowledge that the brain process is stopped",
+    )
+
     # version
     sub.add_parser("version", help="print installed z4j-brain version")
 
@@ -335,8 +397,202 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "allowed-hosts":
         return _run_allowed_hosts(args)
 
+    if args.command == "backup":
+        return _run_backup(args)
+
+    if args.command == "restore":
+        return _run_restore(args)
+
+    if args.command == "doctor":
+        return _run_doctor(args)
+
     parser.error(f"unknown command {args.command!r}")
     return 2
+
+
+def _run_doctor(args: argparse.Namespace) -> int:
+    """Full health + configuration audit.
+
+    Composes ``check`` (DB + migrations) with a set of warnings that
+    a plain ``check`` can't raise because they're not failures -
+    they're configuration smells the operator should be aware of
+    before exposing the brain to the internet.
+
+    Return codes:
+      0 = all green, no warnings
+      0 = check passed but one or more warnings (operator attention)
+      non-zero = same as ``check`` (config invalid / DB unreachable /
+                 schema not at head)
+    """
+    import asyncio
+    from pathlib import Path as _Path
+
+    # Reuse the existing check to catch config / DB / migration issues
+    # up front. If that fails, the rest of doctor is moot.
+    rc = _run_check(args)
+    if rc != 0:
+        return rc
+
+    warnings: list[str] = []
+
+    # Warning 1: dev mode + non-loopback bind = publicly-reachable dev
+    # mode, which is the exact footgun we already fixed in the host
+    # middleware. Surface it up front so operators see it.
+    env = os.environ.get("Z4J_ENVIRONMENT", "").lower()
+    bind_host = os.environ.get("Z4J_BIND_HOST", "0.0.0.0")
+    if env == "dev" and bind_host not in ("127.0.0.1", "localhost", "[::1]"):
+        warnings.append(
+            f"Z4J_ENVIRONMENT=dev AND bind_host={bind_host!r}. "
+            f"If this brain is reachable from anywhere beyond localhost "
+            f"(reverse proxy, LAN, Tailscale, public IP), switch to "
+            f"Z4J_ENVIRONMENT=production and pin Z4J_ALLOWED_HOSTS."
+        )
+
+    # Warning 2: Z4J_DEBUG_HOST_ERRORS is on - verbose host rejection
+    # responses will leak internal hostnames. Only safe for strictly-
+    # localhost installs.
+    if os.environ.get("Z4J_DEBUG_HOST_ERRORS", "").lower() in ("1", "true", "yes", "on"):
+        warnings.append(
+            "Z4J_DEBUG_HOST_ERRORS=1 is set. Rejected Host-header "
+            "requests will echo internal allow-list data back to the "
+            "caller. Only safe for local-laptop development bound to "
+            "127.0.0.1. Turn it off for anything reachable from the "
+            "network."
+        )
+
+    # Warning 3: auto-minted secrets - the operator should back up
+    # the persisted secret.env file off-host.
+    secret_env = _Path.home() / ".z4j" / "secret.env"
+    if secret_env.exists():
+        warnings.append(
+            f"Brain secrets were auto-minted and persisted to "
+            f"{secret_env}. This file is the ONLY copy of Z4J_SECRET and "
+            f"Z4J_SESSION_SECRET for this install. Losing it invalidates "
+            f"every existing agent HMAC and the audit chain. Back it up "
+            f"off-host now (rsync / S3 / password manager)."
+        )
+
+    async def _row_warnings() -> None:
+        from sqlalchemy import text
+        from z4j_brain.persistence.database import DatabaseManager
+
+        _settings, engine = _build_settings_from_env()
+        db = DatabaseManager(engine)
+        try:
+            async with db.session() as session:
+                r_users = await session.execute(text("SELECT COUNT(*) FROM users"))
+                users = r_users.scalar_one() or 0
+                r_projects = await session.execute(
+                    text("SELECT COUNT(*) FROM projects"),
+                )
+                projects = r_projects.scalar_one() or 0
+                r_agents = await session.execute(text("SELECT COUNT(*) FROM agents"))
+                agents = r_agents.scalar_one() or 0
+        finally:
+            await engine.dispose()
+
+        if users == 0:
+            warnings.append(
+                "No users exist yet. Complete first-boot setup at the "
+                "/setup URL printed by `z4j serve`, or run "
+                "`z4j createsuperuser` directly."
+            )
+        if users > 0 and projects == 0:
+            warnings.append(
+                "Users exist but no projects. The first-boot flow normally "
+                "creates a default project - investigate (`z4j status`)."
+            )
+        if projects > 0 and agents == 0:
+            warnings.append(
+                "Projects exist but no agents minted. Go to "
+                "/projects/<slug>/agents in the dashboard and click "
+                "'new agent' to issue a token + hmac_secret."
+            )
+
+    try:
+        asyncio.run(_row_warnings())
+    except Exception as exc:  # noqa: BLE001
+        warnings.append(
+            f"could not enumerate users/projects/agents: "
+            f"{type(exc).__name__}: {exc}",
+        )
+
+    if warnings:
+        print("\nz4j doctor: warnings ({}):".format(len(warnings)))  # noqa: T201
+        for i, w in enumerate(warnings, 1):
+            print(f"  {i}. {w}\n")  # noqa: T201
+        return 0
+
+    print("\nz4j doctor: all green, no warnings.")  # noqa: T201
+    return 0
+
+
+def _run_backup(args: argparse.Namespace) -> int:
+    """Snapshot the brain DB to a file. Backend auto-detected from DB URL."""
+    _bootstrap_env_for_management_commands()
+    from z4j_brain.backup import backup
+    from z4j_brain.settings import Settings
+
+    settings = Settings()  # type: ignore[call-arg]
+    output = Path(args.output)
+    try:
+        result = backup(settings.database_url, output)
+    except FileExistsError as exc:
+        print(f"z4j-brain: {exc}")  # noqa: T201
+        return 1
+    except FileNotFoundError as exc:
+        print(f"z4j-brain: {exc}")  # noqa: T201
+        return 1
+    except Exception as exc:  # noqa: BLE001
+        print(f"z4j-brain: backup failed: {exc}")  # noqa: T201
+        return 1
+    size_mb = result["size_bytes"] / (1024 * 1024)
+    print(  # noqa: T201
+        f"z4j-brain: backup complete\n"
+        f"  backend:    {result['backend']}\n"
+        f"  output:     {result['path']}\n"
+        f"  size:       {size_mb:.2f} MiB",
+    )
+    print(  # noqa: T201
+        f"z4j-brain: move this file off-host (scp, rclone, S3, ...) for "
+        f"true disaster recovery.",
+    )
+    return 0
+
+
+def _run_restore(args: argparse.Namespace) -> int:
+    """Restore the brain DB from a backup file. Brain MUST be stopped."""
+    if not args.force:
+        print(  # noqa: T201
+            "z4j-brain: restore replaces the live DB. The brain process "
+            "MUST be stopped first (`systemctl stop z4j` / `docker compose "
+            "down z4j-brain`). Re-run with --force to acknowledge.",
+        )
+        return 1
+    _bootstrap_env_for_management_commands()
+    from z4j_brain.backup import restore
+    from z4j_brain.settings import Settings
+
+    settings = Settings()  # type: ignore[call-arg]
+    src = Path(args.source)
+    try:
+        result = restore(settings.database_url, src)
+    except FileNotFoundError as exc:
+        print(f"z4j-brain: {exc}")  # noqa: T201
+        return 1
+    except Exception as exc:  # noqa: BLE001
+        print(f"z4j-brain: restore failed: {exc}")  # noqa: T201
+        return 1
+    print(  # noqa: T201
+        f"z4j-brain: restore complete\n"
+        f"  backend:    {result['backend']}\n"
+        f"  source:     {result['source']}",
+    )
+    print(  # noqa: T201
+        f"z4j-brain: start the brain (`systemctl start z4j` / `docker "
+        f"compose up -d z4j-brain`) and verify with `z4j check && z4j status`.",
+    )
+    return 0
 
 
 def _run_allowed_hosts(args: argparse.Namespace) -> int:
@@ -600,6 +856,27 @@ def _run_serve(args: argparse.Namespace) -> int:
                     auto_hosts.append(h)
 
             os.environ["Z4J_ALLOWED_HOSTS"] = _json.dumps(auto_hosts)
+
+    # --debug-host-errors opt-in: enables verbose host-rejection response
+    # bodies, but ONLY in dev mode. Protects against the common footgun
+    # where a homelab operator runs the pip/SQLite path (dev mode by
+    # default) behind a public reverse proxy - they'd otherwise get
+    # internal-hostname leakage on every crawler hit.
+    if getattr(args, "debug_host_errors", False):
+        if os.environ.get("Z4J_ENVIRONMENT", "").lower() != "dev":
+            print(  # noqa: T201
+                "z4j-brain: --debug-host-errors refused outside dev mode. "
+                "This flag enables verbose 400 responses that leak internal "
+                "hostnames; unsafe when the brain is reachable from any "
+                "source other than localhost.",
+            )
+            return 1
+        os.environ["Z4J_DEBUG_HOST_ERRORS"] = "1"
+        print(  # noqa: T201
+            "z4j-brain: WARNING - --debug-host-errors is ON. Rejected "
+            "requests will return internal hostnames in the response body. "
+            "For local development only.",
+        )
 
     # Merge any --allowed-host CLI flags onto whatever env / auto-detect
     # produced. The CLI flag is a repeatable convenience for ad-hoc hosts

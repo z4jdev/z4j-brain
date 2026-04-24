@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.9] - 2026-04-24
+
+### Security
+
+- **`invalid_host` 400 response is now ALWAYS minimal**, regardless of `Z4J_ENVIRONMENT`. Returns only `{error, message, request_id}` to the wire. The dev-mode-verbose gate from 1.0.8 was insufficient: a homelab operator on the SQLite/pip path (defaults to dev mode) exposed via Cloudflare Tunnel / Caddy / nginx still leaked internal LAN IPs, Tailscale node names, and a ready-to-paste `Z4J_ALLOWED_HOSTS=` value to anyone who could reach the brain. Operators get the verbose detail in the operator-facing INFO log (always), correlatable via `request_id`. Audited the rest of the middleware stack (body_size, errors, real_client_ip, request_id, security_headers, ip_rate_limit) - no other leaks.
+
+### Added
+
+- **`z4j backup --output PATH`** - point-in-time database snapshot to a single file. SQLite uses `VACUUM INTO` (online; brain keeps serving). PostgreSQL shells out to `pg_dump -Fc -Z6 --no-owner --no-acl`. Backend auto-detected from `Z4J_DATABASE_URL`.
+
+- **`z4j restore PATH --force`** - restore from a backup file. Brain MUST be stopped. SQLite preserves the existing DB at `<dbpath>.pre-restore-bak` for manual rollback. PostgreSQL uses `pg_restore --clean --if-exists --no-owner --no-acl`.
+
+- **`z4j doctor`** - full health + configuration audit. Composes `check` (config / DB / migrations) with warnings for common pitfalls: dev mode on a non-loopback bind, `Z4J_DEBUG_HOST_ERRORS=1` set, auto-minted secrets needing off-host backup, no users / projects / agents yet. Run before exposing the brain to the internet or before a release.
+
+- **`z4j serve --debug-host-errors`** - opt-in flag that re-enables verbose `invalid_host` response bodies (the 1.0.6/1.0.7 shape with `details.rejected_host`, `details.allowed_hosts`, `details.fix`). Refused outside dev mode by the CLI; refused at runtime by the middleware if `Z4J_ENVIRONMENT != "dev"`. Prints a loud warning at startup. Only safe for local-laptop dev bound to 127.0.0.1.
+
+- **CI: pip-audit + trivy security workflow** on the public z4jdev/z4j-brain repo. Runs on every push, every PR, and daily at 03:00 UTC so new CVEs surface without waiting for a code push. Uploads SARIF to GitHub Security tab.
+
+- **Dashboard: `host_name` is now a top-level column on `/projects/{slug}/agents`** (was a sub-label under the agent name in 1.0.6-1.0.8). Distinguishes the operator-supplied label (`Z4J_AGENT_NAME`) from the mint-time `name`. When the agent did not advertise a host name, the column shows `-`.
+
+- **Operations runbooks** at z4j.dev:
+  - [/operations/allowed-hosts/](https://z4j.dev/operations/allowed-hosts/) - the four sources, precedence, file format, security model, troubleshooting.
+  - [/operations/backup-restore/](https://z4j.dev/operations/backup-restore/) - SQLite + Postgres playbook, scheduled-backup systemd unit, what else to back up beyond the DB.
+  - [/operations/upgrade-rollback/](https://z4j.dev/operations/upgrade-rollback/) - pip + Docker upgrade flow, rollback steps, agent vs brain version skew rules.
+  - [/operations/incident-response/](https://z4j.dev/operations/incident-response/) - playbooks for brain down, audit-chain tampered, leaked agent token, lost last admin.
+
 ## [1.0.8] - 2026-04-24
 
 ### Added

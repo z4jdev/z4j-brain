@@ -48,6 +48,8 @@ class HostValidationMiddleware(BaseHTTPMiddleware):
 
     def __init__(self, app, *, settings: Settings) -> None:  # type: ignore[no-untyped-def]
         super().__init__(app)
+        import os as _os
+
         is_dev = settings.environment == "dev"
         configured = {h.lower() for h in settings.allowed_hosts}
         if is_dev:
@@ -58,6 +60,15 @@ class HostValidationMiddleware(BaseHTTPMiddleware):
         # used in the rejection payload so operators see exactly what's
         # whitelisted, not a lowercased+reordered version.
         self._allowed_display: tuple[str, ...] = tuple(settings.allowed_hosts)
+        # Opt-in debug mode. Off by default. Only honored when dev mode
+        # is also active - a `Z4J_DEBUG_HOST_ERRORS=1` in a production
+        # env does nothing (the startup check in cli.py refuses it too,
+        # but belt + suspenders).
+        self._debug_errors = (
+            is_dev
+            and _os.environ.get("Z4J_DEBUG_HOST_ERRORS", "").lower()
+            in ("1", "true", "yes", "on")
+        )
 
     async def dispatch(
         self,
@@ -67,10 +78,15 @@ class HostValidationMiddleware(BaseHTTPMiddleware):
         host_header = request.headers.get("host", "")
         host = self._strip_port(host_header).lower()
         if host and host not in self._allowed:
-            # Operator-facing log: ALWAYS verbose, regardless of mode.
-            # The operator runs `z4j serve` and watches stderr (or
-            # journalctl / docker logs); leaking detail there is fine.
-            # Public HTTP responses below are NOT verbose in production.
+            # Operator-facing log: ALWAYS verbose. The operator runs
+            # `z4j serve` (and watches stderr / journalctl / docker
+            # logs); leaking detail to that surface is fine because it
+            # is operator-only. The HTTP response below is ALWAYS
+            # minimal because the operator does not control who can
+            # reach the brain - reverse proxies, Cloudflare Tunnels,
+            # public DNS pointed at a homelab, scanners probing port
+            # 7700 - all of those make the HTTP response a public
+            # surface no matter what `environment` we're in.
             logger.info(
                 "z4j: rejected request - Host header %r is not in the "
                 "allow-list. Persist it via `z4j allowed-hosts add %s` "
@@ -87,32 +103,41 @@ class HostValidationMiddleware(BaseHTTPMiddleware):
     def _build_rejection(self, request: Request, host: str) -> JSONResponse:
         """Build the 400 response body.
 
-        Verbosity is gated on ``settings.environment == "dev"``:
+        Default: minimal - no rejected host, no allow-list, no fix
+        command. Internal hostnames, LAN IPs, Tailscale node names,
+        and ready-to-paste env-var values must never leak through the
+        wire to anyone who can hit the brain.
 
-        - **dev mode** (laptop, single-operator, the operator IS the
-          HTTP client): include the rejected host, the full allow-list,
-          and a concrete fix command. Helpful "what do I do" message.
-        - **non-dev mode** (production, public-facing): minimal body -
-          just the error code + request_id. Operators read the full
-          detail from server logs (the INFO line above) which crawlers
-          and attackers cannot see. Mirrors Django's DEBUG-only
-          detailed-error pattern.
+        Operators correlate this 400 with the verbose INFO log line
+        emitted above, via the ``request_id`` field. The log surface
+        is operator-only (terminal stderr / ``journalctl`` / container
+        logs); no scanner, crawler, or attacker has read access to it.
 
-        This avoids leaking internal hostnames, LAN IPs, Tailscale node
-        names, or a ready-to-paste env var value to anyone hitting the
-        brain through a public reverse proxy.
+        Verbose behavior can be opted into for local development via
+        ``z4j serve --debug-host-errors`` (sets
+        ``Z4J_DEBUG_HOST_ERRORS=1``). This is refused outside dev mode
+        by the CLI, and even in dev mode it prints a loud warning at
+        startup so the operator knows they've lowered their guard.
+        Recommended for ``z4j serve`` bound to ``127.0.0.1`` only.
+
+        Earlier 1.0.6/1.0.7 included the verbose ``details`` block
+        unconditionally. That was a real information-disclosure bug
+        because a "dev mode" gate cannot distinguish a local-laptop
+        developer from a homelab-with-a-public-reverse-proxy operator
+        (both run the SQLite/dev path; the latter is publicly
+        reachable). Post-1.0.8 default is minimal; the opt-in is
+        reserved for operators who know they're hitting the brain
+        directly.
         """
         request_id = getattr(request.state, "request_id", None)
-        if self._dev:
+        if self._debug_errors:
             return JSONResponse(
                 status_code=400,
                 content={
                     "error": "invalid_host",
                     "message": (
                         f"Host header {host!r} is not in the configured "
-                        f"allow-list. The brain refuses unrecognized "
-                        f"Host headers to prevent cache-poisoning "
-                        f"attacks."
+                        f"allow-list."
                     ),
                     "request_id": request_id,
                     "details": {
@@ -120,19 +145,12 @@ class HostValidationMiddleware(BaseHTTPMiddleware):
                         "allowed_hosts": list(self._allowed_display),
                         "fix": (
                             f"Persist the host: run "
-                            f"`z4j allowed-hosts add {host}` and "
-                            f"restart `z4j serve`. (Or pin via "
-                            f"Z4J_ALLOWED_HOSTS env / "
-                            f"`z4j serve --allowed-host {host}`.) "
-                            f"Then reload this page."
+                            f"`z4j allowed-hosts add {host}` and restart "
+                            f"`z4j serve`."
                         ),
                     },
                 },
             )
-        # Production: opaque body. Operator correlates via request_id
-        # against the verbose INFO log line above. Crawlers, scanners,
-        # and attackers learn nothing about internal hostnames or the
-        # configured allow-list.
         return JSONResponse(
             status_code=400,
             content={

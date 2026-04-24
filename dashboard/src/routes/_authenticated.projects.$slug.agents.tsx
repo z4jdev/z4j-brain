@@ -159,6 +159,7 @@ function AgentsPage() {
               <TableHeader>
                 <TableRow>
                   <TableHead>Name</TableHead>
+                  <TableHead>Host</TableHead>
                   <TableHead>State</TableHead>
                   <TableHead>Framework</TableHead>
                   <TableHead>Engines</TableHead>
@@ -171,14 +172,16 @@ function AgentsPage() {
                   <TableRow key={agent.id}>
                     <TableCell>
                       <div className="font-medium">{agent.name}</div>
-                      {agent.host_name && agent.host_name !== agent.name && (
-                        <div className="text-xs text-muted-foreground">
-                          host: <span className="font-mono">{agent.host_name}</span>
-                        </div>
-                      )}
                       <div className="font-mono text-xs text-muted-foreground">
                         {agent.id.slice(0, 8)}
                       </div>
+                    </TableCell>
+                    <TableCell>
+                      {agent.host_name ? (
+                        <span className="font-mono text-sm">{agent.host_name}</span>
+                      ) : (
+                        <span className="text-xs text-muted-foreground/60">-</span>
+                      )}
                     </TableCell>
                     <TableCell>
                       <AgentStateBadge state={agent.state} />
