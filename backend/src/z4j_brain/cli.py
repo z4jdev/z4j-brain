@@ -425,6 +425,7 @@ def _run_doctor(args: argparse.Namespace) -> int:
                  schema not at head)
     """
     import asyncio
+    import os
     from pathlib import Path as _Path
 
     # Reuse the existing check to catch config / DB / migration issues

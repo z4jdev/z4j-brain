@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.10] - 2026-04-24
+
+### Fixed
+
+- **`z4j doctor` raised `NameError: name 'os' is not defined`** because the function used `os.environ.get(...)` without importing `os` in its local scope. Other CLI handlers do their own `import os` and that pattern was missed when `_run_doctor` was added in 1.0.9. Brain-only patch; no behavioural change beyond the command no longer crashing on the second warning probe.
+
 ## [1.0.9] - 2026-04-24
 
 ### Security
