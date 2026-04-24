@@ -353,6 +353,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="acknowledge that the brain process is stopped",
     )
 
+    # metrics-token
+    sub.add_parser(
+        "metrics-token",
+        help=(
+            "print the /metrics bearer token (auto-minted on first "
+            "boot, persisted to ~/.z4j/secret.env). Paste into your "
+            "Prometheus scrape config's authorization.credentials or "
+            "use with curl -H 'Authorization: Bearer <token>'."
+        ),
+    )
+
     # version
     sub.add_parser("version", help="print installed z4j-brain version")
 
@@ -403,10 +414,51 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "restore":
         return _run_restore(args)
 
+    if args.command == "metrics-token":
+        return _run_metrics_token(args)
+
     if args.command == "doctor":
         return _run_doctor(args)
 
     parser.error(f"unknown command {args.command!r}")
+    return 2
+
+
+def _run_metrics_token(args: argparse.Namespace) -> int:  # noqa: ARG001
+    """Print the ``/metrics`` bearer token.
+
+    Resolution (first match wins):
+      1. ``Z4J_METRICS_AUTH_TOKEN`` env var (operator override).
+      2. ``Z4J_METRICS_AUTH_TOKEN`` line in ``~/.z4j/secret.env``
+         (auto-minted by ``z4j serve`` on first boot).
+      3. Prints an error to stderr and exits 2.
+
+    Writes ONLY the token to stdout (no trailing newline from print's
+    default would be fine, but keep it deterministic so scripts can
+    ``$(z4j metrics-token)`` safely).
+    """
+    import os
+    from pathlib import Path as _Path
+
+    token = os.environ.get("Z4J_METRICS_AUTH_TOKEN")
+    if token:
+        print(token)  # noqa: T201
+        return 0
+
+    secret_env = _Path.home() / ".z4j" / "secret.env"
+    if secret_env.exists():
+        for line in secret_env.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if line.startswith("Z4J_METRICS_AUTH_TOKEN="):
+                print(line.split("=", 1)[1])  # noqa: T201
+                return 0
+
+    print(  # noqa: T201
+        "z4j metrics-token: no token found. "
+        "Run `z4j serve` once to auto-mint one, or set "
+        "Z4J_METRICS_AUTH_TOKEN explicitly.",
+        file=sys.stderr,
+    )
     return 2
 
 
@@ -471,6 +523,21 @@ def _run_doctor(args: argparse.Namespace) -> int:
             f"Z4J_SESSION_SECRET for this install. Losing it invalidates "
             f"every existing agent HMAC and the audit chain. Back it up "
             f"off-host now (rsync / S3 / password manager)."
+        )
+
+    # Warning 4: /metrics exposed without auth. Prometheus labels
+    # expose project IDs, queue names, task names, in-memory state.
+    # Fail-secure default was introduced in 1.0.13; before that, every
+    # install was public by default.
+    if os.environ.get("Z4J_METRICS_PUBLIC", "").lower() in ("1", "true", "yes", "on"):
+        warnings.append(
+            "Z4J_METRICS_PUBLIC=1 is set. /metrics is served without "
+            "authentication. Prometheus labels leak project IDs, "
+            "queue/task names, and in-memory state to anyone who can "
+            "reach the endpoint. Only safe on a trusted closed "
+            "network. For production, unset Z4J_METRICS_PUBLIC and "
+            "use Z4J_METRICS_AUTH_TOKEN (run `z4j metrics-token` to "
+            "print the auto-minted value)."
         )
 
     async def _row_warnings() -> None:
@@ -718,6 +785,27 @@ def _run_serve(args: argparse.Namespace) -> int:
             print(  # noqa: T201
                 f"z4j-brain: loaded persisted Z4J_SECRET from {secret_env}",
             )
+            # Pre-1.0.13 secret.env files lack Z4J_METRICS_AUTH_TOKEN.
+            # Mint one now and append so in-place upgrades pick up the
+            # new fail-secure /metrics default without operator action.
+            # Done here (not at the callsite) so the appended token
+            # shows up in the same secret.env file the operator already
+            # knows about; no second location to discover.
+            if not os.environ.get("Z4J_METRICS_AUTH_TOKEN"):
+                import secrets as _secrets  # local alias, avoid shadow
+
+                new_metrics = _secrets.token_urlsafe(32)
+                with secret_env.open("a", encoding="utf-8") as fh:
+                    fh.write(f"Z4J_METRICS_AUTH_TOKEN={new_metrics}\n")
+                os.environ["Z4J_METRICS_AUTH_TOKEN"] = new_metrics
+                print(  # noqa: T201
+                    f"z4j-brain: minted Z4J_METRICS_AUTH_TOKEN (in-place "
+                    f"upgrade from pre-1.0.13), appended to {secret_env}. "
+                    f"/metrics now requires Authorization: Bearer <token>. "
+                    f"Run `z4j metrics-token` to print it for Prometheus "
+                    f"scrape config, or set Z4J_METRICS_PUBLIC=1 to opt "
+                    f"back into unauthenticated scraping (not recommended).",
+                )
         else:
             import secrets as _secrets  # local alias to avoid shadowing
 
@@ -760,8 +848,11 @@ def _run_serve(args: argparse.Namespace) -> int:
 
             new_secret = _secrets.token_urlsafe(48)
             new_session = _secrets.token_urlsafe(48)
+            new_metrics = _secrets.token_urlsafe(32)
             secret_env.write_text(
-                f"Z4J_SECRET={new_secret}\nZ4J_SESSION_SECRET={new_session}\n",
+                f"Z4J_SECRET={new_secret}\n"
+                f"Z4J_SESSION_SECRET={new_session}\n"
+                f"Z4J_METRICS_AUTH_TOKEN={new_metrics}\n",
                 encoding="utf-8",
             )
             try:
@@ -772,9 +863,10 @@ def _run_serve(args: argparse.Namespace) -> int:
                 pass
             os.environ["Z4J_SECRET"] = new_secret
             os.environ["Z4J_SESSION_SECRET"] = new_session
+            os.environ["Z4J_METRICS_AUTH_TOKEN"] = new_metrics
             print(  # noqa: T201
-                f"z4j-brain: minted fresh Z4J_SECRET + Z4J_SESSION_SECRET, "
-                f"persisted to {secret_env}",
+                f"z4j-brain: minted fresh Z4J_SECRET + Z4J_SESSION_SECRET + "
+                f"Z4J_METRICS_AUTH_TOKEN, persisted to {secret_env}",
             )
             print(  # noqa: T201
                 "z4j-brain: WARNING - evaluation mode. For production, set "

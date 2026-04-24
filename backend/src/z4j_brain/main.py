@@ -449,16 +449,48 @@ def create_app(
 
     # /metrics is mounted at the root for Prometheus scrapers.
     app.include_router(metrics_api.router)
-    if settings.metrics_enabled and settings.metrics_auth_token is None:
-        structlog.get_logger("z4j.brain").warning(
-            "metrics_open_by_default",
-            message=(
-                "/metrics is mounted without an auth token. Prometheus "
-                "labels expose project IDs, queue/task names, and "
-                "in-memory state - set Z4J_METRICS_AUTH_TOKEN or block "
-                "/metrics at the reverse proxy (Caddy / nginx)."
-            ),
-        )
+    if settings.metrics_enabled:
+        log = structlog.get_logger("z4j.brain")
+        if settings.metrics_public:
+            # Operator explicitly opted into unauthenticated /metrics
+            # (Z4J_METRICS_PUBLIC=1). Log loudly so the choice is
+            # visible in logs and doesn't drift into a forgotten default.
+            log.warning(
+                "metrics_public_opt_in",
+                message=(
+                    "/metrics is exposed WITHOUT authentication "
+                    "(Z4J_METRICS_PUBLIC=1). Prometheus labels leak "
+                    "project IDs, queue/task names, and in-memory state "
+                    "to anyone who can reach the endpoint. Only safe on "
+                    "a trusted closed network (localhost, sidecar "
+                    "Prometheus, private LAN). Unset Z4J_METRICS_PUBLIC "
+                    "and use Z4J_METRICS_AUTH_TOKEN for production."
+                ),
+            )
+        elif settings.metrics_auth_token is None:
+            # Fail-secure branch: no token AND no public opt-in.
+            # /metrics will return 401 until the operator resolves this.
+            # Normally unreachable on a CLI-launched brain (auto-mint
+            # runs at boot), but custom bootstrappers may land here.
+            log.warning(
+                "metrics_no_auth_configured",
+                message=(
+                    "/metrics will return 401 - neither "
+                    "Z4J_METRICS_AUTH_TOKEN nor Z4J_METRICS_PUBLIC is "
+                    "set. Run `z4j metrics-token` to print an auto-minted "
+                    "token, or set Z4J_METRICS_PUBLIC=1 for closed "
+                    "networks."
+                ),
+            )
+        else:
+            log.info(
+                "metrics_auth_enabled",
+                message=(
+                    "/metrics requires Authorization: Bearer <token>. "
+                    "Run `z4j metrics-token` to print the token for "
+                    "Prometheus scrape config."
+                ),
+            )
 
     # WebSocket gateway - mounted at the root, not under /api/v1.
     app.include_router(ws_gateway.router)

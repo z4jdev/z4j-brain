@@ -230,16 +230,49 @@ def record_swallowed(module: str, site: str) -> None:
 
 
 def _check_metrics_auth(request: Request, settings: "Settings") -> None:
-    """Enforce the optional bearer-token guard for ``/metrics``.
+    """Enforce bearer-token auth on ``/metrics`` (fail-secure default).
 
-    When ``settings.metrics_auth_token`` is unset we serve without
-    auth (backwards-compatible). When it is set we require the
-    exact token in ``Authorization: Bearer <token>`` - constant-time
-    compared so failed probes don't leak the token length.
+    Policy (as of 1.0.13):
+
+    - ``settings.metrics_public == True`` -> serve without auth. This
+      is the explicit opt-in path for closed-network deployments where
+      Prometheus scrapes from a trusted LAN / localhost. Operator set
+      ``Z4J_METRICS_PUBLIC=1``; a loud WARNING logged at startup names
+      the risk.
+    - ``settings.metrics_auth_token`` set -> require
+      ``Authorization: Bearer <token>``. The token is either
+      operator-provided (``Z4J_METRICS_AUTH_TOKEN``) or auto-minted on
+      first boot and persisted to ``~/.z4j/secret.env`` alongside
+      ``Z4J_SECRET`` / ``Z4J_SESSION_SECRET``.
+    - neither -> return 401 with an instructional detail pointing at
+      ``z4j metrics-token`` and ``Z4J_METRICS_PUBLIC``. This branch is
+      unreachable on a normally-bootstrapped install because the CLI
+      entry point auto-mints; it exists for defense-in-depth in test
+      rigs or custom bootstrappers that skip the CLI.
+
+    The prior policy (1.0.11 / 1.0.12) was the inverse: unset token
+    meant "serve without auth" and just logged a warning. Every fresh
+    ``pip install z4j && z4j serve`` exposed project IDs, queue names,
+    task names, and in-memory-state counters to anyone who could reach
+    the endpoint - a major default-insecure footgun. Audit follow-up
+    to 2026-04-24 Medium-1.
     """
+    if settings.metrics_public:
+        return
+
     expected = settings.metrics_auth_token
     if expected is None:
-        return
+        raise HTTPException(
+            status_code=401,
+            detail=(
+                "metrics: not configured. Either set Z4J_METRICS_AUTH_TOKEN "
+                "and scrape with `Authorization: Bearer <token>`, or set "
+                "Z4J_METRICS_PUBLIC=1 for closed-network deployments. "
+                "Run `z4j metrics-token` to print the auto-minted token."
+            ),
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
     header = request.headers.get("authorization", "")
     scheme, _, supplied = header.partition(" ")
     if scheme.lower() != "bearer" or not supplied:

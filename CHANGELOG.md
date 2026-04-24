@@ -7,6 +7,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.13] - 2026-04-24
+
+### Security (BREAKING)
+
+- **`/metrics` is now fail-secure by default.** Previously (1.0.11 / 1.0.12), `Z4J_METRICS_AUTH_TOKEN` was optional - unset meant "serve without auth" and the brain just logged a startup WARNING. Every fresh `pip install z4j && z4j serve` therefore exposed project IDs, queue names, task names, and in-memory-state counters (`z4j_inmemory_state_items`) to anyone who could reach the endpoint. The warning was visible only to the operator reading their service log; production deployments behind reverse proxies (Caddy / nginx / Cloudflare Tunnel) inherited the default and leaked metadata to the internet.
+
+  **New policy:**
+  - `Z4J_METRICS_AUTH_TOKEN` is **auto-minted on first boot** and persisted to `~/.z4j/secret.env` alongside `Z4J_SECRET` / `Z4J_SESSION_SECRET`. In-place upgrades from 1.0.12 append the new token to the existing `secret.env` and log a one-time info line.
+  - `/metrics` requires `Authorization: Bearer <token>` by default. Unauthenticated requests get HTTP 401 with a detail body that names the fix.
+  - Operators who intentionally want unauthenticated scrape (sidecar Prometheus on localhost, trusted LAN) must set `Z4J_METRICS_PUBLIC=1` explicitly. The brain logs a loud WARNING and `z4j doctor` surfaces it as a warning.
+
+  **Operator action on upgrade from 1.0.12:**
+  1. `pip install -U z4j && systemctl restart z4j`
+  2. The first boot appends `Z4J_METRICS_AUTH_TOKEN=...` to `~/.z4j/secret.env` and logs the fact.
+  3. Get the token: `z4j metrics-token`
+  4. Update your Prometheus scrape config to include the bearer token:
+     ```yaml
+     scrape_configs:
+       - job_name: z4j
+         authorization:
+           type: Bearer
+           credentials: <paste-token>
+         static_configs:
+           - targets: ["tasks.example.com:443"]
+         scheme: https
+     ```
+  5. If you run Prometheus on the same host and genuinely want unauthenticated scrape: set `Z4J_METRICS_PUBLIC=1` in the systemd unit (`Environment=Z4J_METRICS_PUBLIC=1`), restart, and accept that `z4j doctor` will flag it.
+
+### Added
+
+- **`z4j metrics-token`** CLI subcommand. Reads `Z4J_METRICS_AUTH_TOKEN` from env or `~/.z4j/secret.env` and prints the value to stdout. Shell-safe so `curl -H "Authorization: Bearer $(z4j metrics-token)" http://localhost:7700/metrics` works out of the box.
+- **`Settings.metrics_public`** (env: `Z4J_METRICS_PUBLIC`) - explicit opt-in to unauthenticated `/metrics`. Default False. Mutually exclusive with the auth-token path; when True, the token check is skipped and a loud WARNING is logged.
+- **`z4j doctor` Warning 4** fires when `Z4J_METRICS_PUBLIC=1` is set, echoing the risk so operators can't drift into forgetting.
+
+### Changed
+
+- Startup banner now reports the metrics auth state explicitly - `metrics_auth_enabled` (normal), `metrics_public_opt_in` (warning), or `metrics_no_auth_configured` (warning - unreachable on a CLI-launched brain, present for custom bootstrappers).
+
 ## [1.0.12] - 2026-04-24
 
 ### Fixed

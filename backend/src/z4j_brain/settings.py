@@ -175,14 +175,19 @@ class Settings(BaseSettings):
     metrics_enabled: bool = True
     #: Bearer token that must be presented as
     #: ``Authorization: Bearer <token>`` to fetch ``/metrics``.
-    #: When unset, ``/metrics`` is served without auth (backwards-
-    #: compatible behaviour) and the brain logs a WARNING at startup
-    #: telling the operator to either set this value or block the
-    #: endpoint at the reverse proxy. Audit 2026-04-24 Medium-1:
-    #: Prometheus labels leak project IDs, queue/task names, and
-    #: in-memory state - an unauthenticated reachable ``/metrics``
-    #: is a low-noise reconnaissance channel.
+    #: As of 1.0.13 the CLI auto-mints this on first boot (persisted to
+    #: ``~/.z4j/secret.env``) and the endpoint is fail-secure: unset +
+    #: :attr:`metrics_public` False returns 401. Operators who need
+    #: unauthenticated scrape (trusted LAN, sidecar Prometheus) must
+    #: set :attr:`metrics_public` explicitly.
     metrics_auth_token: SecretStr | None = None
+    #: Explicit opt-in to unauthenticated ``/metrics``. Default False
+    #: (fail-secure). When True, the bearer-token check is skipped and
+    #: the brain logs a loud WARNING at startup naming the risk.
+    #: Set via ``Z4J_METRICS_PUBLIC=1``. Reverse of the pre-1.0.13
+    #: default - see :func:`z4j_brain.api.metrics._check_metrics_auth`
+    #: for the policy rationale.
+    metrics_public: bool = False
 
     # ------------------------------------------------------------------
     # Auth - passwords
