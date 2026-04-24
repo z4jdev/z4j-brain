@@ -1,6 +1,6 @@
 [project]
 name = "z4j-brain"
-version = "1.0.6"
+version = "1.0.7"
 description = "z4j brain - server, dashboard, and API (AGPL v3)"
 readme = "README.md"
 requires-python = ">=3.11"

@@ -450,6 +450,10 @@ def _run_serve(args: argparse.Namespace) -> int:
             import socket as _socket
 
             auto_hosts: list[str] = ["localhost", "127.0.0.1", "[::1]"]
+
+            # 1) Hostname + FQDN. The hostname is what `uname -n` shows;
+            #    the FQDN includes the domain (e.g. Tailscale's
+            #    `<host>.<tailnet>.ts.net`).
             for fn_name in ("gethostname", "getfqdn"):
                 try:
                     h = getattr(_socket, fn_name)()
@@ -457,6 +461,41 @@ def _run_serve(args: argparse.Namespace) -> int:
                         auto_hosts.append(h)
                 except Exception:  # noqa: BLE001
                     pass
+
+            # 2) IPv4 addresses bound on the host. Covers the common
+            #    homelab/LAN case where the operator reaches the brain
+            #    via the server's LAN IP (e.g. 192.168.x.x). Without
+            #    this users hit the host-validation 400 even though
+            #    they're on the same network.
+            #
+            #    Two complementary strategies, both stdlib:
+            #    a) gethostbyname_ex(hostname) returns every IP the
+            #       resolver knows for the hostname. Picks up multiple
+            #       interfaces on machines with proper /etc/hosts.
+            #    b) UDP-socket trick: open a datagram socket "to" a
+            #       non-routable address; no packet ever leaves, but
+            #       the OS picks the source IP it WOULD use for that
+            #       destination. That's the box's primary outbound
+            #       interface IP, even on systems where (a) only
+            #       returns 127.0.1.1 (Debian default).
+            try:
+                _, _, addrs = _socket.gethostbyname_ex(_socket.gethostname())
+                for ip in addrs:
+                    if ip and ip.lower() not in {x.lower() for x in auto_hosts}:
+                        auto_hosts.append(ip)
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                with _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM) as _s:
+                    # 10.255.255.255 is non-routable; connect() on a UDP
+                    # socket just picks the source - no datagram is sent.
+                    _s.connect(("10.255.255.255", 1))
+                    primary_ip = _s.getsockname()[0]
+                    if primary_ip and primary_ip not in auto_hosts:
+                        auto_hosts.append(primary_ip)
+            except Exception:  # noqa: BLE001
+                pass
+
             os.environ["Z4J_ALLOWED_HOSTS"] = _json.dumps(auto_hosts)
 
     # Merge any --allowed-host CLI flags onto whatever env / auto-detect

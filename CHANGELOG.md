@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.7] - 2026-04-23
+
+### Added
+
+- **Auto-detect LAN and interface IPs on the SQLite/dev path.** 1.0.6 added hostname + FQDN to the default Host allow-list, but missed the homelab case where operators reach the brain via its LAN IP (e.g. `192.168.1.42`) rather than its hostname. 1.0.7 also enumerates:
+  - Every IP returned by `socket.gethostbyname_ex(gethostname())` (covers multi-interface boxes with proper `/etc/hosts`).
+  - The primary outbound IP via the stdlib UDP-socket trick (picks up the address the OS would use to reach the internet, even on Debian-default setups where the resolver only knows 127.0.1.1).
+
+  Includes Tailscale addresses (`100.x.x.x`) and Docker bridge IPs automatically. Production (Postgres) still requires explicit `Z4J_ALLOWED_HOSTS`.
+
 ## [1.0.6] - 2026-04-23
 
 ### Added
