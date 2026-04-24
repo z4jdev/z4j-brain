@@ -93,6 +93,35 @@ class ChannelPublic(BaseModel):
     updated_at: datetime
 
 
+class ChannelTestRequest(BaseModel):
+    """Body for the unsaved-config test endpoint.
+
+    Admin is composing a channel in the dialog and wants to verify
+    credentials BEFORE persisting. We accept a full ``{type, config}``
+    shape, validate it through the same SSRF / format guards that
+    create_channel / update_channel use, and dispatch a single test
+    payload. Nothing is written to the DB.
+    """
+
+    type: str = Field(pattern=_CHANNEL_TYPE_PATTERN)
+    config: dict[str, Any] = Field(default_factory=dict)
+
+
+class ChannelTestResult(BaseModel):
+    """Structured outcome of a test dispatch.
+
+    Mirrors :class:`z4j_brain.domain.notifications.channels.DeliveryResult`
+    without leaking the raw ``response_body`` by default - we cap it
+    server-side to protect against huge bodies from hostile webhooks
+    and truncate further here so the dashboard card stays small.
+    """
+
+    success: bool
+    status_code: int | None = None
+    error: str | None = None
+    response_body: str | None = None
+
+
 class SubscriptionFilters(BaseModel):
     """Strict shape for subscription filter JSON.
 
@@ -502,6 +531,144 @@ async def delete_channel(
         ),
     )
     await db_session.commit()
+
+
+# ---------------------------------------------------------------------------
+# Channel test (dispatch a one-off verification payload)
+# ---------------------------------------------------------------------------
+
+
+def _test_payload() -> dict[str, Any]:
+    """Canned payload every test dispatch uses.
+
+    Marked clearly as a z4j test so operators reading the Slack
+    channel / inbox don't mistake it for a real alert. The shape
+    matches the real notification envelope (``trigger``,
+    ``task_name``, ``priority``, ``state``) so the test exercises
+    the same rendering path production traffic hits.
+    """
+    from datetime import UTC, datetime as _dt
+
+    now = _dt.now(UTC).isoformat()
+    return {
+        "trigger": "z4j.test",
+        "task_name": "z4j-brain-self-test",
+        "task_id": "test-" + now,
+        "priority": "normal",
+        "state": "test",
+        "subject": "z4j test notification",
+        "body": (
+            "This is a z4j channel test. If you can read this, the "
+            "credentials in this notification channel work.\n\n"
+            f"Dispatched at {now}."
+        ),
+    }
+
+
+async def _dispatch_test(
+    channel_type: str, config: dict[str, Any],
+) -> ChannelTestResult:
+    """Run the real dispatcher with a canned test payload.
+
+    Shared between the saved-channel and unsaved-config endpoints so
+    there is a single test path. Validates the config through the
+    same SSRF / format guards create / update use, then returns the
+    dispatcher's structured result.
+    """
+    from z4j_brain.domain.notifications.channels import (
+        CHANNEL_DISPATCHERS,
+    )
+
+    try:
+        await _validate_channel_config(channel_type, config)
+    except ConflictError as exc:
+        return ChannelTestResult(success=False, error=str(exc))
+
+    dispatcher = CHANNEL_DISPATCHERS.get(channel_type)
+    if dispatcher is None:
+        return ChannelTestResult(
+            success=False, error=f"unknown channel type {channel_type!r}",
+        )
+
+    result = await dispatcher(config, _test_payload())
+    return ChannelTestResult(
+        success=result.success,
+        status_code=result.status_code,
+        error=result.error,
+        response_body=(
+            (result.response_body or "")[:500] if result.response_body else None
+        ),
+    )
+
+
+@router.post(
+    "/channels/test",
+    response_model=ChannelTestResult,
+    dependencies=[Depends(require_csrf)],
+)
+async def test_channel_config(
+    slug: str,
+    body: ChannelTestRequest,
+    user: "User" = Depends(get_current_user),
+    memberships: "MembershipRepository" = Depends(get_membership_repo),
+    projects: "ProjectRepository" = Depends(get_project_repo),
+) -> ChannelTestResult:
+    """Dispatch a single test notification against an UNSAVED config.
+
+    Used by the dashboard's "Test" button in the create dialog so
+    admins can verify SMTP / webhook / Slack / Telegram credentials
+    BEFORE persisting the channel (audit trail: the delivery is NOT
+    logged to ``notification_deliveries`` - this is a preflight, not
+    a real send).
+
+    Admin-only; same role gate as create_channel.
+    """
+    await _resolve_member_project(
+        slug, user, memberships, projects, min_role=ProjectRole.ADMIN,
+    )
+    return await _dispatch_test(body.type, body.config)
+
+
+@router.post(
+    "/channels/{channel_id}/test",
+    response_model=ChannelTestResult,
+    dependencies=[Depends(require_csrf)],
+)
+async def test_saved_channel(
+    slug: str,
+    channel_id: uuid.UUID,
+    user: "User" = Depends(get_current_user),
+    memberships: "MembershipRepository" = Depends(get_membership_repo),
+    projects: "ProjectRepository" = Depends(get_project_repo),
+    db_session: "AsyncSession" = Depends(get_session),
+) -> ChannelTestResult:
+    """Dispatch a single test notification against a SAVED channel.
+
+    Uses the channel's stored config (including secrets the admin
+    entered at create / update time), not anything the caller sends
+    in the body. The delivery is NOT logged to
+    ``notification_deliveries`` - same preflight semantics as the
+    unsaved variant.
+
+    Admin-only.
+    """
+    from z4j_brain.errors import NotFoundError
+    from z4j_brain.persistence.repositories import (
+        NotificationChannelRepository,
+    )
+
+    project_id = await _resolve_member_project(
+        slug, user, memberships, projects, min_role=ProjectRole.ADMIN,
+    )
+    channel = await NotificationChannelRepository(db_session).get_for_project(
+        project_id, channel_id,
+    )
+    if channel is None:
+        raise NotFoundError(
+            "channel not found",
+            details={"channel_id": str(channel_id)},
+        )
+    return await _dispatch_test(channel.type, channel.config or {})
 
 
 # ---------------------------------------------------------------------------

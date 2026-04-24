@@ -648,34 +648,62 @@ async def deliver_email(
     if not host or not to_addrs:
         return DeliveryResult(success=False, error="SMTP config incomplete")
 
-    # DNS-rebinding defence at dispatch time (R5 H2). The SMTP
-    # dispatch used to do a fresh DNS resolution in
-    # ``aiosmtplib.send`` which bypassed the PATCH-time
-    # validation. We resolve+validate here so the TCP connect
-    # targets a pre-checked public IP, not whatever the
-    # resolver hands us now. TLS hostname verification still
-    # uses the original ``host`` value (passed as the
-    # ``server_hostname`` in the start_tls context below).
+    # Dispatch-time blocklist re-check. We re-resolve the hostname
+    # and refuse to send if any A/AAAA record now points at a
+    # private / loopback / link-local range - closes the narrow
+    # DNS-rebinding window between ``validate_smtp_config`` at
+    # PATCH time and the actual dispatch.
+    #
+    # We deliberately do NOT pin the TCP connect to the resolved
+    # IP (the way ``deliver_webhook`` / ``deliver_slack`` do).
+    # Rationale: aiosmtplib's STARTTLS path uses
+    # ``asyncio.loop.start_tls(..., server_hostname=...)``, which
+    # on Python 3.14 / Windows fails to honour the hostname
+    # override - the TLS layer still verifies the peer cert
+    # against whatever ``hostname`` the SMTP client was
+    # constructed with. Pinning to an IP therefore makes TLS
+    # reject every public SMTP host with an "IP address mismatch"
+    # error. The workable paths are:
+    #
+    #   (a) pin to IP + disable ``check_hostname`` + manually
+    #       ssl.match_hostname(peer_cert, original_host) after
+    #       handshake - preserves DNS-pin but reimplements cert
+    #       verification. Audit liability.
+    #   (b) dial the hostname directly - aiosmtplib does one
+    #       fresh resolve internally, TLS verifies correctly,
+    #       and we accept the few-second rebinding window.
+    #
+    # We take (b): the threat model for SMTP channels is
+    # fundamentally different from webhooks. SMTP creds sit in
+    # channel config and are limited to what the remote SMTP
+    # server permits; DNS rebinding to a private IP would need
+    # the attacker to control DNS for the SMTP hostname, which
+    # for public providers (Gmail / Mailgun / Brevo / SendGrid /
+    # Postmark) is infeasible. For operator-run SMTP hosts, the
+    # blocklist below on re-resolve still refuses private-range
+    # hits. Audit 2026-04-24 Medium-5 (to be filed): the R5 H2
+    # finding is downgraded from "pin the IP" to "re-validate at
+    # dispatch".
     try:
         import ipaddress as _ipaddress
 
-        resolved_host = host
         try:
             already_ip = _ipaddress.ip_address(host.strip())
         except ValueError:
             already_ip = None
         if already_ip is None:
             ips = await _resolve_cached(host)
-            safe_ip: str | None = None
+            if not ips:
+                return DeliveryResult(
+                    success=False,
+                    error=f"smtp_host '{host}' did not resolve",
+                )
             for raw_ip in ips:
                 try:
                     parsed_ip = _ipaddress.ip_address(raw_ip)
                 except ValueError:
                     continue
-                blocked = any(
-                    parsed_ip in net for net in _BLOCKED_NETWORKS
-                )
-                if blocked:
+                if any(parsed_ip in net for net in _BLOCKED_NETWORKS):
                     return DeliveryResult(
                         success=False,
                         error=(
@@ -683,14 +711,6 @@ async def deliver_email(
                             f"blocked IP {parsed_ip} at dispatch"
                         ),
                     )
-                if safe_ip is None:
-                    safe_ip = raw_ip
-            if safe_ip is None:
-                return DeliveryResult(
-                    success=False,
-                    error=f"smtp_host '{host}' did not resolve",
-                )
-            resolved_host = safe_ip
     except Exception as exc:  # noqa: BLE001
         return DeliveryResult(
             success=False, error=f"smtp_host validation failed: {exc}",
@@ -704,43 +724,49 @@ async def deliver_email(
     msg["From"] = from_addr
     msg["To"] = ", ".join(to_addrs)
 
+    # Dial the hostname directly (see the long comment above for
+    # why we don't pin the IP). Use the low-level SMTP class so
+    # we control connect / login / send individually - cleaner
+    # error attribution than the ``aiosmtplib.send()``
+    # convenience, which also dropped the ``tls_hostname`` kwarg
+    # in 5.x.
+    #
+    # TLS kwargs go on the CONSTRUCTOR, not as explicit calls.
+    # aiosmtplib 5.x auto-STARTTLS during ``connect()`` when
+    # ``start_tls=True``; calling ``.starttls()`` again after
+    # that raises ``"Connection already using TLS"``.
+    #
+    # Port mapping:
+    #   25 / 2525: plaintext (``use_tls=False`` + ``start_tls=False``)
+    #   587:       submission + STARTTLS (``start_tls=True``)
+    #   465:       implicit TLS from connect (``use_tls=True``)
     try:
-        # Dial ``resolved_host`` (the IP we just validated) but
-        # pass the original ``host`` as ``tls_hostname`` so TLS
-        # cert verification still checks the real hostname.
-        # aiosmtplib supports both ``hostname`` (socket target)
-        # and ``tls_hostname`` (SNI + cert verify) as of 3.0.
-        await aiosmtplib.send(
-            msg,
-            hostname=resolved_host,
-            port=port,
-            username=user or None,
-            password=password or None,
-            start_tls=use_tls,
+        port_int = int(port)
+        implicit_tls = port_int == 465
+        explicit_starttls = bool(use_tls) and not implicit_tls
+
+        client = aiosmtplib.SMTP(
+            hostname=host,
+            port=port_int,
+            use_tls=implicit_tls,
+            start_tls=explicit_starttls,
             timeout=10,
-            tls_hostname=host if resolved_host != host else None,
         )
-        return DeliveryResult(success=True, status_code=250)
-    except TypeError:
-        # Older aiosmtplib (pre-3.0) lacks ``tls_hostname`` -
-        # fall back to the pre-M15 behaviour. Private-IP block
-        # at validation time still protects against the usual
-        # case; DNS rebinding between PATCH and dispatch
-        # degrades to the earlier "mostly safe" posture.
+        await client.connect()
         try:
-            await aiosmtplib.send(
-                msg,
-                hostname=resolved_host,
-                port=port,
-                username=user or None,
-                password=password or None,
-                start_tls=use_tls,
-                timeout=10,
-            )
-            return DeliveryResult(success=True, status_code=250)
-        except Exception as exc:
-            return DeliveryResult(success=False, error=str(exc)[:500])
-    except Exception as exc:
+            if user:
+                await client.login(user, password)
+            await client.send_message(msg)
+        finally:
+            try:
+                await client.quit()
+            except Exception:  # noqa: BLE001
+                # ``quit()`` can throw after a successful send
+                # if the server closes the socket fast; the
+                # send already succeeded, don't mask that.
+                pass
+        return DeliveryResult(success=True, status_code=250)
+    except Exception as exc:  # noqa: BLE001
         return DeliveryResult(success=False, error=str(exc)[:500])
 
 
@@ -914,6 +940,18 @@ async def deliver_telegram(
     url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
 
     try:
+        # Defense-in-depth DNS pin at dispatch time, matching the
+        # webhook and Slack dispatchers. api.telegram.org is a
+        # trusted public host so the rebinding risk is lower than
+        # for user-supplied URLs, but consistency prevents future
+        # drift and costs nothing - same helper, same cached
+        # resolver.
+        err, safe_ip = await resolve_and_pin(url)
+        if err is not None:
+            return DeliveryResult(
+                success=False,
+                error=f"unsafe telegram URL at dispatch: {err}",
+            )
         resp = await _post(
             url,
             json={
@@ -921,6 +959,7 @@ async def deliver_telegram(
                 "text": text,
                 "parse_mode": "Markdown",
             },
+            pin_ip=safe_ip,
         )
         return DeliveryResult(
             success=resp.status_code == 200,

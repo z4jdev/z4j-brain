@@ -4,9 +4,12 @@ Exposes application-level counters, gauges, and histograms for
 Grafana dashboards. The endpoint is mounted at the root (NOT
 under ``/api/v1``) so Prometheus scrape configs use a stable path.
 
-Authorization: open by default. Operators behind a reverse proxy
-should restrict ``/metrics`` to their internal network at the
-proxy layer (Caddy / nginx).
+Authorization: optional bearer-token guard. Set
+``Z4J_METRICS_AUTH_TOKEN`` and the endpoint requires
+``Authorization: Bearer <token>``; leave it unset to keep the
+legacy "open" behaviour, with a boot-time warning reminding the
+operator to either set a token or block ``/metrics`` at the
+reverse proxy (Caddy / nginx). Audit 2026-04-24 Medium-1.
 
 Metric naming follows the Prometheus convention:
 ``z4j_{component}_{metric}_{unit}``.
@@ -17,9 +20,10 @@ dashboard patterns used by Flower and Celery monitoring setups.
 
 from __future__ import annotations
 
-from typing import Callable
+import hmac
+from typing import TYPE_CHECKING, Callable
 
-from fastapi import APIRouter, Response
+from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from prometheus_client import (
     CONTENT_TYPE_LATEST,
     CollectorRegistry,
@@ -28,6 +32,11 @@ from prometheus_client import (
     Histogram,
     generate_latest,
 )
+
+from z4j_brain.api.deps import get_settings
+
+if TYPE_CHECKING:
+    from z4j_brain.settings import Settings
 
 router = APIRouter(tags=["metrics"])
 
@@ -220,8 +229,41 @@ def record_swallowed(module: str, site: str) -> None:
         return
 
 
+def _check_metrics_auth(request: Request, settings: "Settings") -> None:
+    """Enforce the optional bearer-token guard for ``/metrics``.
+
+    When ``settings.metrics_auth_token`` is unset we serve without
+    auth (backwards-compatible). When it is set we require the
+    exact token in ``Authorization: Bearer <token>`` - constant-time
+    compared so failed probes don't leak the token length.
+    """
+    expected = settings.metrics_auth_token
+    if expected is None:
+        return
+    header = request.headers.get("authorization", "")
+    scheme, _, supplied = header.partition(" ")
+    if scheme.lower() != "bearer" or not supplied:
+        raise HTTPException(
+            status_code=401,
+            detail="metrics: authorization required",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    if not hmac.compare_digest(
+        supplied.encode("utf-8"),
+        expected.get_secret_value().encode("utf-8"),
+    ):
+        raise HTTPException(
+            status_code=401,
+            detail="metrics: invalid bearer token",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+
 @router.get("/metrics", response_class=Response)
-async def metrics_endpoint() -> Response:
+async def metrics_endpoint(
+    request: Request,
+    settings: "Settings" = Depends(get_settings),
+) -> Response:
     """Render the brain's metrics in Prometheus text format.
 
     Refreshes lazy in-memory state gauges before rendering so a
@@ -229,6 +271,7 @@ async def metrics_endpoint() -> Response:
     snapshot without forcing every subsystem to update on every
     mutation (R3 finding M8).
     """
+    _check_metrics_auth(request, settings)
     _refresh_inmemory_gauges()
     body = generate_latest(registry)
     return Response(content=body, media_type=CONTENT_TYPE_LATEST)

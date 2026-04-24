@@ -150,8 +150,33 @@ class BulkRetryRequest(BaseModel):
 
 
 class PurgeQueueRequest(BaseModel):
+    """Purge-queue request body.
+
+    The agent's per-engine ``purge_queue_action`` refuses to act
+    unless one of the two confirmation fields is supplied:
+
+    * ``confirm_token`` - HMAC of ``(queue_name, observed_depth)``.
+      The caller (dashboard / API client) fetches the current depth
+      first (from the agent's measurement, surfaced in the brain's
+      queue-depth telemetry), computes the token with
+      :func:`z4j_celery.actions.purge.expected_confirm_token`, and
+      sends it here. The agent re-measures and re-computes; a
+      mismatch means the depth moved (likely a replayed command).
+    * ``force`` - bypass the token check and the depth threshold.
+      Logged at CRITICAL by the agent; reserved for scripted
+      emergency use.
+
+    Audit 2026-04-24 Medium-3: these fields were missing from the
+    brain request model, so every ``purge_queue`` command reached
+    the agent with ``confirm_token=None`` and was rejected.
+    """
+
     agent_id: uuid.UUID
     queue: str = Field(min_length=1, max_length=200)
+    confirm_token: str | None = Field(
+        default=None, min_length=1, max_length=128,
+    )
+    force: bool = False
     idempotency_key: str | None = Field(default=None, min_length=1, max_length=200)
 
 
@@ -547,13 +572,21 @@ async def issue_purge_queue(
     Removes every pending task from the named queue. The agent's
     purge action refuses the destructive ``queue_delete`` fallback
     (B3 audit fix), so this is bounded to ``queue_purge`` semantics.
+
+    The caller must pass either ``confirm_token`` (HMAC of
+    ``queue_name + observed_depth``) or ``force=True``. Without one
+    of these the agent refuses to act (audit 2026-04-24 Medium-3).
     """
     return await _issue_generic_command(
         slug=slug,
         action="purge_queue",
         target_type="queue",
         target_id=body.queue,
-        payload={"queue": body.queue},
+        payload={
+            "queue": body.queue,
+            "confirm_token": body.confirm_token,
+            "force": body.force,
+        },
         idempotency_key=body.idempotency_key,
         agent_id=body.agent_id,
         user=user,

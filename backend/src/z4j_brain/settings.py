@@ -150,6 +150,18 @@ class Settings(BaseSettings):
     # ------------------------------------------------------------------
     max_payload_size_bytes: int = Field(default=8_192, ge=128)
     max_ws_frame_bytes: int = Field(default=1_048_576, ge=1024)
+    #: Upper bound on the admin project listing endpoints
+    #: (``/api/v1/projects`` and the Home dashboard). Raise this for
+    #: tenants with more projects than the default ceiling; keep it
+    #: low for deployments where a runaway admin UI should not DoS
+    #: the backend. Audit 2026-04-24 Low-3 - was hardcoded 500.
+    admin_project_list_cap: int = Field(default=500, ge=10, le=100_000)
+    #: Upper bound on rows fetched by task export endpoints
+    #: (``/api/v1/projects/{slug}/tasks?format=csv|xlsx|json``).
+    #: Exports don't paginate; this cap is the backstop that
+    #: prevents a single export from pulling a multi-million-row
+    #: resultset into memory. Audit 2026-04-24 Low-3.
+    tasks_export_max_rows: int = Field(default=50_000, ge=100, le=5_000_000)
 
     # ------------------------------------------------------------------
     # Registry (asyncpg LISTEN/NOTIFY)
@@ -161,6 +173,16 @@ class Settings(BaseSettings):
     # Observability
     # ------------------------------------------------------------------
     metrics_enabled: bool = True
+    #: Bearer token that must be presented as
+    #: ``Authorization: Bearer <token>`` to fetch ``/metrics``.
+    #: When unset, ``/metrics`` is served without auth (backwards-
+    #: compatible behaviour) and the brain logs a WARNING at startup
+    #: telling the operator to either set this value or block the
+    #: endpoint at the reverse proxy. Audit 2026-04-24 Medium-1:
+    #: Prometheus labels leak project IDs, queue/task names, and
+    #: in-memory state - an unauthenticated reachable ``/metrics``
+    #: is a low-noise reconnaissance channel.
+    metrics_auth_token: SecretStr | None = None
 
     # ------------------------------------------------------------------
     # Auth - passwords

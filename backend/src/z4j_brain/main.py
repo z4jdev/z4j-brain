@@ -449,6 +449,16 @@ def create_app(
 
     # /metrics is mounted at the root for Prometheus scrapers.
     app.include_router(metrics_api.router)
+    if settings.metrics_enabled and settings.metrics_auth_token is None:
+        structlog.get_logger("z4j.brain").warning(
+            "metrics_open_by_default",
+            message=(
+                "/metrics is mounted without an auth token. Prometheus "
+                "labels expose project IDs, queue/task names, and "
+                "in-memory state - set Z4J_METRICS_AUTH_TOKEN or block "
+                "/metrics at the reverse proxy (Caddy / nginx)."
+            ),
+        )
 
     # WebSocket gateway - mounted at the root, not under /api/v1.
     app.include_router(ws_gateway.router)

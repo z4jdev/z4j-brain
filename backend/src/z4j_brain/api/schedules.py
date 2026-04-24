@@ -40,7 +40,7 @@ if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
 
     from z4j_brain.domain.command_dispatcher import CommandDispatcher
-    from z4j_brain.persistence.models import Schedule, User
+    from z4j_brain.persistence.models import Agent, Schedule, User
     from z4j_brain.persistence.repositories import (
         AuditLogRepository,
         MembershipRepository,
@@ -168,6 +168,68 @@ async def get_schedule(
 # ---------------------------------------------------------------------------
 
 
+async def _pick_scheduler_agent(
+    *,
+    db_session: "AsyncSession",
+    project_id: uuid.UUID,
+    scheduler_name: str,
+    schedule_id: uuid.UUID,
+) -> "Agent":
+    """Pick the best online agent to receive a schedule command.
+
+    Filters the project's agents down to those that are:
+
+    1. Currently online (``state == ONLINE``), and
+    2. Registered for the schedule's specific scheduler adapter
+       (``scheduler_name`` in ``agent.scheduler_adapters``).
+
+    Returns the freshest match (``list_online_for_project`` orders
+    by ``last_seen_at DESC``). Raises :class:`NotFoundError` with a
+    helpful message if nothing matches so the dashboard can surface
+    the root cause (offline agent vs. adapter not installed) rather
+    than the old "no agent registered" generic string.
+
+    Audit 2026-04-24 Medium-4: before this helper the caller did
+    ``next(iter(list_for_project(...)), None)``, which picked ANY
+    agent regardless of online state or scheduler support - so a
+    Django+Celery+RQ project could send ``schedule.enable`` to the
+    RQ-only agent and leave the brain's optimistic ``is_enabled``
+    out of sync forever.
+    """
+    from z4j_brain.persistence.repositories import AgentRepository
+
+    agents = await AgentRepository(db_session).list_online_for_project(
+        project_id,
+    )
+    for agent in agents:
+        if scheduler_name in (agent.scheduler_adapters or ()):
+            return agent
+
+    # None matched. Tell the caller WHY so the UI can help the
+    # operator: is no agent online at all, or is one online but
+    # without this scheduler adapter?
+    if not agents:
+        raise NotFoundError(
+            "no online agent for this project; start the agent "
+            "and retry",
+            details={
+                "schedule_id": str(schedule_id),
+                "scheduler": scheduler_name,
+                "reason": "no_online_agent",
+            },
+        )
+    raise NotFoundError(
+        f"no online agent advertises scheduler {scheduler_name!r}; "
+        f"install the matching scheduler adapter on an agent and "
+        f"restart it",
+        details={
+            "schedule_id": str(schedule_id),
+            "scheduler": scheduler_name,
+            "reason": "scheduler_not_installed",
+        },
+    )
+
+
 async def _enable_or_disable(
     *,
     slug: str,
@@ -183,7 +245,6 @@ async def _enable_or_disable(
 ) -> SchedulePublic:
     from z4j_brain.domain.policy_engine import PolicyEngine
     from z4j_brain.persistence.repositories import (
-        AgentRepository,
         CommandRepository,
         ScheduleRepository,
     )
@@ -207,17 +268,12 @@ async def _enable_or_disable(
             details={"schedule_id": str(schedule_id)},
         )
 
-    # Pick the first online agent for this project that supports
-    # the scheduler. v1 is single-agent-per-project in practice;
-    # multi-agent routing is a Phase 2 concern.
-    agents_repo = AgentRepository(db_session)
-    agents = await agents_repo.list_for_project(project.id)
-    target_agent = next(iter(agents), None)
-    if target_agent is None:
-        raise NotFoundError(
-            "no agent registered for this project",
-            details={},
-        )
+    target_agent = await _pick_scheduler_agent(
+        db_session=db_session,
+        project_id=project.id,
+        scheduler_name=schedule.scheduler,
+        schedule_id=schedule_id,
+    )
 
     action = "schedule.enable" if enabled else "schedule.disable"
     commands = CommandRepository(db_session)
@@ -337,7 +393,6 @@ async def trigger_schedule_now(
     """
     from z4j_brain.domain.policy_engine import PolicyEngine
     from z4j_brain.persistence.repositories import (
-        AgentRepository,
         CommandRepository,
         ScheduleRepository,
     )
@@ -361,13 +416,12 @@ async def trigger_schedule_now(
             details={"schedule_id": str(schedule_id)},
         )
 
-    agents = await AgentRepository(db_session).list_for_project(project.id)
-    target_agent = next(iter(agents), None)
-    if target_agent is None:
-        raise NotFoundError(
-            "no agent registered for this project",
-            details={},
-        )
+    target_agent = await _pick_scheduler_agent(
+        db_session=db_session,
+        project_id=project.id,
+        scheduler_name=schedule.scheduler,
+        schedule_id=schedule_id,
+    )
 
     await dispatcher.issue(
         commands=CommandRepository(db_session),

@@ -184,9 +184,12 @@ async def list_tasks(
     if fields:
         selected_fields = [f.strip() for f in fields.split(",") if f.strip()]
 
-    # For exports: no pagination, higher limit.
+    # For exports: no pagination, higher limit. Audit 2026-04-24
+    # Low-3 - made configurable via ``tasks_export_max_rows`` so
+    # tenants with very large projects can raise it safely instead
+    # of forking the brain.
     if format in ("csv", "xlsx", "json"):
-        page_size = 50_000
+        page_size = settings.tasks_export_max_rows
     else:
         page_size = clamp_limit(
             limit,

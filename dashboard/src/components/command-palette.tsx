@@ -12,7 +12,7 @@
  * Mounted once at the app root level. Opens on ⌘K (Mac) or Ctrl+K
  * (Windows/Linux). ESC closes it.
  */
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { useNavigate, useParams } from "@tanstack/react-router";
 import { Command } from "cmdk";
 import {
@@ -37,6 +37,11 @@ import {
   Dialog,
   DialogContent,
 } from "@/components/ui/dialog";
+import { useTasks } from "@/hooks/use-tasks";
+import {
+  TaskPriorityBadge,
+  TaskStateBadge,
+} from "@/components/domain/state-badges";
 
 interface CommandPaletteProps {
   open: boolean;
@@ -46,9 +51,28 @@ interface CommandPaletteProps {
 export function CommandPalette({ open, onOpenChange }: CommandPaletteProps) {
   const navigate = useNavigate();
   const params = useParams({ strict: false });
-  const slug = (params as { slug?: string }).slug ?? "default";
+  const activeSlug = (params as { slug?: string }).slug;
+  const slug = activeSlug ?? "default";
   const { setTheme, resolvedTheme } = useTheme();
   const [search, setSearch] = useState("");
+
+  // Debounce the search input so we don't hammer /tasks on every
+  // keystroke. 200ms is below the ~250ms human-perceived "instant"
+  // threshold; shorter keeps results feeling live, longer risks
+  // perceptible lag.
+  const debouncedSearch = useDebouncedValue(search, 200);
+  const taskQueryEnabled =
+    open && Boolean(activeSlug) && debouncedSearch.trim().length >= 2;
+  const { data: taskResults } = useTasks(
+    taskQueryEnabled ? slug : "",
+    taskQueryEnabled
+      ? { search: debouncedSearch.trim(), limit: 8 }
+      : {},
+  );
+  const taskMatches = useMemo(() => {
+    if (!taskQueryEnabled) return [];
+    return taskResults?.items ?? [];
+  }, [taskQueryEnabled, taskResults]);
 
   const close = useCallback(() => {
     onOpenChange(false);
@@ -86,6 +110,43 @@ export function CommandPalette({ open, onOpenChange }: CommandPaletteProps) {
             <Command.Empty className="py-6 text-center text-sm text-muted-foreground">
               No results found.
             </Command.Empty>
+
+            {/* Task matches - rendered above Navigate so the palette
+                prioritises the specific thing the operator typed over
+                the generic page list. Only present when we're inside
+                a project context AND the query is >= 2 chars (below
+                that every task would match and the list is noise). */}
+            {taskMatches.length > 0 && (
+              <Command.Group heading="Tasks">
+                {taskMatches.map((t) => (
+                  <Command.Item
+                    key={t.id}
+                    value={`task:${t.engine}:${t.task_id}:${t.name}`}
+                    onSelect={() =>
+                      go(
+                        `/projects/${slug}/tasks/${t.engine}/${t.task_id}`,
+                      )
+                    }
+                    className="flex cursor-pointer items-center gap-3 rounded-md px-2 py-2 text-sm aria-selected:bg-accent aria-selected:text-accent-foreground"
+                  >
+                    <ClipboardList className="size-4 shrink-0 opacity-60" />
+                    <div className="flex min-w-0 flex-1 flex-col gap-0.5">
+                      <span className="truncate font-mono text-xs">
+                        {t.name}
+                      </span>
+                      <span className="truncate text-[11px] text-muted-foreground">
+                        {t.engine} · {t.task_id}
+                        {t.queue ? ` · ${t.queue}` : ""}
+                      </span>
+                    </div>
+                    <div className="flex shrink-0 items-center gap-1">
+                      <TaskStateBadge state={t.state} />
+                      <TaskPriorityBadge priority={t.priority} />
+                    </div>
+                  </Command.Item>
+                ))}
+              </Command.Group>
+            )}
 
             {/* Navigation */}
             <Command.Group heading="Navigate">
@@ -201,6 +262,23 @@ function PaletteItem({
     </Command.Item>
   );
 }
+
+/**
+ * Trailing-edge debounce for fast-typed search inputs.
+ *
+ * Returns ``value`` after it has been stable for ``delay`` ms.
+ * The effect clears its timer on every re-render so the latest
+ * keystroke always wins.
+ */
+function useDebouncedValue<T>(value: T, delay: number): T {
+  const [debounced, setDebounced] = useState(value);
+  useEffect(() => {
+    const t = setTimeout(() => setDebounced(value), delay);
+    return () => clearTimeout(t);
+  }, [value, delay]);
+  return debounced;
+}
+
 
 /**
  * Hook to manage command palette open state + global keybinding.

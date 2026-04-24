@@ -23,6 +23,7 @@ from z4j_brain.api.deps import (
     get_membership_repo,
     get_project_repo,
     get_session,
+    get_settings,
     require_admin,
     require_csrf,
 )
@@ -39,6 +40,7 @@ if TYPE_CHECKING:
         MembershipRepository,
         ProjectRepository,
     )
+    from z4j_brain.settings import Settings
 
 
 _SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]{1,48}[a-z0-9]$")
@@ -109,6 +111,7 @@ async def list_projects(
     user: "User" = Depends(get_current_user),
     memberships: "MembershipRepository" = Depends(get_membership_repo),
     projects: "ProjectRepository" = Depends(get_project_repo),
+    settings: "Settings" = Depends(get_settings),
 ) -> list[ProjectPublic]:
     """List the projects the current user has access to.
 
@@ -125,7 +128,7 @@ async def list_projects(
     )
 
     if user.is_admin:
-        rows = await projects.list(limit=500, offset=0)
+        rows = await projects.list(limit=settings.admin_project_list_cap, offset=0)
         payload = [_project_payload(p) for p in rows if p.is_active]
     else:
         member_rows = await memberships.list_for_user(user.id)

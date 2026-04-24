@@ -241,6 +241,50 @@ export function useDeleteChannel(slug: string) {
   });
 }
 
+// -- Test dispatch (credential preflight) ------------------------------------
+
+export interface ChannelTestResult {
+  success: boolean;
+  status_code: number | null;
+  error: string | null;
+  response_body: string | null;
+}
+
+/**
+ * Dispatch a test notification against an **unsaved** config.
+ *
+ * Used by the "Test" button inside the create dialog so admins can
+ * verify SMTP / webhook / Slack / Telegram credentials before
+ * persisting. Backend does not log the delivery to
+ * ``notification_deliveries`` - this is a preflight, not a real
+ * send.
+ */
+export function useTestChannelConfig(slug: string) {
+  return useMutation({
+    mutationFn: (body: { type: ChannelType; config: Record<string, unknown> }) =>
+      api.post<ChannelTestResult>(
+        `/projects/${slug}/notifications/channels/test`,
+        body,
+      ),
+  });
+}
+
+/**
+ * Dispatch a test notification against an already-saved channel.
+ *
+ * Uses the channel's stored config (including secrets the admin
+ * entered at create / update time). Admin-only.
+ */
+export function useTestChannel(slug: string) {
+  return useMutation({
+    mutationFn: (channelId: string) =>
+      api.post<ChannelTestResult>(
+        `/projects/${slug}/notifications/channels/${channelId}/test`,
+        {},
+      ),
+  });
+}
+
 // ---------------------------------------------------------------------------
 // User channels
 // ---------------------------------------------------------------------------
@@ -282,6 +326,29 @@ export function useDeleteUserChannel() {
       qc.invalidateQueries({ queryKey: ["user-channels"] });
       qc.invalidateQueries({ queryKey: ["user-subscriptions"] });
     },
+  });
+}
+
+/**
+ * Dispatch a test notification against an **unsaved** user-channel
+ * config. Mirrors ``useTestChannelConfig`` for parity between the
+ * per-project Providers page and the global settings/channels page.
+ */
+export function useTestUserChannelConfig() {
+  return useMutation({
+    mutationFn: (body: { type: ChannelType; config: Record<string, unknown> }) =>
+      api.post<ChannelTestResult>(`/user/channels/test`, body),
+  });
+}
+
+/**
+ * Dispatch a test notification against an already-saved user channel.
+ * Uses the channel's stored (unmasked) config.
+ */
+export function useTestUserChannel() {
+  return useMutation({
+    mutationFn: (channelId: string) =>
+      api.post<ChannelTestResult>(`/user/channels/${channelId}/test`, {}),
   });
 }
 

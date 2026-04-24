@@ -138,8 +138,11 @@ export function Topbar() {
 
       <Separator orientation="vertical" className="hidden h-6 sm:block" />
 
-      {/* Global toolbar */}
-      <div className="flex items-center gap-1">
+      {/* Global toolbar.
+          ``gap-2`` (was ``gap-1``) so the NotificationBell doesn't
+          crowd the user avatar - operators were hitting the J avatar
+          when aiming for the bell on touch laptops. */}
+      <div className="flex items-center gap-2">
         <ThemeToggle />
         <NotificationBell />
         <UserMenu />

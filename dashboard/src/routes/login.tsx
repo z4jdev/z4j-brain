@@ -1,9 +1,10 @@
 import { useState } from "react";
 import { createFileRoute, useNavigate } from "@tanstack/react-router";
-import { Eye, EyeOff, Loader2 } from "lucide-react";
+import { AlertCircle, Eye, EyeOff, Loader2 } from "lucide-react";
 import { Z4jMark } from "@/components/z4j-mark";
 import { ThemeToggle } from "@/components/layout/theme-toggle";
 import { toast } from "sonner";
+import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -39,21 +40,83 @@ export const Route = createFileRoute("/login")({
   component: LoginPage,
 });
 
+/**
+ * Map an ApiError from the login endpoint to an operator-facing
+ * message pair (title + description). The brain's auth service
+ * returns distinct error codes for the three login-failure modes
+ * (bad creds, locked out, inactive user); generic networking /
+ * server errors fall through to a safe default.
+ *
+ * Kept verbose so the user can tell "wrong password" (try again)
+ * from "locked out" (wait) from "account disabled" (contact admin)
+ * without having to decode status codes.
+ */
+function describeLoginError(err: unknown): { title: string; description: string } {
+  if (err instanceof ApiError) {
+    // Rate-limit / lockout - 429 on the brain when login attempts
+    // exceed the configured per-identity / per-IP ceiling.
+    if (err.status === 429) {
+      return {
+        title: "Too many login attempts",
+        description:
+          "The account is temporarily locked. Wait a few minutes and try again.",
+      };
+    }
+    // 403 on this endpoint means the user row exists but is_active
+    // is false - "account disabled", not "wrong password".
+    if (err.status === 403) {
+      return {
+        title: "Account disabled",
+        description:
+          "Your account has been disabled. Ask a z4j admin to re-enable it.",
+      };
+    }
+    if (err.status === 401) {
+      return {
+        title: "Invalid email or password",
+        description: "Check the address, the capitalisation of the password, and try again.",
+      };
+    }
+    if (err.status >= 500) {
+      return {
+        title: "Server error",
+        description:
+          "The brain returned a server error. Check the brain logs or try again in a moment.",
+      };
+    }
+  }
+  return {
+    title: "Could not sign in",
+    description:
+      err instanceof Error
+        ? err.message
+        : "An unexpected error occurred. Try again.",
+  };
+}
+
 function LoginPage() {
   const navigate = useNavigate();
   const login = useLogin();
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [showPassword, setShowPassword] = useState(false);
+  const [error, setError] = useState<{
+    title: string;
+    description: string;
+  } | null>(null);
 
   async function onSubmit(e: React.FormEvent) {
     e.preventDefault();
+    // Clear any stale error from a previous failed attempt so a
+    // half-visible red block doesn't persist while the spinner is
+    // running.
+    setError(null);
     try {
       await login.mutateAsync({ email, password });
       toast.success("welcome back");
       navigate({ to: "/" });
-    } catch {
-      toast.error("invalid email or password");
+    } catch (err) {
+      setError(describeLoginError(err));
     }
   }
 
@@ -82,6 +145,15 @@ function LoginPage() {
           </CardHeader>
           <form onSubmit={onSubmit}>
             <CardContent className="space-y-4">
+              {error && (
+                <Alert variant="destructive" role="alert" aria-live="polite">
+                  <AlertCircle />
+                  <AlertTitle>{error.title}</AlertTitle>
+                  <AlertDescription>
+                    <p>{error.description}</p>
+                  </AlertDescription>
+                </Alert>
+              )}
               <div className="space-y-2">
                 <Label htmlFor="email">Email</Label>
                 <Input
@@ -90,8 +162,15 @@ function LoginPage() {
                   autoComplete="email"
                   required
                   value={email}
-                  onChange={(e) => setEmail(e.target.value)}
+                  onChange={(e) => {
+                    setEmail(e.target.value);
+                    // Editing either field is an implicit "I know,
+                    // I'm trying again" - drop the stale banner so
+                    // the form looks clean while the user re-types.
+                    if (error) setError(null);
+                  }}
                   placeholder="you@example.com"
+                  aria-invalid={error ? true : undefined}
                 />
               </div>
               <div className="space-y-2">
@@ -103,9 +182,13 @@ function LoginPage() {
                     autoComplete="current-password"
                     required
                     value={password}
-                    onChange={(e) => setPassword(e.target.value)}
+                    onChange={(e) => {
+                      setPassword(e.target.value);
+                      if (error) setError(null);
+                    }}
                     placeholder="enter your password"
                     className="pr-10"
+                    aria-invalid={error ? true : undefined}
                   />
                   <button
                     type="button"

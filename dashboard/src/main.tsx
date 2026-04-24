@@ -48,7 +48,10 @@ ReactDOM.createRoot(rootEl).render(
         <QueryClientProvider client={queryClient}>
           <TooltipProvider>
             <RouterProvider router={router} />
-            <Toaster position="top-right" richColors />
+            {/* Defaults (top-center, richColors, closeButton, expand)
+                live inside the <Toaster /> wrapper so every mount
+                gets the same visibility tuning. */}
+            <Toaster />
             {import.meta.env.DEV && (
               <ReactQueryDevtools initialIsOpen={false} />
             )}

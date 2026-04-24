@@ -1,6 +1,6 @@
 [project]
 name = "z4j-brain"
-version = "1.0.10"
+version = "1.0.11"
 description = "z4j brain - server, dashboard, and API (AGPL v3)"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -40,6 +40,16 @@ dependencies = [
     "python-multipart>=0.0.26",
     "itsdangerous>=2.2",
     "aiosqlite>=0.22.1",
+    # Async SMTP client for the email notification channel. Supports
+    # STARTTLS (587, the Gmail app-password path) and implicit TLS
+    # (465). v3.0+ exposes the ``tls_hostname`` kwarg the channel
+    # dispatcher uses so DNS-pinned delivery still verifies the
+    # original hostname against the server cert. Declared here (not
+    # optional-deps) because email is a first-class channel type -
+    # ``pip install z4j-brain`` should have it from day one; the
+    # runtime fallback message "aiosmtplib is not installed" was a
+    # latent packaging bug.
+    "aiosmtplib>=3.0",
     # Tasks-page xlsx export. Pure Python, write-only, ~1 MB, no
     # native deps, no optional extra needed - operators who want
     # xlsx output just get it. We specifically do NOT use

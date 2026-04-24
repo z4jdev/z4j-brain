@@ -30,6 +30,7 @@ from z4j_brain.api.deps import (
     get_session,
     require_csrf,
 )
+from z4j_brain.api.notifications import ChannelTestRequest, ChannelTestResult
 from z4j_brain.domain.notifications.channels import (
     validate_smtp_config,
     validate_telegram_config,
@@ -448,6 +449,109 @@ async def delete_user_channel(
         ),
     )
     await db_session.commit()
+
+
+# ---------------------------------------------------------------------------
+# User channel test (dispatch a one-off verification payload)
+# ---------------------------------------------------------------------------
+#
+# Mirrors the project-channel test endpoints in ``api.notifications``
+# so the global /settings/channels page has feature parity with the
+# per-project Providers page. Private-channel secrets (smtp_pass,
+# bot_token, hmac_secret) are masked in list/get responses - the
+# saved-channel test uses the stored unmasked config; the unsaved
+# variant validates the config the caller sends BEFORE persistence
+# so admins can verify creds in the create dialog.
+
+
+async def _dispatch_user_test(
+    channel_type: str, config: dict[str, Any],
+) -> ChannelTestResult:
+    """Run the real dispatcher with a canned test payload.
+
+    Validates the config through the user-scoped
+    ``_validate_channel_config`` (same guards as create/update) and
+    returns the dispatcher's structured result. Imports ``_test_payload``
+    from ``api.notifications`` so the test message matches the
+    project-channel endpoints exactly (single canned body, single
+    dashboard toast renderer).
+    """
+    from z4j_brain.api.notifications import _test_payload
+    from z4j_brain.domain.notifications.channels import (
+        CHANNEL_DISPATCHERS,
+    )
+
+    try:
+        await _validate_channel_config(channel_type, config)
+    except ConflictError as exc:
+        return ChannelTestResult(success=False, error=str(exc))
+
+    dispatcher = CHANNEL_DISPATCHERS.get(channel_type)
+    if dispatcher is None:
+        return ChannelTestResult(
+            success=False, error=f"unknown channel type {channel_type!r}",
+        )
+
+    result = await dispatcher(config, _test_payload())
+    return ChannelTestResult(
+        success=result.success,
+        status_code=result.status_code,
+        error=result.error,
+        response_body=(
+            (result.response_body or "")[:500] if result.response_body else None
+        ),
+    )
+
+
+@router.post(
+    "/channels/test",
+    response_model=ChannelTestResult,
+    dependencies=[Depends(require_csrf)],
+)
+async def test_user_channel_config(
+    body: ChannelTestRequest,
+    user: "User" = Depends(get_current_user),  # noqa: ARG001
+) -> ChannelTestResult:
+    """Dispatch a test notification against an UNSAVED user-channel config.
+
+    Used by the "Test" button in the global settings/channels create
+    dialog so the user can verify SMTP / webhook / Slack / Telegram
+    credentials BEFORE persisting. Delivery is NOT logged to
+    ``notification_deliveries`` - preflight semantics only. Runs the
+    same SSRF / format guards as ``create_user_channel``.
+    """
+    return await _dispatch_user_test(body.type, body.config)
+
+
+@router.post(
+    "/channels/{channel_id}/test",
+    response_model=ChannelTestResult,
+    dependencies=[Depends(require_csrf)],
+)
+async def test_saved_user_channel(
+    channel_id: uuid.UUID,
+    user: "User" = Depends(get_current_user),
+    db_session: "AsyncSession" = Depends(get_session),
+) -> ChannelTestResult:
+    """Dispatch a test notification against a SAVED user channel.
+
+    Uses the channel's stored (unmasked) config. Only the owning
+    user can test their own channel - ``get_for_user`` scopes the
+    lookup by ``user.id`` so a leaked UUID cannot cross-test another
+    user's channel.
+    """
+    from z4j_brain.errors import NotFoundError
+    from z4j_brain.persistence.repositories import UserChannelRepository
+
+    channel = await UserChannelRepository(db_session).get_for_user(
+        user.id, channel_id,
+    )
+    if channel is None:
+        raise NotFoundError(
+            "channel not found",
+            details={"channel_id": str(channel_id)},
+        )
+    return await _dispatch_user_test(channel.type, channel.config or {})
 
 
 # ---------------------------------------------------------------------------

@@ -38,6 +38,7 @@ from z4j_brain.api.deps import (
     get_membership_repo,
     get_project_repo,
     get_session,
+    get_settings,
 )
 from z4j_brain.persistence.enums import (
     AgentState,
@@ -60,6 +61,7 @@ if TYPE_CHECKING:
         MembershipRepository,
         ProjectRepository,
     )
+    from z4j_brain.settings import Settings
 
 
 router = APIRouter(prefix="/home", tags=["home"])
@@ -163,6 +165,7 @@ async def _visible_projects(
     user: "User",
     memberships: "MembershipRepository",
     projects_repo: "ProjectRepository",
+    admin_project_cap: int,
     bound_slug: str | None = None,
 ) -> tuple[list[Project], dict[uuid.UUID, str | None]]:
     """Return the list of projects the user can see and a map
@@ -181,7 +184,7 @@ async def _visible_projects(
     if user.is_admin:
         # Global admin: every active project, with their actual role
         # where one exists, and None otherwise.
-        rows = await projects_repo.list(limit=500, offset=0)
+        rows = await projects_repo.list(limit=admin_project_cap, offset=0)
         active = [p for p in rows if p.is_active]
         member_rows = await memberships.list_for_user(user.id)
         role_map: dict[uuid.UUID, str | None] = {
@@ -271,6 +274,7 @@ async def get_summary(
     memberships: "MembershipRepository" = Depends(get_membership_repo),
     projects_repo: "ProjectRepository" = Depends(get_project_repo),
     db_session: "AsyncSession" = Depends(get_session),
+    settings: "Settings" = Depends(get_settings),
 ) -> HomeSummaryPublic:
     """Home dashboard summary - one blob the SPA renders as cards."""
     bound_slug: str | None = getattr(
@@ -280,6 +284,7 @@ async def get_summary(
         user=user,
         memberships=memberships,
         projects_repo=projects_repo,
+        admin_project_cap=settings.admin_project_list_cap,
         bound_slug=bound_slug,
     )
 
@@ -641,6 +646,7 @@ async def get_recent_failures(
     memberships: "MembershipRepository" = Depends(get_membership_repo),
     projects_repo: "ProjectRepository" = Depends(get_project_repo),
     db_session: "AsyncSession" = Depends(get_session),
+    settings: "Settings" = Depends(get_settings),
 ) -> RecentFailuresPublic:
     """Recent ``task.failed`` events across every visible project.
 
@@ -657,6 +663,7 @@ async def get_recent_failures(
         user=user,
         memberships=memberships,
         projects_repo=projects_repo,
+        admin_project_cap=settings.admin_project_list_cap,
         bound_slug=bound_slug,
     )
     if not visible:
