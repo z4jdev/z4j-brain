@@ -169,6 +169,240 @@ async def get_schedule(
 
 
 # ---------------------------------------------------------------------------
+# CRUD endpoints (Phase 3) - dashboard + declarative reconciler
+# ---------------------------------------------------------------------------
+
+
+class ScheduleCreateIn(BaseModel):
+    """Body for ``POST /schedules`` - operator-defined schedule."""
+
+    name: str
+    engine: str
+    kind: str  # "cron" | "interval" | "one_shot"
+    expression: str
+    task_name: str
+    timezone: str = "UTC"
+    queue: str | None = None
+    args: list[Any] = []
+    kwargs: dict[str, Any] = {}
+    catch_up: str = "skip"
+    is_enabled: bool = True
+    scheduler: str = "z4j-scheduler"
+    source: str = "dashboard"
+    source_hash: str | None = None
+
+
+class ScheduleUpdateIn(BaseModel):
+    """Body for ``PATCH /schedules/{id}`` - all fields optional.
+
+    None means "do not touch this field." This lets the dashboard
+    flip a single attribute (timezone, expression, queue) without
+    re-sending the rest of the row.
+    """
+
+    engine: str | None = None
+    kind: str | None = None
+    expression: str | None = None
+    task_name: str | None = None
+    timezone: str | None = None
+    queue: str | None = None
+    args: list[Any] | None = None
+    kwargs: dict[str, Any] | None = None
+    catch_up: str | None = None
+    is_enabled: bool | None = None
+    source_hash: str | None = None
+
+
+@router.post(
+    "",
+    response_model=SchedulePublic,
+    status_code=201,
+    dependencies=[Depends(require_csrf)],
+)
+async def create_schedule(
+    slug: str,
+    body: ScheduleCreateIn,
+    user: "User" = Depends(get_current_user),
+    memberships: "MembershipRepository" = Depends(get_membership_repo),
+    projects: "ProjectRepository" = Depends(get_project_repo),
+    audit_log: "AuditLogRepository" = Depends(get_audit_log_repo),
+    audit: "AuditService" = Depends(get_audit_service),
+    db_session: "AsyncSession" = Depends(get_session),
+    ip: str = Depends(get_client_ip),
+) -> SchedulePublic:
+    """Create a new schedule under the project.
+
+    Authorization: ADMIN. Creating a schedule is a privileged
+    operation - it can move money, send emails, etc.
+    """
+    from z4j_brain.domain.policy_engine import PolicyEngine
+    from z4j_brain.persistence.repositories import ScheduleRepository
+
+    policy = PolicyEngine()
+    project = await policy.get_project_or_404(projects, slug)
+    await policy.require_member(
+        memberships,
+        user=user,
+        project_id=project.id,
+        min_role=ProjectRole.ADMIN,
+    )
+
+    repo = ScheduleRepository(db_session)
+    try:
+        row = await repo.create_for_project(
+            project_id=project.id, data=body.model_dump(),
+        )
+    except ValueError as exc:
+        raise NotFoundError(
+            f"invalid schedule: {exc}",
+            details={"reason": str(exc)},
+        ) from exc
+
+    await audit.record(
+        audit_log,
+        action="schedule.create",
+        target_type="schedule",
+        target_id=str(row.id),
+        result="success",
+        outcome="allow",
+        user_id=user.id,
+        project_id=project.id,
+        source_ip=ip,
+        metadata={"name": row.name, "engine": row.engine, "kind": row.kind.value},
+    )
+    await db_session.commit()
+    return _payload(row)
+
+
+@router.patch(
+    "/{schedule_id}",
+    response_model=SchedulePublic,
+    dependencies=[Depends(require_csrf)],
+)
+async def update_schedule(
+    slug: str,
+    schedule_id: uuid.UUID,
+    body: ScheduleUpdateIn,
+    user: "User" = Depends(get_current_user),
+    memberships: "MembershipRepository" = Depends(get_membership_repo),
+    projects: "ProjectRepository" = Depends(get_project_repo),
+    audit_log: "AuditLogRepository" = Depends(get_audit_log_repo),
+    audit: "AuditService" = Depends(get_audit_service),
+    db_session: "AsyncSession" = Depends(get_session),
+    ip: str = Depends(get_client_ip),
+) -> SchedulePublic:
+    """Partial update. Only fields present in the body are touched.
+
+    Authorization: ADMIN.
+    """
+    from z4j_brain.domain.policy_engine import PolicyEngine
+    from z4j_brain.persistence.repositories import ScheduleRepository
+
+    policy = PolicyEngine()
+    project = await policy.get_project_or_404(projects, slug)
+    await policy.require_member(
+        memberships,
+        user=user,
+        project_id=project.id,
+        min_role=ProjectRole.ADMIN,
+    )
+
+    # Drop None values so the repo's "only set what's present"
+    # contract holds.
+    patch = {k: v for k, v in body.model_dump().items() if v is not None}
+    repo = ScheduleRepository(db_session)
+    try:
+        row = await repo.update_for_project(
+            project_id=project.id,
+            schedule_id=schedule_id,
+            data=patch,
+        )
+    except ValueError as exc:
+        raise NotFoundError(
+            f"invalid schedule update: {exc}",
+            details={"reason": str(exc)},
+        ) from exc
+    if row is None:
+        raise NotFoundError(
+            "schedule not found",
+            details={"schedule_id": str(schedule_id)},
+        )
+
+    await audit.record(
+        audit_log,
+        action="schedule.update",
+        target_type="schedule",
+        target_id=str(schedule_id),
+        result="success",
+        outcome="allow",
+        user_id=user.id,
+        project_id=project.id,
+        source_ip=ip,
+        metadata={"fields_changed": sorted(patch.keys())},
+    )
+    await db_session.commit()
+    return _payload(row)
+
+
+@router.delete(
+    "/{schedule_id}",
+    status_code=204,
+    dependencies=[Depends(require_csrf)],
+)
+async def delete_schedule(
+    slug: str,
+    schedule_id: uuid.UUID,
+    user: "User" = Depends(get_current_user),
+    memberships: "MembershipRepository" = Depends(get_membership_repo),
+    projects: "ProjectRepository" = Depends(get_project_repo),
+    audit_log: "AuditLogRepository" = Depends(get_audit_log_repo),
+    audit: "AuditService" = Depends(get_audit_service),
+    db_session: "AsyncSession" = Depends(get_session),
+    ip: str = Depends(get_client_ip),
+) -> None:
+    """Hard-delete the schedule. IDOR-safe (project-scoped lookup).
+
+    Cascades to ``pending_fires`` via FK. Authorization: ADMIN.
+    """
+    from z4j_brain.domain.policy_engine import PolicyEngine
+    from z4j_brain.persistence.repositories import ScheduleRepository
+
+    policy = PolicyEngine()
+    project = await policy.get_project_or_404(projects, slug)
+    await policy.require_member(
+        memberships,
+        user=user,
+        project_id=project.id,
+        min_role=ProjectRole.ADMIN,
+    )
+
+    repo = ScheduleRepository(db_session)
+    deleted = await repo.delete_for_project(
+        project_id=project.id, schedule_id=schedule_id,
+    )
+    if not deleted:
+        raise NotFoundError(
+            "schedule not found",
+            details={"schedule_id": str(schedule_id)},
+        )
+
+    await audit.record(
+        audit_log,
+        action="schedule.delete",
+        target_type="schedule",
+        target_id=str(schedule_id),
+        result="success",
+        outcome="allow",
+        user_id=user.id,
+        project_id=project.id,
+        source_ip=ip,
+        metadata={},
+    )
+    await db_session.commit()
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Write endpoints - issue commands to the agent
 # ---------------------------------------------------------------------------
 
@@ -594,9 +828,27 @@ class ImportedScheduleIn(BaseModel):
 
 
 class ImportSchedulesRequest(BaseModel):
-    """POST body for ``/api/v1/projects/{slug}/schedules:import``."""
+    """POST body for ``/api/v1/projects/{slug}/schedules:import``.
+
+    ``mode`` controls the delete behaviour:
+
+    - ``"upsert"`` (default): per-row upsert. Schedules already in
+      brain that are NOT in the batch stay untouched. Right for the
+      one-shot importers (celery-beat, rq, apscheduler, cron).
+    - ``"replace_for_source"``: same upsert semantics for present
+      rows, plus delete every schedule with the same ``source``
+      label that is NOT in this batch. Right for the declarative
+      reconciler - the framework adapter sends the COMPLETE set of
+      schedules from one source label and absence means removal.
+
+    ``source_filter`` is required when ``mode="replace_for_source"``.
+    Defaults to the source of the first row in the batch (the
+    framework adapters always tag everything with one label).
+    """
 
     schedules: list[ImportedScheduleIn]
+    mode: str = "upsert"
+    source_filter: str | None = None
 
 
 class ImportSchedulesResponse(BaseModel):
@@ -606,12 +858,16 @@ class ImportSchedulesResponse(BaseModel):
     real diff or a no-op. ``errors`` carries human-readable messages
     keyed by index in the input list so the operator can pinpoint
     which row failed without re-correlating by name.
+
+    ``deleted`` counts rows removed by ``mode="replace_for_source"``
+    semantics; always 0 in plain upsert mode.
     """
 
     inserted: int
     updated: int
     unchanged: int
     failed: int
+    deleted: int = 0
     errors: dict[int, str] = {}
 
 
@@ -645,7 +901,10 @@ async def import_schedules(
     convention for membership / retention / token mutations.
     """
     from z4j_brain.domain.policy_engine import PolicyEngine
-    from z4j_brain.persistence.repositories import upsert_imported_schedule
+    from z4j_brain.persistence.repositories import (
+        ScheduleRepository,
+        upsert_imported_schedule,
+    )
 
     policy = PolicyEngine()
     project = await policy.get_project_or_404(projects, slug)
@@ -656,12 +915,21 @@ async def import_schedules(
         min_role=ProjectRole.ADMIN,
     )
 
+    if body.mode not in ("upsert", "replace_for_source"):
+        raise NotFoundError(
+            f"unsupported import mode {body.mode!r}",
+            details={"mode": body.mode},
+        )
+
     summary = ImportSchedulesResponse(
-        inserted=0, updated=0, unchanged=0, failed=0, errors={},
+        inserted=0, updated=0, unchanged=0, failed=0, deleted=0, errors={},
     )
+    # Track which schedules survived the upsert pass so the
+    # replace-for-source delete can target the absent ones.
+    surviving_ids: set[uuid.UUID] = set()
     for idx, row in enumerate(body.schedules):
         try:
-            outcome = await upsert_imported_schedule(
+            outcome, schedule_row = await upsert_imported_schedule(
                 session=db_session,
                 project_id=project.id,
                 data=row.model_dump(),
@@ -674,12 +942,30 @@ async def import_schedules(
             summary.failed += 1
             summary.errors[idx] = str(exc)
             continue
+        surviving_ids.add(schedule_row.id)
         if outcome == "inserted":
             summary.inserted += 1
         elif outcome == "updated":
             summary.updated += 1
         else:
             summary.unchanged += 1
+
+    # Replace-for-source: delete any schedule with the same source
+    # label that is not in this batch. The framework adapter sends
+    # the COMPLETE set so absence means deletion.
+    if body.mode == "replace_for_source":
+        # Pick the source label: explicit ``source_filter`` wins,
+        # otherwise infer from the first row in the batch.
+        source_label = body.source_filter
+        if source_label is None and body.schedules:
+            source_label = body.schedules[0].source
+        if source_label:
+            deleted = await ScheduleRepository(db_session).delete_by_source_except(
+                project_id=project.id,
+                source=source_label,
+                keep_ids=surviving_ids,
+            )
+            summary.deleted = deleted
 
     # Single audit row for the whole batch. Per-row audit would
     # spam the log when the importer is run on a big celery-beat
@@ -696,9 +982,11 @@ async def import_schedules(
         project_id=project.id,
         source_ip=ip,
         metadata={
+            "mode": body.mode,
             "inserted": summary.inserted,
             "updated": summary.updated,
             "unchanged": summary.unchanged,
+            "deleted": summary.deleted,
             "failed": summary.failed,
         },
     )

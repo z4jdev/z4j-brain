@@ -57,6 +57,142 @@ class ScheduleRepository(BaseRepository[Schedule]):
         )
         return (result.rowcount or 0) > 0
 
+    # ------------------------------------------------------------------
+    # CRUD (Phase 3)
+    # ------------------------------------------------------------------
+
+    async def create_for_project(
+        self,
+        *,
+        project_id: UUID,
+        data: dict[str, Any],
+    ) -> Schedule:
+        """Insert a new schedule under ``(project_id, scheduler, name)``.
+
+        Raises :class:`ValueError` on missing required fields or
+        unknown ``kind`` enum value. Caller owns the transaction
+        boundary.
+        """
+        from z4j_brain.persistence.enums import ScheduleKind
+
+        name = str(data.get("name", "")).strip()
+        if not name:
+            raise ValueError("schedule.name is required")
+
+        task_name = str(data.get("task_name", "")).strip()
+        if not task_name:
+            raise ValueError("schedule.task_name is required")
+
+        kind_raw = str(data.get("kind", "")).strip()
+        try:
+            kind = ScheduleKind(kind_raw)
+        except ValueError as exc:
+            raise ValueError(
+                f"schedule.kind {kind_raw!r} is not a recognised ScheduleKind",
+            ) from exc
+
+        row = Schedule(
+            project_id=project_id,
+            engine=str(data.get("engine", "celery")),
+            scheduler=str(data.get("scheduler", "z4j-scheduler")),
+            name=name,
+            task_name=task_name,
+            kind=kind,
+            expression=str(data.get("expression", "")),
+            timezone=str(data.get("timezone", "UTC")) or "UTC",
+            queue=data.get("queue"),
+            args=data.get("args") or [],
+            kwargs=data.get("kwargs") or {},
+            is_enabled=bool(data.get("is_enabled", True)),
+            catch_up=str(data.get("catch_up", "skip")),
+            source=str(data.get("source", "dashboard")),
+            source_hash=data.get("source_hash"),
+        )
+        self.session.add(row)
+        await self.session.flush()
+        return row
+
+    async def update_for_project(
+        self,
+        *,
+        project_id: UUID,
+        schedule_id: UUID,
+        data: dict[str, Any],
+    ) -> Schedule | None:
+        """Apply a partial update. Returns ``None`` if the schedule is
+        not in the project (IDOR-safe)."""
+        from z4j_brain.persistence.enums import ScheduleKind
+
+        existing = await self.get_for_project(
+            project_id=project_id, schedule_id=schedule_id,
+        )
+        if existing is None:
+            return None
+
+        # Only fields present in ``data`` get touched; everything
+        # else stays. Lets the dashboard PATCH a single field
+        # without round-tripping every other column.
+        for key, value in data.items():
+            if key == "kind" and value is not None:
+                value = ScheduleKind(str(value))  # noqa: PLW2901 - rebind on purpose
+            if hasattr(existing, key):
+                setattr(existing, key, value)
+        existing.updated_at = datetime.now(UTC)
+        await self.session.flush()
+        return existing
+
+    async def delete_for_project(
+        self,
+        *,
+        project_id: UUID,
+        schedule_id: UUID,
+    ) -> bool:
+        """Hard-delete one schedule. IDOR-safe.
+
+        Cascades to ``pending_fires`` via the FK on schedule_id.
+        Returns True iff a row was removed.
+        """
+        existing = await self.get_for_project(
+            project_id=project_id, schedule_id=schedule_id,
+        )
+        if existing is None:
+            return False
+        await self.session.delete(existing)
+        await self.session.flush()
+        return True
+
+    async def delete_by_source_except(
+        self,
+        *,
+        project_id: UUID,
+        source: str,
+        keep_ids: set[UUID],
+    ) -> int:
+        """Delete every schedule with this source EXCEPT the given ids.
+
+        Used by the declarative-reconciliation import mode
+        (``replace_for_source``): the framework adapter sends a
+        complete batch of schedules for one source label
+        (e.g. ``"declarative_django"``), and brain treats absence
+        from the batch as removal.
+
+        Scoped to (project, source) so a Django app can manage its
+        own declarative schedules without touching schedules from
+        another framework or imported from celery-beat.
+
+        Returns the number of rows deleted.
+        """
+        from sqlalchemy import delete as sa_delete
+
+        stmt = sa_delete(Schedule).where(
+            Schedule.project_id == project_id,
+            Schedule.source == source,
+        )
+        if keep_ids:
+            stmt = stmt.where(Schedule.id.notin_(keep_ids))
+        result = await self.session.execute(stmt)
+        return result.rowcount or 0
+
 
     async def upsert_from_event(
         self,
@@ -148,7 +284,7 @@ async def upsert_imported_schedule(
     session: AsyncSession,
     project_id: UUID,
     data: dict[str, Any],
-) -> ImportRowOutcome:
+) -> tuple[ImportRowOutcome, Schedule]:
     """Insert or update one schedule from a migration importer payload.
 
     Identity is ``(project_id, scheduler, name)``. The same name can
@@ -162,8 +298,10 @@ async def upsert_imported_schedule(
     the operator can re-run ``z4j-scheduler import`` and only see
     actual diffs land in the audit trail.
 
-    Returns ``"inserted"`` / ``"updated"`` / ``"unchanged"`` so the
-    caller can summarise per-batch counts in the API response.
+    Returns ``(outcome, row)`` where outcome is one of
+    ``"inserted"`` / ``"updated"`` / ``"unchanged"`` and ``row`` is
+    the upserted Schedule. The caller uses the row id to track
+    survivors when running in ``replace_for_source`` import mode.
 
     Note: the caller is responsible for the surrounding transaction
     boundary - we do not commit here. The bulk import endpoint
@@ -229,20 +367,20 @@ async def upsert_imported_schedule(
         )
         session.add(row)
         await session.flush()
-        return "inserted"
+        return "inserted", row
 
     # Re-import idempotency: same content hash AND existing row also
     # has a hash means nothing changed. We still touch updated_at?
     # No - keeping updated_at stable lets WatchSchedules treat the
     # noop as truly noop (it polls updated_at to detect diffs).
     if source_hash and existing.source_hash == source_hash:
-        return "unchanged"
+        return "unchanged", existing
 
     for key, value in new_values.items():
         setattr(existing, key, value)
     existing.updated_at = datetime.now(UTC)
     await session.flush()
-    return "updated"
+    return "updated", existing
 
 
 __all__ = ["ScheduleRepository", "upsert_imported_schedule"]

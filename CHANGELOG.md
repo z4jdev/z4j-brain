@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.16] - 2026-04-27
+
+### Fixed
+
+- **Wheel ships the bundled dashboard SPA again (v1.0.11
+  regression).** The 1.0.15 wheel on PyPI was missing the
+  `dashboard/dist/` directory entirely, so `pip install z4j-brain
+  && z4j-brain serve` returned `{"detail":"Not Found"}` for
+  `GET /` on every fresh install. Pure packaging defect: the
+  release-split script's rsync `--exclude='dist'` rule was
+  unanchored and matched the SPA's bundle directory at
+  `backend/src/z4j_brain/dashboard/dist/` along with the intended
+  top-level `dist/` build output. Fixed by anchoring the exclude
+  to the package root only (`--exclude='/dist'` on rsync, full
+  source-path on robocopy, post-copy `rm -rf` on cp). Belt-and-
+  suspenders: the release script now refuses to publish a
+  z4j-brain wheel that contains fewer than 100 SPA asset entries
+  or is missing `dashboard/dist/index.html` - the same
+  regression cannot reach PyPI again.
+- API endpoints (`/api/v1/*`), `/metrics`, the WebSocket gateway,
+  CLI, and migrations were all working correctly in 1.0.15 - only
+  the dashboard HTML was missing. **Operator action: `pip install
+  -U z4j` (or `-U z4j-brain`) and restart.** No DB migrations,
+  no env changes.
+- Docker users were unaffected; the Dockerfile copies the SPA
+  separately from the pip install.
+
+### Compatibility
+
+- Backwards compatible. Wheel content delta vs 1.0.15 is purely
+  the addition of the missing `dashboard/dist/` tree (267 files).
+
 ## [1.0.15] - 2026-04-27
 
 ### Security

@@ -163,19 +163,22 @@ class SchedulerServiceImpl(pb_grpc.SchedulerServiceServicer):
     ) -> AsyncIterator[pb.ScheduleEvent]:
         """Stream create/update/delete events to the scheduler.
 
-        Implementation: poll ``schedules.updated_at`` every
-        ``Z4J_SCHEDULER_GRPC_WATCH_POLL_SECONDS``. We track the
-        last-emitted (id -> updated_at) snapshot per stream and emit
-        a diff each cycle. The ``resume_token`` is the ISO timestamp
-        of the most recent ``updated_at`` we've seen; on reconnect
-        the scheduler echoes it back so we only need to consider
-        rows newer than that for the first cycle.
+        Two implementations, picked at runtime based on the DB
+        dialect:
 
-        This is the simplest correct implementation. A LISTEN-based
-        push path is a Phase 2 optimisation; at our target scale
-        (10k schedules, single-region brain) polling at 2s is well
-        within the 100ms-target cache freshness budget the scheduler
-        targets after amortising against its own 250ms tick.
+        - **Postgres**: dedicated asyncpg connection LISTENing on
+          ``z4j_schedules_changed`` (set up by migration
+          ``2026_04_27_0007_sched_notify``). Sub-100ms cache
+          freshness, near-zero idle CPU. Phase 3 default.
+        - **SQLite**: polls ``schedules.updated_at`` every
+          ``Z4J_SCHEDULER_GRPC_WATCH_POLL_SECONDS`` and emits diffs
+          (Phase 1/2 path; SQLite has no LISTEN/NOTIFY). Used by the
+          test fixtures + single-tenant evaluation deployments.
+
+        The ``resume_token`` is the ISO timestamp of the latest
+        ``updated_at`` the scheduler has seen; on reconnect the
+        scheduler echoes it back so the first cycle skips events
+        already delivered.
         """
         project_id: UUID | None = None
         if request.project_id:
@@ -188,26 +191,176 @@ class SchedulerServiceImpl(pb_grpc.SchedulerServiceServicer):
                 )
                 return
 
-        # Resume token is an ISO datetime; missing = start fresh.
+        # Dispatch on dialect. The async engine carries the dialect
+        # name; we read it once at stream open. Falling back to the
+        # poll path on any dialect we don't recognise (defence in
+        # depth - a future Postgres replacement should not silently
+        # drop notifications because of a typo).
+        dialect = self._db.engine.dialect.name
+        if dialect == "postgresql":
+            async for event in self._watch_via_listen(
+                project_id=project_id,
+                resume_token=request.resume_token,
+                context=context,
+            ):
+                yield event
+            return
+        # SQLite + everything else → polling fallback.
+        async for event in self._watch_via_polling(
+            project_id=project_id,
+            resume_token=request.resume_token,
+            context=context,
+        ):
+            yield event
+
+    async def _watch_via_listen(
+        self,
+        *,
+        project_id: UUID | None,
+        resume_token: str,
+        context: grpc.aio.ServicerContext,
+    ) -> AsyncIterator[pb.ScheduleEvent]:
+        """Postgres LISTEN/NOTIFY-driven WatchSchedules implementation.
+
+        Opens a dedicated asyncpg connection (LISTEN cannot be
+        pooled - the listener identity is bound to the connection),
+        subscribes to ``z4j_schedules_changed``, and emits gRPC
+        events as notifications arrive.
+
+        Catch-up on connect: if the scheduler sent a ``resume_token``
+        we run one diff pass to deliver any events the scheduler
+        missed during reconnect, then enter the live LISTEN loop.
+
+        The dedicated connection is closed when the gRPC stream
+        ends (client disconnect, scheduler shutdown, transient
+        network drop).
+        """
+        try:
+            import asyncpg  # noqa: PLC0415
+        except ImportError:  # pragma: no cover
+            # asyncpg is a hard dep of brain on Postgres - this branch
+            # only fires if the operator stripped it out for some
+            # reason. Fall back to polling.
+            logger.warning(
+                "z4j.brain.scheduler_grpc: asyncpg missing; falling "
+                "back to polling for WatchSchedules",
+            )
+            async for event in self._watch_via_polling(
+                project_id=project_id,
+                resume_token=resume_token,
+                context=context,
+            ):
+                yield event
+            return
+
+        # Catch-up pass: emit any events newer than resume_token so
+        # the reconnecting scheduler doesn't miss diffs that landed
+        # while the stream was down.
         last_seen_at: datetime | None = None
-        if request.resume_token:
+        if resume_token:
             try:
-                last_seen_at = datetime.fromisoformat(request.resume_token)
+                last_seen_at = datetime.fromisoformat(resume_token)
             except ValueError:
-                # Bad token from a stale scheduler - just start fresh
-                # rather than failing the stream. The scheduler will
-                # refresh its cache from ListSchedules anyway.
                 logger.warning(
                     "z4j.brain.scheduler_grpc: ignoring malformed "
                     "resume_token %r; starting from current state",
-                    request.resume_token,
+                    resume_token,
+                )
+        if last_seen_at is not None:
+            catchup_events, _ = await self._compute_watch_diff(
+                project_id=project_id,
+                last_seen_at=last_seen_at,
+                snapshot={},
+                first_cycle=True,
+            )
+            for event in catchup_events:
+                yield event
+
+        # Open a dedicated asyncpg connection on the same DSN as the
+        # SQLAlchemy engine. Translate the SQLAlchemy URL to the
+        # asyncpg DSN form (asyncpg doesn't understand the
+        # ``postgresql+asyncpg://`` driver suffix). Use
+        # ``render_as_string(hide_password=False)`` because the
+        # default ``str(url)`` masks the password as ``***`` -
+        # asyncpg would then fail with InvalidPasswordError. The
+        # rendered string never leaves this function.
+        dsn = self._db.engine.url.render_as_string(
+            hide_password=False,
+        ).replace("postgresql+asyncpg://", "postgresql://")
+        conn = await asyncpg.connect(
+            dsn,
+            server_settings={"application_name": "z4j-brain-watch-stream"},
+        )
+        notification_queue: asyncio.Queue = asyncio.Queue()
+
+        def _on_notify(_conn, _pid, _channel, payload: str) -> None:
+            # Called by asyncpg in the connection's task. Just
+            # enqueue - the consumer below does the actual work.
+            try:
+                notification_queue.put_nowait(payload)
+            except asyncio.QueueFull:  # pragma: no cover - unbounded queue
+                pass
+
+        await conn.add_listener("z4j_schedules_changed", _on_notify)
+        try:
+            while not context.cancelled():
+                try:
+                    payload = await asyncio.wait_for(
+                        notification_queue.get(), timeout=30.0,
+                    )
+                except asyncio.TimeoutError:
+                    # Liveness ping - keeps the gRPC stream alive
+                    # under no-traffic conditions and lets us notice
+                    # context cancellation without blocking forever.
+                    continue
+                except asyncio.CancelledError:
+                    return
+
+                event = await self._notification_to_event(
+                    payload=payload, project_id=project_id,
+                )
+                if event is not None:
+                    yield event
+        finally:
+            try:
+                await conn.remove_listener(
+                    "z4j_schedules_changed", _on_notify,
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                await conn.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+    async def _watch_via_polling(
+        self,
+        *,
+        project_id: UUID | None,
+        resume_token: str,
+        context: grpc.aio.ServicerContext,
+    ) -> AsyncIterator[pb.ScheduleEvent]:
+        """SQLite (and fallback) polling implementation.
+
+        Extracted from the original WatchSchedules body so the
+        Postgres path can defer to it on asyncpg failure.
+        """
+        last_seen_at: datetime | None = None
+        if resume_token:
+            try:
+                last_seen_at = datetime.fromisoformat(resume_token)
+            except ValueError:
+                logger.warning(
+                    "z4j.brain.scheduler_grpc: ignoring malformed "
+                    "resume_token %r; starting from current state",
+                    resume_token,
                 )
 
-        # Per-stream snapshot of (id -> updated_at) used to detect
-        # deletes. We populate it lazily on the first cycle.
         snapshot: dict[UUID, datetime] = {}
         first_cycle = True
-        poll_seconds = float(self._settings.scheduler_grpc_watch_poll_seconds)
+        poll_seconds = float(
+            self._settings.scheduler_grpc_watch_poll_seconds,
+        )
 
         while not context.cancelled():
             try:
@@ -218,9 +371,6 @@ class SchedulerServiceImpl(pb_grpc.SchedulerServiceServicer):
                     first_cycle=first_cycle,
                 )
             except Exception:  # noqa: BLE001
-                # Don't tear down the stream on a transient DB error;
-                # the scheduler's reconnect-with-backoff would just
-                # bring us back here.
                 logger.exception(
                     "z4j.brain.scheduler_grpc: watch poll crashed",
                 )
@@ -228,10 +378,6 @@ class SchedulerServiceImpl(pb_grpc.SchedulerServiceServicer):
                 continue
 
             for event in events:
-                # Update last_seen_at as we emit so the resume token
-                # always reflects "the last event the scheduler has".
-                if event.schedule and event.schedule.next_run_at:
-                    pass  # nothing - resume token uses updated_at
                 yield event
                 if event.resume_token:
                     try:
@@ -246,6 +392,82 @@ class SchedulerServiceImpl(pb_grpc.SchedulerServiceServicer):
                 await asyncio.sleep(poll_seconds)
             except asyncio.CancelledError:
                 return
+
+    async def _notification_to_event(
+        self,
+        *,
+        payload: str,
+        project_id: UUID | None,
+    ) -> pb.ScheduleEvent | None:
+        """Convert one NOTIFY payload to a ScheduleEvent.
+
+        Payload shape (from migration 2026_04_27_0007):
+            {"op": "insert"|"update"|"delete", "id": <uuid>,
+             "project_id": <uuid>}
+
+        Returns ``None`` to skip emission when:
+        - JSON is malformed
+        - the row's project doesn't match this stream's filter
+        - the row turns out to belong to a different scheduler
+          (we only emit for ``scheduler='z4j-scheduler'``)
+        """
+        import json as _json  # noqa: PLC0415
+
+        try:
+            data = _json.loads(payload)
+        except _json.JSONDecodeError:
+            logger.warning(
+                "z4j.brain.scheduler_grpc: dropped malformed NOTIFY %r",
+                payload,
+            )
+            return None
+
+        try:
+            row_id = UUID(str(data["id"]))
+            row_project_id = UUID(str(data["project_id"]))
+        except (KeyError, ValueError):
+            return None
+
+        if project_id is not None and row_project_id != project_id:
+            return None
+
+        op_kind = data.get("op")
+        if op_kind == "delete":
+            return pb.ScheduleEvent(
+                kind=pb.ScheduleEvent.Kind.DELETED,
+                deleted_id=str(row_id),
+                resume_token=datetime.now(UTC).isoformat(),
+            )
+
+        # INSERT / UPDATE: fetch the row to build the full payload.
+        # The trigger fires on every INSERT/UPDATE regardless of
+        # scheduler value; filter here so we don't leak rows owned
+        # by celery-beat etc. into the z4j-scheduler stream.
+        from sqlalchemy import select  # noqa: PLC0415
+
+        from z4j_brain.persistence.models import Schedule  # noqa: PLC0415
+
+        async with self._db.session() as session:
+            result = await session.execute(
+                select(Schedule).where(
+                    Schedule.id == row_id,
+                    Schedule.scheduler == _SCHEDULER_NAME,
+                ),
+            )
+            row = result.scalar_one_or_none()
+        if row is None:
+            return None
+
+        kind = (
+            pb.ScheduleEvent.Kind.CREATED
+            if op_kind == "insert"
+            else pb.ScheduleEvent.Kind.UPDATED
+        )
+        return pb.ScheduleEvent(
+            kind=kind,
+            schedule=_schedule_to_pb(row),
+            resume_token=row.updated_at.isoformat(),
+        )
 
     async def _compute_watch_diff(
         self,
