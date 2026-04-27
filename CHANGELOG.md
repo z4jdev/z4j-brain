@@ -16,7 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 > upgrades and downgrades cleanly to / from every other v1.0.x. See
 > `docs/MIGRATIONS.md` for the additive-only contract.
 >
-> Coordinated minor publish: ships alongside `z4j-core` 1.0.5 (the
+> Coordinated minor publish: ships alongside `z4j-core` 1.0.6 (the
 > SDK companion that adds `Schedule.catch_up` / `source` /
 > `source_hash` defaults so deserializing brain responses doesn't
 > trip `extra="forbid"`) and the `z4j` umbrella 1.0.19. The bigger
