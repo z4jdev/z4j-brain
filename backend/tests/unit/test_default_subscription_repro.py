@@ -1,5 +1,10 @@
 """Reproducer for the production 500 on Add Default Subscription.
 
+NOTE: passes on SQLite (in-memory). Bug only surfaces on the
+Postgres deployment - probably the ``ARRAY(Uuid)`` column type
+or a JSONB serialisation difference. The Postgres reproducer is
+in ``tests/integration/test_default_subscription_pg.py``.
+
 Screenshot from operator: clicking "Create Default" in the
 dashboard's Project Settings → Defaults page produced three
 "Failed: the brain encountered an unexpected error" toasts. Form
@@ -110,7 +115,7 @@ async def _seed(brain_app, settings: Settings):
                     name="Frag.ai Fail Task TG",
                     type="telegram",
                     config={"bot_token": "x", "chat_id": "y"},
-                    enabled=True,
+                    is_active=True,
                 ),
                 NotificationChannel(
                     id=channel_ids["slack"],
@@ -118,7 +123,7 @@ async def _seed(brain_app, settings: Settings):
                     name="Fragi.ai Failed Task",
                     type="slack",
                     config={"webhook_url": "https://hooks.slack.example.com/x"},
-                    enabled=True,
+                    is_active=True,
                 ),
                 NotificationChannel(
                     id=channel_ids["email"],
@@ -126,7 +131,7 @@ async def _seed(brain_app, settings: Settings):
                     name="Frag.ai Fail Task Gmail",
                     type="email",
                     config={"to": "ops@example.com"},
-                    enabled=True,
+                    is_active=True,
                 ),
             ],
         )
@@ -189,3 +194,150 @@ class TestProductionRepro:
         if r.status_code != 201:
             print(f"\n!!! status={r.status_code}\nbody={r.text}")
         assert r.status_code == 201, r.text
+
+
+class TestBadInputShapes:
+    """The operator's screenshot shows three 'unexpected error' toasts.
+
+    A 500 (vs 422) means the route accepted the request body and
+    threw inside the handler. Try every plausible bad-input shape
+    that could land in a 500 instead of a clean 422/409.
+    """
+
+    @pytest.mark.asyncio
+    async def test_dashboard_label_instead_of_value_returns_422_not_500(
+        self, settings: Settings, brain_app,
+    ) -> None:
+        # The dashboard might send the LABEL ("Task failed") instead
+        # of the VALUE ("task.failed"). Should be a clean 422.
+        seed = await _seed(brain_app, settings)
+        async with _client(brain_app, settings, seed) as client:
+            r = await client.post(
+                "/api/v1/projects/fragai/notifications/defaults",
+                json={
+                    "trigger": "Task failed",  # WRONG - has space + cap
+                    "in_app": True,
+                    "project_channel_ids": [],
+                    "cooldown_seconds": 300,
+                },
+            )
+        assert r.status_code in (400, 422), (
+            f"bad trigger should be 422/400, got {r.status_code}: {r.text}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_invalid_uuid_in_channel_list_clean_status(
+        self, settings: Settings, brain_app,
+    ) -> None:
+        # Sending a non-UUID string in project_channel_ids.
+        seed = await _seed(brain_app, settings)
+        async with _client(brain_app, settings, seed) as client:
+            r = await client.post(
+                "/api/v1/projects/fragai/notifications/defaults",
+                json={
+                    "trigger": "task.failed",
+                    "in_app": True,
+                    "project_channel_ids": ["not-a-uuid"],
+                    "cooldown_seconds": 300,
+                },
+            )
+        assert r.status_code == 422, (
+            f"bad uuid should be 422, got {r.status_code}: {r.text}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_channel_id_from_other_project_returns_clean_409(
+        self, settings: Settings, brain_app,
+    ) -> None:
+        # Sending a channel id that exists but belongs to a
+        # different project. Should hit the validator and return
+        # 409, NOT 500. Tests the IDOR scoping path.
+        seed = await _seed(brain_app, settings)
+        # Create a second project + channel.
+        from z4j_brain.persistence.models import Project as P, NotificationChannel as NC
+        other_project_id = uuid.uuid4()
+        other_channel_id = uuid.uuid4()
+        async with brain_app.state.db.session() as s:
+            s.add(P(id=other_project_id, slug="other", name="Other"))
+            await s.commit()
+        async with brain_app.state.db.session() as s:
+            s.add(
+                NC(
+                    id=other_channel_id,
+                    project_id=other_project_id,
+                    name="other-channel",
+                    type="slack",
+                    config={"webhook_url": "https://x"},
+                    is_active=True,
+                ),
+            )
+            await s.commit()
+
+        async with _client(brain_app, settings, seed) as client:
+            r = await client.post(
+                "/api/v1/projects/fragai/notifications/defaults",
+                json={
+                    "trigger": "task.failed",
+                    "in_app": True,
+                    "project_channel_ids": [str(other_channel_id)],
+                    "cooldown_seconds": 300,
+                },
+            )
+        # MUST be 409, not 500. If 500, the IDOR scoping check is
+        # broken and returns a generic error instead of a clean
+        # ConflictError.
+        assert r.status_code == 409, (
+            f"cross-project channel id should be 409, got "
+            f"{r.status_code}: {r.text}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_duplicate_trigger_returns_409_on_second_post(
+        self, settings: Settings, brain_app,
+    ) -> None:
+        # First create succeeds; second with same trigger must
+        # return 409, not 500.
+        seed = await _seed(brain_app, settings)
+        body = {
+            "trigger": "task.failed",
+            "in_app": True,
+            "project_channel_ids": [],
+            "cooldown_seconds": 300,
+        }
+        async with _client(brain_app, settings, seed) as client:
+            r1 = await client.post(
+                "/api/v1/projects/fragai/notifications/defaults",
+                json=body,
+            )
+            assert r1.status_code == 201
+            r2 = await client.post(
+                "/api/v1/projects/fragai/notifications/defaults",
+                json=body,
+            )
+        assert r2.status_code == 409, (
+            f"duplicate trigger should be 409, got "
+            f"{r2.status_code}: {r2.text}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_unknown_filter_field_returns_422(
+        self, settings: Settings, brain_app,
+    ) -> None:
+        # SubscriptionFilters has extra="forbid"; an unknown filter
+        # key should be 422 not 500.
+        seed = await _seed(brain_app, settings)
+        async with _client(brain_app, settings, seed) as client:
+            r = await client.post(
+                "/api/v1/projects/fragai/notifications/defaults",
+                json={
+                    "trigger": "task.failed",
+                    "in_app": True,
+                    "project_channel_ids": [],
+                    "cooldown_seconds": 300,
+                    "filters": {"made_up_field": "x"},
+                },
+            )
+        assert r.status_code == 422, (
+            f"unknown filter key should be 422, got "
+            f"{r.status_code}: {r.text}"
+        )

@@ -3,16 +3,17 @@
  *
  * Left sidebar navigation (mirrors the global settings layout) with a
  * single "Project" section. Renders an Outlet for the active child
- * settings page (members, providers, defaults, deliveries).
+ * settings page (members, notifications hub).
+ *
+ * v1.0.18: the three notification entries (Project Channels,
+ * Default Subscriptions, Delivery Log) collapsed into one
+ * admin-only "Notifications" entry that points at the unified
+ * Project Notifications hub. Hidden from non-admin members
+ * because every tab inside is admin-only - members manage their
+ * own subscriptions in Global Notifications under their account.
  */
 import { createFileRoute, Link, Outlet } from "@tanstack/react-router";
-import {
-  BellRing,
-  Globe,
-  Send,
-  Settings2,
-  Users,
-} from "lucide-react";
+import { BellRing, Settings2, Users } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { PageHeader } from "@/components/domain/page-header";
 import { useIsProjectAdmin } from "@/hooks/use-memberships";
@@ -49,20 +50,14 @@ function ProjectSettingsLayout() {
           icon: Users,
         },
         {
-          label: "Project Channels",
-          to: "/projects/$slug/settings/providers",
-          icon: Globe,
-        },
-        {
-          label: "Default Subscriptions",
-          to: "/projects/$slug/settings/defaults",
+          // v1.0.18: collapses Project Channels + Default
+          // Subscriptions + Delivery Log into one admin-only
+          // hub page. Non-admins never see this entry; if they
+          // URL-jump in directly the inner tabs render their own
+          // admin-only EmptyState.
+          label: "Notifications",
+          to: "/projects/$slug/settings/notifications",
           icon: BellRing,
-          adminOnly: true,
-        },
-        {
-          label: "Delivery Log",
-          to: "/projects/$slug/settings/deliveries",
-          icon: Send,
           adminOnly: true,
         },
       ],

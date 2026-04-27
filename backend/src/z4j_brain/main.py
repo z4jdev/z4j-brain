@@ -72,6 +72,10 @@ from z4j_brain.domain.workers.agent_hygiene import AgentHygieneWorker
 from z4j_brain.domain.workers.partition_creator import PartitionCreatorWorker
 from z4j_brain.domain.workers.pending_fires import PendingFiresReplayWorker
 from z4j_brain.domain.workers.reconciliation import ReconciliationWorker
+from z4j_brain.domain.workers.schedule_circuit_breaker import (
+    ScheduleCircuitBreakerWorker,
+    ScheduleFiresPruneWorker,
+)
 from z4j_brain.logging_config import configure_logging
 from z4j_brain.middleware import (
     BodySizeLimitMiddleware,
@@ -292,6 +296,29 @@ def create_app(
                 interval_seconds=float(
                     settings.pending_fires_replay_interval_seconds,
                 ),
+            ),
+            # z4j-scheduler circuit breaker. Auto-disables a
+            # schedule after N consecutive failed fires so a
+            # broken schedule doesn't flood the dashboard.
+            PeriodicWorker(
+                name="schedule_circuit_breaker_worker",
+                tick=ScheduleCircuitBreakerWorker(
+                    db=db, settings=settings, audit=audit_service,
+                ).tick,
+                interval_seconds=float(
+                    settings.schedule_circuit_breaker_interval_seconds,
+                ),
+            ),
+            # z4j-scheduler fire-history retention. Bounds the
+            # ``schedule_fires`` table at the operator-configured
+            # window. Hourly is fine - the table doesn't need
+            # tight retention.
+            PeriodicWorker(
+                name="schedule_fires_prune_worker",
+                tick=ScheduleFiresPruneWorker(
+                    db=db, settings=settings,
+                ).tick,
+                interval_seconds=3600.0,
             ),
         ],
     )

@@ -44,6 +44,9 @@ from z4j_brain.persistence.repositories.pending_fires import (
 )
 from z4j_brain.persistence.repositories.projects import ProjectRepository
 from z4j_brain.persistence.repositories.queues import QueueRepository
+from z4j_brain.persistence.repositories.schedule_fires import (
+    ScheduleFireRepository,
+)
 from z4j_brain.persistence.repositories.schedules import (
     ScheduleRepository,
     upsert_imported_schedule,
@@ -69,6 +72,7 @@ __all__ = [
     "ProjectDefaultSubscriptionRepository",
     "ProjectRepository",
     "QueueRepository",
+    "ScheduleFireRepository",
     "ScheduleRepository",
     "SessionRepository",
     "TaskRepository",

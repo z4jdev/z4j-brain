@@ -29,6 +29,8 @@ from pydantic import BaseModel, Field, field_validator
 from sqlalchemy.exc import IntegrityError
 
 from z4j_brain.api.deps import (
+    get_audit_log_repo,
+    get_audit_service,
     get_current_user,
     get_membership_repo,
     get_project_repo,
@@ -49,8 +51,10 @@ from z4j_brain.persistence.enums import ProjectRole
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
 
+    from z4j_brain.domain.audit_service import AuditService
     from z4j_brain.persistence.models import User
     from z4j_brain.persistence.repositories import (
+        AuditLogRepository,
         MembershipRepository,
         ProjectRepository,
     )
@@ -69,7 +73,10 @@ router = APIRouter(
 
 _TRIGGER_PATTERN = (
     r"^(task\.failed|task\.succeeded|task\.retried|"
-    r"task\.slow|agent\.offline|agent\.online)$"
+    r"task\.slow|agent\.offline|agent\.online|"
+    r"schedule\.fire\.failed|schedule\.fire\.succeeded|"
+    r"schedule\.task_failed|"
+    r"schedule\.circuit_breaker\.tripped)$"
 )
 _CHANNEL_TYPE_PATTERN = r"^(webhook|email|slack|telegram|pagerduty|discord)$"
 
@@ -276,6 +283,12 @@ class DefaultSubscriptionPublic(BaseModel):
 
 class DeliveryPublic(BaseModel):
     id: uuid.UUID
+    # v1.0.18: ``project_id`` is now exposed so the personal
+    # delivery-history tab can group / filter by project without
+    # an N+1 fetch. The project-scoped delivery log already knows
+    # the project from the URL slug, so it doesn't need this -
+    # but it's harmless to include for symmetry.
+    project_id: uuid.UUID | None = None
     subscription_id: uuid.UUID | None
     channel_id: uuid.UUID | None
     user_channel_id: uuid.UUID | None
@@ -544,6 +557,7 @@ def _delivery_payload(
             name, type_ = user_channel_lookup[d.user_channel_id]
     return DeliveryPublic(
         id=d.id,
+        project_id=d.project_id,
         subscription_id=d.subscription_id,
         channel_id=d.channel_id,
         user_channel_id=d.user_channel_id,
@@ -595,9 +609,12 @@ async def list_channels(
 async def create_channel(
     slug: str,
     body: ChannelCreate,
+    request: Request,
     user: "User" = Depends(get_current_user),
     memberships: "MembershipRepository" = Depends(get_membership_repo),
     projects: "ProjectRepository" = Depends(get_project_repo),
+    audit_log: "AuditLogRepository" = Depends(get_audit_log_repo),
+    audit: "AuditService" = Depends(get_audit_service),
     db_session: "AsyncSession" = Depends(get_session),
 ) -> ChannelPublic:
     from z4j_brain.persistence.models.notification import NotificationChannel
@@ -617,6 +634,23 @@ async def create_channel(
     )
     db_session.add(channel)
     await db_session.flush()
+    # Audit BEFORE commit so create + audit-row are atomic.
+    # Channels carry secrets (webhook URLs, bot tokens, SMTP creds)
+    # so creation is a privileged event that must leave a trail.
+    # Audit-Phase4-1 caught the missing audit.
+    await audit.record(
+        audit_log,
+        action="notifications.channel.create",
+        target_type="notification_channel",
+        target_id=str(channel.id),
+        result="success",
+        outcome="allow",
+        user_id=user.id,
+        project_id=project_id,
+        source_ip=request.client.host if request.client else None,
+        user_agent=request.headers.get("user-agent"),
+        metadata={"name": channel.name, "type": channel.type},
+    )
     try:
         await db_session.commit()
     except IntegrityError:
@@ -638,9 +672,12 @@ async def create_channel(
 async def import_channel_from_user(
     slug: str,
     body: ChannelImportFromUserRequest,
+    request: Request,
     user: "User" = Depends(get_current_user),
     memberships: "MembershipRepository" = Depends(get_membership_repo),
     projects: "ProjectRepository" = Depends(get_project_repo),
+    audit_log: "AuditLogRepository" = Depends(get_audit_log_repo),
+    audit: "AuditService" = Depends(get_audit_service),
     db_session: "AsyncSession" = Depends(get_session),
 ) -> ChannelPublic:
     """Copy one of the caller's personal channels into the project.
@@ -707,6 +744,27 @@ async def import_channel_from_user(
     )
     db_session.add(channel)
     await db_session.flush()
+    # Audit the cross-boundary copy: a personal user channel
+    # (with secrets) became visible to all project admins. Names
+    # both the source user_channel_id and the new project channel.
+    # Audit-Phase4-1 caught the missing audit.
+    await audit.record(
+        audit_log,
+        action="notifications.channel.import_from_user",
+        target_type="notification_channel",
+        target_id=str(channel.id),
+        result="success",
+        outcome="allow",
+        user_id=user.id,
+        project_id=project_id,
+        source_ip=request.client.host if request.client else None,
+        user_agent=request.headers.get("user-agent"),
+        metadata={
+            "name": new_name,
+            "type": source.type,
+            "source_user_channel_id": str(source.id),
+        },
+    )
     try:
         await db_session.commit()
     except IntegrityError:
@@ -727,9 +785,12 @@ async def update_channel(
     slug: str,
     channel_id: uuid.UUID,
     body: ChannelUpdate,
+    request: Request,
     user: "User" = Depends(get_current_user),
     memberships: "MembershipRepository" = Depends(get_membership_repo),
     projects: "ProjectRepository" = Depends(get_project_repo),
+    audit_log: "AuditLogRepository" = Depends(get_audit_log_repo),
+    audit: "AuditService" = Depends(get_audit_service),
     db_session: "AsyncSession" = Depends(get_session),
 ) -> ChannelPublic:
     from z4j_brain.errors import NotFoundError
@@ -748,8 +809,11 @@ async def update_channel(
             "channel not found",
             details={"channel_id": str(channel_id)},
         )
+    fields_changed: list[str] = []
     if body.name is not None:
         channel.name = body.name
+        fields_changed.append("name")
+    url_changed = False
     if body.config is not None:
         # Validate any incoming URL/headers BEFORE the merge so
         # unsafe patches never touch the DB.
@@ -757,13 +821,38 @@ async def update_channel(
         # Merge instead of replace so admins don't have to re-enter
         # masked credentials. See _safe_merge_config for HIGH-01
         # details (mask-echo preservation + URL-pivot scrub).
-        merged, _url_changed = _safe_merge_config(
+        merged, url_changed = _safe_merge_config(
             channel.config or {}, body.config, mask=_MASK,
         )
         channel.config = merged
+        fields_changed.append("config")
     if body.is_active is not None:
         channel.is_active = body.is_active
+        fields_changed.append("is_active")
     await db_session.flush()
+    # Audit the patch. Don't include the raw config (would leak
+    # rotated secrets via the audit_log table); instead record
+    # which fields changed + a flag for URL pivots so security
+    # ops can spot a credential rotation followed by URL change
+    # (classic phishing-the-channel attack pattern).
+    # Audit-Phase4-1 caught the missing audit.
+    await audit.record(
+        audit_log,
+        action="notifications.channel.update",
+        target_type="notification_channel",
+        target_id=str(channel.id),
+        result="success",
+        outcome="allow",
+        user_id=user.id,
+        project_id=project_id,
+        source_ip=request.client.host if request.client else None,
+        user_agent=request.headers.get("user-agent"),
+        metadata={
+            "fields_changed": fields_changed,
+            "url_changed": url_changed,
+            "type": channel.type,
+        },
+    )
     await db_session.commit()
     await db_session.refresh(channel)
     return _channel_payload(channel)
@@ -777,17 +866,31 @@ async def update_channel(
 async def delete_channel(
     slug: str,
     channel_id: uuid.UUID,
+    request: Request,
     user: "User" = Depends(get_current_user),
     memberships: "MembershipRepository" = Depends(get_membership_repo),
     projects: "ProjectRepository" = Depends(get_project_repo),
+    audit_log: "AuditLogRepository" = Depends(get_audit_log_repo),
+    audit: "AuditService" = Depends(get_audit_service),
     db_session: "AsyncSession" = Depends(get_session),
 ) -> None:
     from sqlalchemy import delete
 
     from z4j_brain.persistence.models.notification import NotificationChannel
+    from z4j_brain.persistence.repositories import (
+        NotificationChannelRepository,
+    )
 
     project_id = await _resolve_member_project(
         slug, user, memberships, projects, min_role=ProjectRole.ADMIN,
+    )
+
+    # Look up the row first so the audit metadata can name what was
+    # deleted (operator looking at the audit page should see
+    # ``deleted webhook channel "Slack: ops-alerts"``, not just
+    # an opaque UUID). Returns None on cross-project IDOR attempts.
+    channel = await NotificationChannelRepository(db_session).get_for_project(
+        project_id, channel_id,
     )
 
     # DATA-05: strip this channel id from every subscription that
@@ -813,12 +916,63 @@ async def delete_channel(
             NotificationChannel.project_id == project_id,
         ),
     )
+    # Audit-Phase4-1 caught the missing audit. Privileged delete -
+    # rogue admin shouldn't be able to silently nuke a channel
+    # carrying alert credentials.
+    await audit.record(
+        audit_log,
+        action="notifications.channel.delete",
+        target_type="notification_channel",
+        target_id=str(channel_id),
+        result="success",
+        outcome="allow",
+        user_id=user.id,
+        project_id=project_id,
+        source_ip=request.client.host if request.client else None,
+        user_agent=request.headers.get("user-agent"),
+        metadata={
+            "name": channel.name if channel else None,
+            "type": channel.type if channel else None,
+        },
+    )
     await db_session.commit()
 
 
 # ---------------------------------------------------------------------------
 # Channel test (dispatch a one-off verification payload)
 # ---------------------------------------------------------------------------
+
+
+def _destination_summary(channel_type: str, config: dict[str, Any]) -> str:
+    """Compact, audit-safe rendering of a channel's destination.
+
+    Returns the host (for webhook / slack / discord URLs), email
+    address (for email type), or chat id (for telegram). NEVER
+    returns secrets - bot tokens, webhook signing secrets, SMTP
+    passwords are all dropped. The audit log persists these
+    summaries indefinitely so leaking a credential here would
+    create a long-lived breach.
+
+    Used by the channel-test audit to record where the test fired
+    so a security review can spot exfiltration via test endpoints
+    pointed at attacker-controlled URLs.
+    """
+    from urllib.parse import urlparse
+
+    if channel_type in {"webhook", "slack", "discord", "pagerduty"}:
+        url = config.get("webhook_url") or config.get("url") or ""
+        try:
+            host = urlparse(str(url)).hostname or ""
+        except (ValueError, TypeError):
+            host = ""
+        return f"{channel_type}://{host}" if host else channel_type
+    if channel_type == "email":
+        to = config.get("to") or ""
+        return f"email:{to}"
+    if channel_type == "telegram":
+        chat_id = config.get("chat_id") or ""
+        return f"telegram:chat_id={chat_id}"
+    return channel_type
 
 
 def _test_payload() -> dict[str, Any]:
@@ -982,9 +1136,12 @@ async def _dispatch_test(
 async def test_channel_config(
     slug: str,
     body: ChannelTestRequest,
+    request: Request,
     user: "User" = Depends(get_current_user),
     memberships: "MembershipRepository" = Depends(get_membership_repo),
     projects: "ProjectRepository" = Depends(get_project_repo),
+    audit_log: "AuditLogRepository" = Depends(get_audit_log_repo),
+    audit: "AuditService" = Depends(get_audit_service),
     db_session: "AsyncSession" = Depends(get_session),
 ) -> ChannelTestResult:
     """Dispatch a single test notification against an UNSAVED config.
@@ -1005,13 +1162,37 @@ async def test_channel_config(
     project_id = await _resolve_member_project(
         slug, user, memberships, projects, min_role=ProjectRole.ADMIN,
     )
-    return await _dispatch_test(
+    result = await _dispatch_test(
         body.type,
         body.config,
         project_id=project_id,
         channel_id=None,
         db_session=db_session,
     )
+    # Audit-Phase4-1: the test endpoint is a data-exfil vector
+    # (operator can configure an attacker-controlled webhook URL +
+    # fire one test that puts arbitrary brain data on the wire).
+    # Record every test attempt with the destination's URL/host
+    # in metadata so a security review can spot the pivot.
+    await audit.record(
+        audit_log,
+        action="notifications.channel.test",
+        target_type="notification_channel",
+        target_id=None,  # unsaved-config test
+        result="success" if result.success else "failed",
+        outcome="allow",
+        user_id=user.id,
+        project_id=project_id,
+        source_ip=request.client.host if request.client else None,
+        user_agent=request.headers.get("user-agent"),
+        metadata={
+            "type": body.type,
+            "destination_summary": _destination_summary(body.type, body.config),
+            "ok": result.success,
+        },
+    )
+    await db_session.commit()
+    return result
 
 
 @router.post(
@@ -1025,9 +1206,12 @@ async def test_channel_config(
 async def test_saved_channel(
     slug: str,
     channel_id: uuid.UUID,
+    request: Request,
     user: "User" = Depends(get_current_user),
     memberships: "MembershipRepository" = Depends(get_membership_repo),
     projects: "ProjectRepository" = Depends(get_project_repo),
+    audit_log: "AuditLogRepository" = Depends(get_audit_log_repo),
+    audit: "AuditService" = Depends(get_audit_service),
     db_session: "AsyncSession" = Depends(get_session),
 ) -> ChannelTestResult:
     """Dispatch a single test notification against a SAVED channel.
@@ -1056,13 +1240,35 @@ async def test_saved_channel(
             "channel not found",
             details={"channel_id": str(channel_id)},
         )
-    return await _dispatch_test(
+    result = await _dispatch_test(
         channel.type,
         channel.config or {},
         project_id=project_id,
         channel_id=channel.id,
         db_session=db_session,
     )
+    # Audit-Phase4-1: same exfil concern as test_channel_config
+    # but against a stored channel - the audit row names which
+    # channel was poked.
+    await audit.record(
+        audit_log,
+        action="notifications.channel.test",
+        target_type="notification_channel",
+        target_id=str(channel.id),
+        result="success" if result.success else "failed",
+        outcome="allow",
+        user_id=user.id,
+        project_id=project_id,
+        source_ip=request.client.host if request.client else None,
+        user_agent=request.headers.get("user-agent"),
+        metadata={
+            "type": channel.type,
+            "name": channel.name,
+            "ok": result.success,
+        },
+    )
+    await db_session.commit()
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -1103,9 +1309,12 @@ async def list_defaults(
 async def create_default(
     slug: str,
     body: DefaultSubscriptionCreate,
+    request: Request,
     user: "User" = Depends(get_current_user),
     memberships: "MembershipRepository" = Depends(get_membership_repo),
     projects: "ProjectRepository" = Depends(get_project_repo),
+    audit_log: "AuditLogRepository" = Depends(get_audit_log_repo),
+    audit: "AuditService" = Depends(get_audit_service),
     db_session: "AsyncSession" = Depends(get_session),
 ) -> DefaultSubscriptionPublic:
     from z4j_brain.persistence.models.notification import (
@@ -1152,6 +1361,27 @@ async def create_default(
     )
     db_session.add(default)
     await db_session.flush()
+    # Audit-Phase4-1: defaults auto-materialise into UserSubscriptions
+    # for every new project member. Defining one is a privileged
+    # operation that propagates across the whole org → must audit.
+    await audit.record(
+        audit_log,
+        action="notifications.default.create",
+        target_type="project_default_subscription",
+        target_id=str(default.id),
+        result="success",
+        outcome="allow",
+        user_id=user.id,
+        project_id=project_id,
+        source_ip=request.client.host if request.client else None,
+        user_agent=request.headers.get("user-agent"),
+        metadata={
+            "trigger": default.trigger,
+            "in_app": default.in_app,
+            "channel_count": len(default.project_channel_ids or []),
+            "cooldown_seconds": default.cooldown_seconds,
+        },
+    )
     try:
         await db_session.commit()
     except IntegrityError:
@@ -1165,6 +1395,122 @@ async def create_default(
     return _default_payload(default)
 
 
+class DefaultSubscriptionUpdate(BaseModel):
+    """Body for ``PATCH /defaults/{default_id}`` (added v1.0.18).
+
+    Every field is optional - only the keys actually present in
+    the request mutate the row. Lets admins flip a single channel
+    on/off, change the cooldown, or rename the trigger without
+    re-typing the whole subscription. Mirrors :class:`ChannelUpdate`'s
+    partial-update shape.
+    """
+
+    trigger: str | None = Field(default=None, pattern=_TRIGGER_PATTERN)
+    filters: SubscriptionFilters | None = None
+    in_app: bool | None = None
+    project_channel_ids: list[uuid.UUID] | None = None
+    cooldown_seconds: int | None = Field(default=None, ge=0, le=86400)
+
+
+@router.patch(
+    "/defaults/{default_id}",
+    response_model=DefaultSubscriptionPublic,
+    dependencies=[Depends(require_csrf)],
+)
+async def update_default(
+    slug: str,
+    default_id: uuid.UUID,
+    body: DefaultSubscriptionUpdate,
+    user: "User" = Depends(get_current_user),
+    memberships: "MembershipRepository" = Depends(get_membership_repo),
+    projects: "ProjectRepository" = Depends(get_project_repo),
+    db_session: "AsyncSession" = Depends(get_session),
+) -> DefaultSubscriptionPublic:
+    """Partial-update an existing default subscription (admin only).
+
+    Added v1.0.18 so admins can adjust a default's channels /
+    in-app / cooldown / trigger without the
+    ``delete + recreate`` workaround. Mutated fields:
+
+    - ``trigger``: rename. Validated against the same allow-list
+      as create. Rejects with 409 if another default already
+      exists for the new trigger in this project (race-safe).
+    - ``filters``: replace the JSON filter blob.
+    - ``in_app``: toggle in-app delivery.
+    - ``project_channel_ids``: replace the channel-id list. Each
+      id MUST belong to this project (409 ConflictError otherwise).
+    - ``cooldown_seconds``: integer 0..86400.
+
+    All five are independent: a request containing only
+    ``project_channel_ids`` updates ONLY that field. Omitted keys
+    leave the existing value untouched (PATCH semantics, not PUT).
+    """
+    from z4j_brain.errors import NotFoundError
+    from z4j_brain.persistence.repositories import (
+        NotificationChannelRepository,
+        ProjectDefaultSubscriptionRepository,
+    )
+
+    project_id = await _resolve_member_project(
+        slug, user, memberships, projects, min_role=ProjectRole.ADMIN,
+    )
+
+    # Load the row scoped to this project so a leaked default_id
+    # cannot mutate a default in a different project.
+    repo = ProjectDefaultSubscriptionRepository(db_session)
+    default = await repo.get_for_project(project_id, default_id)
+    if default is None:
+        raise NotFoundError(
+            "default subscription not found",
+            details={"default_id": str(default_id)},
+        )
+
+    # Validate channel ids belong to this project BEFORE any
+    # write, so a partial-state row is never persisted on bad
+    # input.
+    if body.project_channel_ids is not None and body.project_channel_ids:
+        valid = await NotificationChannelRepository(
+            db_session,
+        ).get_many_for_project(project_id, body.project_channel_ids)
+        if len(valid) != len(set(body.project_channel_ids)):
+            raise ConflictError(
+                "one or more channel_ids do not belong to this project",
+            )
+
+    # If the trigger is changing, defend the (project_id, trigger)
+    # uniqueness invariant so the user gets a clean 409 instead
+    # of an opaque IntegrityError on commit.
+    if body.trigger is not None and body.trigger != default.trigger:
+        if await repo.exists_for_project_trigger(project_id, body.trigger):
+            raise ConflictError(
+                "default subscription for this trigger already exists",
+                details={"trigger": body.trigger},
+            )
+        default.trigger = body.trigger
+
+    if body.filters is not None:
+        default.filters = body.filters.model_dump(exclude_none=True)
+    if body.in_app is not None:
+        default.in_app = body.in_app
+    if body.project_channel_ids is not None:
+        default.project_channel_ids = body.project_channel_ids
+    if body.cooldown_seconds is not None:
+        default.cooldown_seconds = body.cooldown_seconds
+
+    await db_session.flush()
+    try:
+        await db_session.commit()
+    except IntegrityError:
+        # Concurrent insert / update lost the check-then-write
+        # race for a trigger rename. Re-raise as a clean 409.
+        await db_session.rollback()
+        raise ConflictError(
+            "default subscription for this trigger already exists",
+            details={"trigger": body.trigger or default.trigger},
+        ) from None
+    await db_session.refresh(default)
+    return _default_payload(default)
+
 @router.delete(
     "/defaults/{default_id}",
     status_code=204,
@@ -1173,9 +1519,12 @@ async def create_default(
 async def delete_default(
     slug: str,
     default_id: uuid.UUID,
+    request: Request,
     user: "User" = Depends(get_current_user),
     memberships: "MembershipRepository" = Depends(get_membership_repo),
     projects: "ProjectRepository" = Depends(get_project_repo),
+    audit_log: "AuditLogRepository" = Depends(get_audit_log_repo),
+    audit: "AuditService" = Depends(get_audit_service),
     db_session: "AsyncSession" = Depends(get_session),
 ) -> None:
     from sqlalchemy import delete
@@ -1183,15 +1532,40 @@ async def delete_default(
     from z4j_brain.persistence.models.notification import (
         ProjectDefaultSubscription,
     )
+    from z4j_brain.persistence.repositories import (
+        ProjectDefaultSubscriptionRepository,
+    )
 
     project_id = await _resolve_member_project(
         slug, user, memberships, projects, min_role=ProjectRole.ADMIN,
     )
+    # Capture the trigger before the row goes so the audit metadata
+    # has something more useful than an opaque UUID.
+    existing = await ProjectDefaultSubscriptionRepository(
+        db_session,
+    ).get_for_project(project_id, default_id)
     await db_session.execute(
         delete(ProjectDefaultSubscription).where(
             ProjectDefaultSubscription.id == default_id,
             ProjectDefaultSubscription.project_id == project_id,
         ),
+    )
+    # Audit-Phase4-1: removing a default touches every future
+    # member's notification preferences. Privileged + must audit.
+    await audit.record(
+        audit_log,
+        action="notifications.default.delete",
+        target_type="project_default_subscription",
+        target_id=str(default_id),
+        result="success",
+        outcome="allow",
+        user_id=user.id,
+        project_id=project_id,
+        source_ip=request.client.host if request.client else None,
+        user_agent=request.headers.get("user-agent"),
+        metadata={
+            "trigger": existing.trigger if existing else None,
+        },
     )
     await db_session.commit()
 
@@ -1325,9 +1699,14 @@ async def list_deliveries(
     )
     next_cursor: str | None = None
     if len(rows) > limit:
-        overflow = rows[limit]
-        next_cursor = _encode_cursor(overflow.sent_at, overflow.id)
+        # v1.0.18: encode the last visible row, not the overflow
+        # row. The keyset predicate is strict ``sent_at < cursor``,
+        # so encoding the overflow would skip one row per page
+        # boundary. Now page 2 starts with what was previously the
+        # overflow row, exactly as paging is intended to work.
         rows = rows[:limit]
+        last = rows[-1]
+        next_cursor = _encode_cursor(last.sent_at, last.id)
 
     # Batch-resolve channel name + type for each row in this page so
     # the dashboard can label "which Slack channel did this fire to?"

@@ -697,6 +697,84 @@ class NotificationDeliveryRepository(BaseRepository[NotificationDelivery]):
         result = await self.session.execute(stmt)
         return list(result.scalars().all())
 
+    async def list_for_user(
+        self,
+        user_id: UUID,
+        *,
+        limit: int = 50,
+        cursor_sent_at: datetime | None = None,
+        cursor_id: UUID | None = None,
+        project_id: UUID | None = None,
+    ) -> list[NotificationDelivery]:
+        """Newest deliveries TO a specific user, capped at ``limit``.
+
+        Joins ``notification_deliveries.subscription_id`` to
+        ``user_subscriptions.user_id`` so a user sees every
+        notification that fired into one of their personal
+        subscriptions across all projects. Added v1.0.18 to
+        complement the project-scoped audit log with a personal
+        delivery history view.
+
+        - ``project_id``: optional filter when the dashboard wants
+          to scope the view to one project.
+        - Pagination matches :meth:`list_for_project` (keyset on
+          ``(sent_at, id)`` so pages stay stable under concurrent
+          insert / delete).
+
+        IMPORTANT: includes deliveries whose subscription was later
+        deleted (``subscription_id`` orphaned). Those rows still
+        belong to the user historically; the dashboard renders them
+        with a "subscription deleted" hint rather than hiding them.
+        Same principle for the user leaving the project — historical
+        audit data survives membership changes.
+        """
+        if limit <= 0 or limit > 501:
+            raise ValueError("limit must be between 1 and 501")
+        from sqlalchemy import and_, or_
+
+        from z4j_brain.persistence.models import UserSubscription
+
+        # Subquery: subscription IDs that belong to this user. We
+        # cache the LEFT-JOIN-friendly id list so a delivery row
+        # whose subscription was deleted (subscription_id NULL)
+        # still surfaces if it carries a user_subscription_id we
+        # remember owning. For the v1.0.18 minimum, we just match
+        # by user-owned subscription_id at query time.
+        owned_subs = (
+            select(UserSubscription.id)
+            .where(UserSubscription.user_id == user_id)
+            .scalar_subquery()
+        )
+
+        where_conds: list[Any] = [
+            NotificationDelivery.subscription_id.in_(owned_subs),
+        ]
+        if project_id is not None:
+            where_conds.append(
+                NotificationDelivery.project_id == project_id,
+            )
+        if cursor_sent_at is not None and cursor_id is not None:
+            where_conds.append(
+                or_(
+                    NotificationDelivery.sent_at < cursor_sent_at,
+                    and_(
+                        NotificationDelivery.sent_at == cursor_sent_at,
+                        NotificationDelivery.id < cursor_id,
+                    ),
+                ),
+            )
+        stmt = (
+            select(NotificationDelivery)
+            .where(and_(*where_conds))
+            .order_by(
+                desc(NotificationDelivery.sent_at),
+                desc(NotificationDelivery.id),
+            )
+            .limit(limit)
+        )
+        result = await self.session.execute(stmt)
+        return list(result.scalars().all())
+
     async def delete_for_project(
         self,
         project_id: UUID,

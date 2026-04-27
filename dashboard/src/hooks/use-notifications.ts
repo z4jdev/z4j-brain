@@ -137,6 +137,9 @@ export interface CreateSubscriptionRequest {
 }
 
 export interface UpdateSubscriptionRequest {
+  /** Renaming the trigger added v1.0.18; backend defends the
+   *  (user, project, trigger) uniqueness invariant with a 409. */
+  trigger?: TriggerType;
   filters?: Record<string, unknown>;
   in_app?: boolean;
   project_channel_ids?: string[];
@@ -182,10 +185,39 @@ export interface CreateDefaultSubscriptionRequest {
   cooldown_seconds?: number;
 }
 
+/**
+ * Body for `PATCH /defaults/{default_id}` (added v1.0.18).
+ * Every field is optional - only the keys actually present in the
+ * request mutate the row. Lets admins flip a single channel on/off,
+ * change the cooldown, or rename the trigger without re-typing the
+ * whole subscription.
+ */
+export interface UpdateDefaultSubscriptionRequest {
+  trigger?: TriggerType;
+  filters?: Record<string, unknown>;
+  in_app?: boolean;
+  project_channel_ids?: string[];
+  cooldown_seconds?: number;
+}
+
+/**
+ * Cursor-paginated personal delivery history. v1.0.18 added the
+ * `/api/v1/user/deliveries` endpoint so users can see "where did
+ * my alerts land?" without opening every project's audit log.
+ */
+export interface UserDeliveryListResponse {
+  items: NotificationDelivery[];
+  next_cursor: string | null;
+}
+
 // -- Delivery audit log -------------------------------------------------------
 
 export interface NotificationDelivery {
   id: string;
+  /** v1.0.18: project_id is now exposed so the personal delivery
+   *  history can group / filter by project, and badge rows whose
+   *  project the user is no longer a member of. */
+  project_id: string | null;
   subscription_id: string | null;
   channel_id: string | null;
   user_channel_id: string | null;
@@ -556,6 +588,28 @@ export function useCreateDefaultSubscription(slug: string) {
   });
 }
 
+export function useUpdateDefaultSubscription(slug: string) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({
+      id,
+      body,
+    }: {
+      id: string;
+      body: UpdateDefaultSubscriptionRequest;
+    }) =>
+      api.patch<ProjectDefaultSubscription>(
+        `/projects/${slug}/notifications/defaults/${id}`,
+        body,
+      ),
+    onSuccess: () => {
+      qc.invalidateQueries({
+        queryKey: ["project-default-subscriptions", slug],
+      });
+    },
+  });
+}
+
 export function useDeleteDefaultSubscription(slug: string) {
   const qc = useQueryClient();
   return useMutation({
@@ -593,6 +647,37 @@ export function useDeliveries(slug: string, limit = 50, cursor?: string | null) 
       );
     },
     enabled: !!slug,
+    staleTime: 30_000,
+  });
+}
+
+/**
+ * Personal delivery history across all the user's projects (v1.0.18).
+ * Mirror of `useDeliveries` but unscoped — joins to the user's
+ * personal subscriptions on the backend. Optional `projectSlug`
+ * narrows the view to one project; deliveries from projects the
+ * user is no longer a member of still surface (audit data outlives
+ * membership). The dashboard renders those rows with a "you left
+ * this project" hint by checking against the membership list.
+ */
+export function useUserDeliveries(
+  limit = 50,
+  cursor?: string | null,
+  projectSlug?: string | null,
+) {
+  return useQuery<NotificationDeliveryList>({
+    queryKey: [
+      "user-deliveries",
+      limit,
+      cursor ?? null,
+      projectSlug ?? null,
+    ],
+    queryFn: () => {
+      const params: Record<string, string | number> = { limit };
+      if (cursor) params.cursor = cursor;
+      if (projectSlug) params.project_slug = projectSlug;
+      return api.get<NotificationDeliveryList>(`/user/deliveries`, params);
+    },
     staleTime: 30_000,
   });
 }

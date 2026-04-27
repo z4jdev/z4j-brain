@@ -561,7 +561,21 @@ class SchedulerServiceImpl(pb_grpc.SchedulerServiceServicer):
         from z4j_brain.persistence.repositories import (
             AuditLogRepository,
             CommandRepository,
+            ScheduleFireRepository,
             ScheduleRepository,
+        )
+
+        # Phase 4: parse the scheduler-supplied scheduled_for so the
+        # fire-history row records the original tick boundary, not
+        # whatever wall-clock the brain runs at.
+        scheduled_for_dt = (
+            datetime.fromtimestamp(
+                request.scheduled_for.seconds
+                + request.scheduled_for.nanos / 1e9,
+                tz=UTC,
+            )
+            if request.scheduled_for.seconds
+            else datetime.now(UTC)
         )
 
         async with self._db.session() as session:
@@ -604,7 +618,7 @@ class SchedulerServiceImpl(pb_grpc.SchedulerServiceServicer):
                 # wants zero buffering can disable buffering by
                 # setting Z4J_PENDING_FIRES_BUFFER_SKIP_POLICY=false
                 # (Phase 3 op knob; default True today).
-                from datetime import UTC, datetime, timedelta  # noqa: PLC0415
+                from datetime import timedelta  # noqa: PLC0415
 
                 from z4j_brain.persistence.repositories import (  # noqa: PLC0415
                     PendingFiresRepository,
@@ -613,15 +627,6 @@ class SchedulerServiceImpl(pb_grpc.SchedulerServiceServicer):
                 pending = PendingFiresRepository(session)
                 retention_days = self._settings.pending_fires_retention_days
                 expires_at = datetime.now(UTC) + timedelta(days=retention_days)
-                scheduled_for_dt = (
-                    datetime.fromtimestamp(
-                        request.scheduled_for.seconds
-                        + request.scheduled_for.nanos / 1e9,
-                        tz=UTC,
-                    )
-                    if request.scheduled_for.seconds
-                    else datetime.now(UTC)
-                )
                 await pending.buffer(
                     fire_id=fire_id,
                     schedule_id=schedule.id,
@@ -641,6 +646,19 @@ class SchedulerServiceImpl(pb_grpc.SchedulerServiceServicer):
                     },
                     scheduled_for=scheduled_for_dt,
                     expires_at=expires_at,
+                )
+                # Phase 4: also write a schedule_fires row with
+                # status="buffered" so the dashboard's fire-history
+                # view shows "buffered, awaiting agent" rather than
+                # silence. Replay later updates the same row to
+                # acked_success/acked_failed via fire_id correlation.
+                await ScheduleFireRepository(session).record(
+                    fire_id=fire_id,
+                    schedule_id=schedule.id,
+                    project_id=schedule.project_id,
+                    command_id=None,
+                    status="buffered",
+                    scheduled_for=scheduled_for_dt,
                 )
                 await session.commit()
                 return pb.FireScheduleResponse(buffered=True)
@@ -681,6 +699,29 @@ class SchedulerServiceImpl(pb_grpc.SchedulerServiceServicer):
                         "fire_id": str(fire_id),
                     },
                 )
+                # Phase 4: even on dispatcher failure, write a
+                # fire-history row so the dashboard shows "we tried
+                # and failed" instead of silence. status="failed"
+                # means brain didn't even reach an agent.
+                try:
+                    await ScheduleFireRepository(session).record(
+                        fire_id=fire_id,
+                        schedule_id=schedule.id,
+                        project_id=schedule.project_id,
+                        command_id=None,
+                        status="failed",
+                        scheduled_for=scheduled_for_dt,
+                        error_code="brain_error",
+                        error_message=str(exc),
+                    )
+                    await session.commit()
+                except Exception:  # noqa: BLE001
+                    # Audit-write failure is non-fatal: don't mask the
+                    # original error from the scheduler.
+                    logger.exception(
+                        "z4j.brain.scheduler_grpc: failed to record "
+                        "schedule_fire row for failed fire",
+                    )
                 return pb.FireScheduleResponse(
                     error_code="brain_error",
                     error_message=str(exc),
@@ -691,6 +732,17 @@ class SchedulerServiceImpl(pb_grpc.SchedulerServiceServicer):
             # ack handler can also infer correlation from fire_id
             # alone via the commands table's idempotency_key.
             schedule.last_fire_id = fire_id  # type: ignore[attr-defined]
+            # Phase 4: write the fire-history row with the
+            # brain-assigned command_id. AcknowledgeFireResult will
+            # update it later with the agent's outcome.
+            await ScheduleFireRepository(session).record(
+                fire_id=fire_id,
+                schedule_id=schedule.id,
+                project_id=schedule.project_id,
+                command_id=command.id,
+                status="delivered",
+                scheduled_for=scheduled_for_dt,
+            )
             await session.commit()
 
             return pb.FireScheduleResponse(
@@ -765,7 +817,81 @@ class SchedulerServiceImpl(pb_grpc.SchedulerServiceServicer):
                 .where(Schedule.id == schedule.id)
                 .values(**updates),
             )
+
+            # Phase 4: also update the schedule_fires row with the
+            # ack outcome + computed latency. The history view shows
+            # the per-fire detail; the circuit breaker reads this to
+            # detect consecutive failures.
+            from z4j_brain.persistence.repositories import (  # noqa: PLC0415
+                ScheduleFireRepository,
+            )
+
+            ack_status = (
+                "acked_success"
+                if request.status == "success"
+                else "acked_failed"
+            )
+            await ScheduleFireRepository(session).acknowledge(
+                fire_id=fire_id,
+                status=ack_status,
+                error_code=request.error or None,
+                error_message=request.error or None,
+            )
             await session.commit()
+
+        # Phase 4 + 5: dispatch notifications matching the spec's
+        # split between fire-side and task-side failures
+        # (docs/SCHEDULER.md §5.9):
+        #
+        # - ``schedule.fire.{succeeded,failed}`` — outcome of the
+        #   FireSchedule round-trip itself.
+        # - ``schedule.task_failed`` — emitted in addition to
+        #   ``schedule.fire.failed`` whenever the agent reports a
+        #   task-side failure. The two are aliases at present
+        #   because the brain can't yet distinguish "couldn't
+        #   reach an agent" from "agent ran the task and it
+        #   failed" without a task ↔ command linkage. Operators
+        #   subscribe to either trigger and get the alert; if a
+        #   future schema change splits the routing, existing
+        #   subscriptions keep working.
+        #
+        # Runs in its own session because evaluate_and_dispatch
+        # opens deliveries + may take longer than the ack response
+        # should block for. Best-effort - failures here must NOT
+        # bubble up (the ack succeeded; missed notification is a
+        # secondary concern).
+        try:
+            from z4j_brain.domain.notifications.service import (  # noqa: PLC0415
+                NotificationService,
+            )
+
+            triggers: list[str] = []
+            if request.status == "success":
+                triggers.append("schedule.fire.succeeded")
+            else:
+                triggers.append("schedule.fire.failed")
+                triggers.append("schedule.task_failed")
+            async with self._db.session() as notify_session:
+                svc = NotificationService()
+                for trigger in triggers:
+                    await svc.evaluate_and_dispatch(
+                        session=notify_session,
+                        project_id=schedule.project_id,
+                        trigger=trigger,
+                        task_id=str(fire_id),
+                        task_name=schedule.name,
+                        engine=schedule.engine,
+                        state=request.status,
+                        queue=schedule.queue,
+                        exception=request.error or None,
+                    )
+                await notify_session.commit()
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "z4j.brain.scheduler_grpc: schedule notification "
+                "dispatch failed for fire_id=%s (non-fatal)",
+                fire_id,
+            )
 
         return pb.AcknowledgeFireResultResponse()
 

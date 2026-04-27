@@ -307,6 +307,15 @@ class UserSubscriptionCreate(BaseModel):
 
 
 class UserSubscriptionUpdate(BaseModel):
+    """Body for ``PATCH /user/subscriptions/{sub_id}``.
+
+    Every field is optional; only keys actually present mutate the
+    row. v1.0.18 added ``trigger`` for parity with the project
+    default-subscription update endpoint - lets users rename a
+    subscription without delete-and-recreate.
+    """
+
+    trigger: str | None = Field(default=None, pattern=_TRIGGER_PATTERN)
     filters: SubscriptionFilters | None = None
     in_app: bool | None = None
     project_channel_ids: list[uuid.UUID] | None = None
@@ -895,14 +904,30 @@ async def update_user_subscription(
         UserSubscriptionRepository,
     )
 
-    sub = await UserSubscriptionRepository(db_session).get_for_user(
-        user.id, sub_id,
-    )
+    user_sub_repo = UserSubscriptionRepository(db_session)
+    sub = await user_sub_repo.get_for_user(user.id, sub_id)
     if sub is None:
         raise NotFoundError(
             "subscription not found",
             details={"subscription_id": str(sub_id)},
         )
+
+    # v1.0.18: trigger rename. Defends the (user, project, trigger)
+    # uniqueness invariant so the user gets a clean 409 instead of
+    # an opaque IntegrityError on commit.
+    if body.trigger is not None and body.trigger != sub.trigger:
+        existing = await user_sub_repo.get_by_unique(
+            user_id=user.id,
+            project_id=sub.project_id,
+            trigger=body.trigger,
+        )
+        if existing is not None:
+            raise ConflictError(
+                "you already have a subscription for this trigger "
+                "on this project",
+                details={"trigger": body.trigger},
+            )
+        sub.trigger = body.trigger
 
     if body.filters is not None:
         sub.filters = body.filters.model_dump(exclude_none=True)
@@ -935,7 +960,15 @@ async def update_user_subscription(
     if body.is_active is not None:
         sub.is_active = body.is_active
     await db_session.flush()
-    await db_session.commit()
+    try:
+        await db_session.commit()
+    except IntegrityError:
+        # Concurrent insert/rename lost the check-then-write race.
+        await db_session.rollback()
+        raise ConflictError(
+            "you already have a subscription for this trigger on this project",
+            details={"trigger": body.trigger or sub.trigger},
+        ) from None
     await db_session.refresh(sub)
     return _subscription_payload(sub)
 
@@ -961,6 +994,89 @@ async def delete_user_subscription(
         ),
     )
     await db_session.commit()
+
+
+# ---------------------------------------------------------------------------
+# /user/deliveries  (personal delivery history, v1.0.18)
+# ---------------------------------------------------------------------------
+
+
+@router.get(
+    "/deliveries",
+)
+async def list_user_deliveries(
+    limit: int = Query(default=50, ge=1, le=500),
+    cursor: str | None = Query(default=None),
+    project_slug: str | None = Query(default=None),
+    user: "User" = Depends(get_current_user),
+    memberships: "MembershipRepository" = Depends(get_membership_repo),
+    projects: "ProjectRepository" = Depends(get_project_repo),
+    db_session: "AsyncSession" = Depends(get_session),
+):
+    """Personal delivery history across all of the user's projects.
+
+    Mirror of the project-scoped ``/projects/{slug}/notifications/
+    deliveries`` endpoint, scoped to the calling user. Returns
+    every notification that fired into one of the caller's
+    personal subscriptions, regardless of which project it came
+    from. Optional ``project_slug`` filter narrows the view.
+
+    Includes deliveries from projects the user is no longer a
+    member of - the dashboard renders those rows with a "you
+    left this project" hint rather than hiding them, since
+    historical audit data should survive membership changes.
+
+    Pagination: keyset on ``(sent_at, id)``. Returns
+    ``{"items": [...], "next_cursor": ...}``. Each item carries
+    ``project_id`` + ``project_slug`` (nullable - NULL when the
+    project was deleted) so the dashboard can group by project
+    and badge ex-membership rows.
+    """
+    from z4j_brain.api.home import (
+        _decode_recent_failures_cursor as _decode_cursor,
+        _encode_recent_failures_cursor as _encode_cursor,
+    )
+    from z4j_brain.api.notifications import (
+        DeliveryListPublic,
+        _delivery_payload,
+    )
+    from z4j_brain.persistence.repositories import (
+        NotificationDeliveryRepository,
+    )
+
+    project_id_filter: uuid.UUID | None = None
+    if project_slug is not None:
+        project = await projects.get_by_slug(project_slug)
+        if project is None:
+            # Mirror the "no rows" behaviour for an unknown slug
+            # rather than 404 - keeps the endpoint forgiving for
+            # the dashboard's optional filter dropdown.
+            return {"items": [], "next_cursor": None}
+        project_id_filter = project.id
+
+    cursor_dt, cursor_id = _decode_cursor(cursor)
+    rows = await NotificationDeliveryRepository(db_session).list_for_user(
+        user.id,
+        limit=limit + 1,
+        cursor_sent_at=cursor_dt,
+        cursor_id=cursor_id,
+        project_id=project_id_filter,
+    )
+    next_cursor: str | None = None
+    if len(rows) > limit:
+        # Truncate to the requested page size, then encode the LAST
+        # visible row as the cursor. The WHERE predicate is strict
+        # ``sent_at < cursor`` so encoding the last visible row makes
+        # page 2 correctly start with the row that was the overflow.
+        # Encoding the overflow itself (older code) would have skipped
+        # one row per page boundary.
+        rows = rows[:limit]
+        last = rows[-1]
+        next_cursor = _encode_cursor(last.sent_at, last.id)
+    return DeliveryListPublic(
+        items=[_delivery_payload(r) for r in rows],
+        next_cursor=next_cursor,
+    )
 
 
 # ---------------------------------------------------------------------------

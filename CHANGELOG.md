@@ -7,6 +7,126 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.18] - 2026-04-27
+
+### Added
+
+- **Edit personal subscriptions in the dashboard.** Pre-1.0.18 the
+  `/settings/notifications` page only let users toggle `is_active`
+  + delete. Adjusting channels, filters, cooldown, or trigger
+  required delete-and-recreate. The `PATCH /api/v1/user/subscriptions/{id}`
+  endpoint had supported every field except `trigger` since v1.0.x;
+  this release wires it into a proper edit dialog (pencil icon
+  next to the trash icon on each row) AND extends the schema with
+  `trigger` for full parity with the project-defaults edit
+  endpoint shipped in this same release. Backend defends the
+  `(user_id, project_id, trigger)` uniqueness invariant with a
+  clean 409 on rename collision (race-safe via
+  IntegrityError fallback). Pinned by
+  `tests/unit/test_user_deliveries_and_sub_edit.py::TestUserSubscriptionTriggerRename`.
+- **Edit project default subscriptions in the dashboard.** Same
+  shape as the personal-sub fix: edit pencil + unified
+  create/edit dialog. Backend `PATCH /api/v1/projects/{slug}/notifications/defaults/{id}`
+  was added earlier in this release with full admin-gate + project
+  scoping + race-safe uniqueness check; now wired in the UI.
+  Pinned by `tests/unit/test_default_subscription_update.py` (7 tests
+  covering add-channel-to-existing, partial cooldown, trigger
+  rename, trigger collision 409, foreign-channel 409, IDOR 404,
+  empty-noop).
+- **`GET /api/v1/user/deliveries`** — personal delivery history
+  across all of the user's projects. Mirror of the project-scoped
+  `/projects/{slug}/notifications/deliveries` audit log, scoped to
+  the calling user via a join to `user_subscriptions.user_id`.
+  Cursor-paginated (50/page) with optional `?project_slug=` filter
+  to narrow to one project. Includes deliveries from projects the
+  user is no longer a member of — historical audit data outlives
+  membership. The dashboard renders ex-membership rows with a
+  "you left this project" badge so the row reads honestly. Pinned
+  by `tests/unit/test_user_deliveries_and_sub_edit.py::TestUserDeliveries`
+  (6 tests covering cross-project listing, project_slug filter,
+  unknown slug, IDOR isolation between users, ex-membership
+  visibility, cursor pagination).
+- **Filter parity between personal subscriptions and project
+  defaults.** The backend `SubscriptionFilters` schema has
+  supported `priority`, `task_name_pattern`, and `queue` since
+  v1.0.x — but the dashboard exposed only some of them on each
+  surface. v1.0.18 adds the missing inputs:
+  - **Project defaults dialog** gained `priority`,
+    `task_name_pattern`, AND `queue` filter inputs (none of the
+    three were previously rendered).
+  - **Personal subscription dialog** gained the `queue` filter
+    input (priority + task_name_pattern were already there).
+  - Both dialogs now show inline help on the priority filter:
+    *"only fires for tasks annotated with `@z4j_meta(priority='critical')`"*
+    so users understand why the filter silently matches nothing
+    if their task code doesn't annotate priority.
+- **Personal subscription dialog gained a project-channels
+  multi-select.** The backend has accepted `project_channel_ids`
+  in `UserSubscriptionUpdate` since v1.0.x, but the personal-sub
+  create/edit dialog only rendered the `user_channel_ids`
+  picker. Members of a project can now route their personal
+  subscriptions through admin-managed shared channels in addition
+  to their personal destinations.
+- **`DeliveryPublic.project_id` field.** The delivery audit row
+  shape now exposes `project_id` so the new personal Delivery
+  History tab can group by project and badge ex-membership
+  rows. Backwards-compatible additive field; existing dashboard
+  consumers ignore the extra key.
+
+### Changed
+
+- **Notification settings reorganized into role-based hubs (Option C).**
+  Pre-1.0.18 the dashboard exposed five separate notification routes
+  whose ownership was confusing — was "Channels" personal or
+  shared? The two channel pages were 1252+1256 lines of nearly
+  duplicated UI. v1.0.18 collapses them by ROLE:
+  - `/settings/notifications` becomes the **"Global Notifications"**
+    hub with three tabs: *My Subscriptions* + *My Channels* +
+    *My Delivery History*. Personal scope only.
+  - `/projects/{slug}/settings/notifications` becomes the
+    **"Project Notifications"** hub (admin-gated) with three
+    tabs: *Project Channels* + *Default Subscriptions* + *Delivery
+    Log*. Project-scope, admin-only — non-admin members no
+    longer see this entry in the project sidebar at all.
+  - The five old route URLs (`/settings/channels`, `/projects/{slug}/settings/providers`,
+    `/projects/{slug}/settings/defaults`, `/projects/{slug}/settings/deliveries`,
+    plus the notion that `/settings/notifications` was just a
+    subs list) all permanently redirect to the appropriate
+    `?tab=` of the new hubs. Old bookmarks survive.
+  - **Zero data-model changes.** Same database tables, same API
+    endpoints, same permissions. The reorg is pure UI.
+  - The personal hub's empty state now mirrors the project hub's
+    empty state for symmetry.
+- **`NotificationDeliveryRepository.list_for_project` cursor fix.**
+  The encoded next-cursor used to point at the OVERFLOW row
+  (the `limit + 1`th fetch), but the WHERE predicate is strict
+  `sent_at < cursor` — so each page boundary silently skipped
+  one row. v1.0.18 encodes the LAST visible row of the current
+  page; page 2 then starts with what was previously the overflow,
+  exactly as paging is intended. Same fix applied to the new
+  `list_for_user` method. Pre-existing latent bug in the project
+  endpoint; nobody had a regression test against it. Pinned by
+  `tests/unit/test_user_deliveries_and_sub_edit.py::TestUserDeliveries::test_pagination_cursor`.
+
+### Compatibility
+
+- Backwards compatible. Existing API consumers see no breaking
+  changes — every old endpoint URL still works (PATCH gained
+  optional fields, DeliveryPublic gained an optional
+  `project_id` field).
+- Old dashboard bookmarks survive via permanent client-side
+  redirects. Five URL patterns now redirect:
+  `/settings/channels` → `/settings/notifications?tab=channels`
+  `/projects/{slug}/settings/providers` → `/projects/{slug}/settings/notifications?tab=channels`
+  `/projects/{slug}/settings/defaults` → `?tab=defaults`
+  `/projects/{slug}/settings/deliveries` → `?tab=deliveries`
+- Non-admin project members lose visibility of the project
+  Notifications sidebar entry (every tab inside is admin-only —
+  members manage their notifications from the personal hub).
+  This is a deliberate de-clutter, not a permission change.
+- No DB migrations. No env changes. Operator action: `pip install
+  -U z4j-brain` and restart.
+
 ## [1.0.17] - 2026-04-27
 
 ### Fixed

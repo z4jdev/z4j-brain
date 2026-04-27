@@ -52,8 +52,9 @@ function SettingsLayout() {
         { label: "My Memberships", to: "/settings/memberships", icon: Users2 },
         { label: "Appearance", to: "/settings/appearance", icon: Palette },
         { label: "API Keys", to: "/settings/api-keys", icon: KeyRound },
+        // v1.0.18: My Channels merged into the Notifications hub
+        // as a tab. The /settings/channels route now redirects.
         { label: "Notifications", to: "/settings/notifications", icon: Bell },
-        { label: "My Channels", to: "/settings/channels", icon: Send },
       ],
     },
     {

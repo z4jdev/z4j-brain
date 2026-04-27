@@ -146,6 +146,99 @@ async def list_schedules(
     return [_payload(s) for s in rows]
 
 
+class ScheduleFirePublic(BaseModel):
+    """One historical fire of a schedule (Phase 4 fire-history view)."""
+
+    id: uuid.UUID
+    fire_id: uuid.UUID
+    schedule_id: uuid.UUID
+    command_id: uuid.UUID | None
+    status: str
+    scheduled_for: datetime
+    fired_at: datetime
+    acked_at: datetime | None
+    latency_ms: int | None
+    error_code: str | None
+    error_message: str | None
+
+
+def _fire_payload(row: Any) -> ScheduleFirePublic:
+    return ScheduleFirePublic(
+        id=row.id,
+        fire_id=row.fire_id,
+        schedule_id=row.schedule_id,
+        command_id=row.command_id,
+        status=row.status,
+        scheduled_for=row.scheduled_for,
+        fired_at=row.fired_at,
+        acked_at=row.acked_at,
+        latency_ms=row.latency_ms,
+        error_code=row.error_code,
+        error_message=row.error_message,
+    )
+
+
+@router.get(
+    "/{schedule_id}/fires",
+    response_model=list[ScheduleFirePublic],
+)
+async def list_schedule_fires(
+    slug: str,
+    schedule_id: uuid.UUID,
+    limit: int = 100,
+    user: "User" = Depends(get_current_user),
+    memberships: "MembershipRepository" = Depends(get_membership_repo),
+    projects: "ProjectRepository" = Depends(get_project_repo),
+    db_session: "AsyncSession" = Depends(get_session),
+) -> list[ScheduleFirePublic]:
+    """Return the schedule's fire history, newest first.
+
+    Authorization: VIEWER (read-only). The fire history exposes
+    timestamps + status + latency, which any project member should
+    see (matches the existing schedule list/get permissions). The
+    error_message field is included verbatim - operators want the
+    debug detail. Args/kwargs are NOT included since the dashboard
+    has the schedule detail page for those.
+
+    Limit is capped at 1000 to prevent runaway queries; the
+    dashboard pages defaults to 50.
+    """
+    from z4j_brain.domain.policy_engine import PolicyEngine
+    from z4j_brain.persistence.repositories import (
+        ScheduleFireRepository,
+        ScheduleRepository,
+    )
+
+    if limit < 1 or limit > 1000:
+        limit = max(1, min(1000, limit))
+
+    policy = PolicyEngine()
+    project = await policy.get_project_or_404(projects, slug)
+    await policy.require_member(
+        memberships,
+        user=user,
+        project_id=project.id,
+        min_role=ProjectRole.VIEWER,
+    )
+
+    # Verify the schedule belongs to this project (IDOR-safe).
+    schedule = await ScheduleRepository(db_session).get_for_project(
+        project_id=project.id, schedule_id=schedule_id,
+    )
+    if schedule is None:
+        raise NotFoundError(
+            "schedule not found",
+            details={"schedule_id": str(schedule_id)},
+        )
+
+    rows = await ScheduleFireRepository(db_session).list_recent_for_schedule(
+        schedule_id=schedule.id,
+        project_id=project.id,
+        limit=limit,
+    )
+    return [_fire_payload(r) for r in rows]
+
+
 @router.get("/{schedule_id}", response_model=SchedulePublic)
 async def get_schedule(
     slug: str,

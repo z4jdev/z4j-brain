@@ -452,6 +452,34 @@ class Settings(BaseSettings):
     )
 
     # ------------------------------------------------------------------
+    # Schedule circuit breaker (Phase 4)
+    # ------------------------------------------------------------------
+    #: After this many consecutive failed fires (any of ``failed`` or
+    #: ``acked_failed``), the circuit breaker auto-disables the
+    #: schedule and writes an audit row. 5 is the typical "noisy
+    #: alert" threshold - one transient hiccup doesn't trip the
+    #: breaker, but a persistent bug does. Set to 0 to disable the
+    #: breaker entirely.
+    schedule_circuit_breaker_threshold: int = Field(
+        default=5, ge=0, le=100,
+    )
+    #: Cadence for :class:`ScheduleCircuitBreakerWorker`. Each tick
+    #: scans every enabled schedule with at least N recent fires
+    #: and disables those past the threshold.
+    schedule_circuit_breaker_interval_seconds: int = Field(
+        default=60, ge=5, le=3600,
+    )
+    #: Retention for :class:`ScheduleFire` rows. After this many
+    #: days the periodic prune worker drops them. 30 days at
+    #: 10 schedules × 1 fire/min is ~430k rows - well under
+    #: Postgres single-table comfort. Operators with longer
+    #: forensic windows raise this; operators with high-frequency
+    #: schedules + tight disk budgets lower it.
+    schedule_fires_retention_days: int = Field(
+        default=30, ge=1, le=3650,
+    )
+
+    # ------------------------------------------------------------------
     # TriggerSchedule client - brain calls scheduler.TriggerSchedule
     # ------------------------------------------------------------------
     #: When set, the dashboard's "fire now" route on a

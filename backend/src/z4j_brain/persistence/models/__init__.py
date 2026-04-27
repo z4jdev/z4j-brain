@@ -32,6 +32,7 @@ from z4j_brain.persistence.models.pending_fire import PendingFire
 from z4j_brain.persistence.models.project import Project
 from z4j_brain.persistence.models.queue import Queue
 from z4j_brain.persistence.models.schedule import Schedule
+from z4j_brain.persistence.models.schedule_fire import ScheduleFire
 from z4j_brain.persistence.models.session import Session
 from z4j_brain.persistence.models.notification import (
     NotificationChannel,
@@ -71,6 +72,7 @@ __all__ = [
     "Queue",
     "SavedView",
     "Schedule",
+    "ScheduleFire",
     "Session",
     "Task",
     "TaskAnnotation",
