@@ -36,7 +36,7 @@ from z4j_brain.api.deps import (
     require_csrf,
 )
 from z4j_brain.domain.ip_rate_limit import require_bulk_action_throttle
-from z4j_brain.errors import NotFoundError
+from z4j_brain.errors import NotFoundError, ValidationError
 from z4j_brain.persistence.enums import ProjectRole
 
 if TYPE_CHECKING:
@@ -262,7 +262,11 @@ async def create_schedule(
             project_id=project.id, data=body.model_dump(),
         )
     except ValueError as exc:
-        raise NotFoundError(
+        # 422 Unprocessable Entity - the request was syntactically
+        # OK but the values failed semantic validation (bad enum,
+        # missing required field). Audit-Phase3-4 fix: previously
+        # this raised NotFoundError → 404 which misled clients.
+        raise ValidationError(
             f"invalid schedule: {exc}",
             details={"reason": str(exc)},
         ) from exc
@@ -327,7 +331,9 @@ async def update_schedule(
             data=patch,
         )
     except ValueError as exc:
-        raise NotFoundError(
+        # 422 (not 404). Bad enum / unknown field is a semantic
+        # validation failure, not a "resource missing" condition.
+        raise ValidationError(
             f"invalid schedule update: {exc}",
             details={"reason": str(exc)},
         ) from exc
@@ -930,6 +936,42 @@ async def import_schedules(
             details={"mode": body.mode},
         )
 
+    # Replace-for-source has a TOCTOU race: two admins calling
+    # reconcile() concurrently with the same source label can each
+    # compute ``surviving_ids`` from a stale snapshot, then the
+    # second one's ``DELETE WHERE source=X AND id NOT IN (mine)``
+    # silently removes the first one's just-inserted rows.
+    # Audit-Phase3-2 caught this. Mitigation: take a Postgres
+    # advisory transaction lock keyed on ``hash(project_id, source)``
+    # so concurrent reconciles for the same scope serialize. The
+    # lock is released on commit/rollback - no manual cleanup. Only
+    # applies on Postgres; SQLite has a single writer so the race
+    # cannot happen there.
+    if body.mode == "replace_for_source" and (
+        db_session.bind.dialect.name == "postgresql"
+        if db_session.bind is not None
+        else False
+    ):
+        from hashlib import sha256  # noqa: PLC0415
+
+        from sqlalchemy import text  # noqa: PLC0415
+
+        scope_key = (
+            (body.source_filter
+             or (body.schedules[0].source if body.schedules else "")
+             or "")
+        )
+        # Two-int form so we can fit both project_id and source-label
+        # hash in the 64-bit advisory-lock key space without collision.
+        proj_int = int.from_bytes(project.id.bytes[:4], "big", signed=True)
+        source_int = int.from_bytes(
+            sha256(scope_key.encode()).digest()[:4], "big", signed=True,
+        )
+        await db_session.execute(
+            text("SELECT pg_advisory_xact_lock(:p, :s)"),
+            {"p": proj_int, "s": source_int},
+        )
+
     summary = ImportSchedulesResponse(
         inserted=0, updated=0, unchanged=0, failed=0, deleted=0, errors={},
     )
@@ -980,6 +1022,29 @@ async def import_schedules(
     # spam the log when the importer is run on a big celery-beat
     # config (a 50-schedule import generating 50 audit entries
     # buries everything else for that minute).
+    #
+    # ``source_filter`` is included unconditionally - audit-Phase3-1
+    # caught the previous version omitting it, which meant an admin
+    # running ``mode="replace_for_source"`` with ``source="dashboard"``
+    # could wipe every dashboard-managed schedule and leave only a
+    # ``deleted=N`` row in the audit log with no breadcrumb of WHICH
+    # source was affected. The forensic trail must name the label.
+    audit_metadata: dict[str, object] = {
+        "mode": body.mode,
+        "inserted": summary.inserted,
+        "updated": summary.updated,
+        "unchanged": summary.unchanged,
+        "deleted": summary.deleted,
+        "failed": summary.failed,
+    }
+    if body.mode == "replace_for_source":
+        # The label that scoped the delete pass. Use the resolved
+        # value (which may have come from the first row's source if
+        # the operator didn't set source_filter explicitly).
+        audit_metadata["source_filter"] = (
+            body.source_filter
+            or (body.schedules[0].source if body.schedules else None)
+        )
     await audit.record(
         audit_log,
         action="schedules.import",
@@ -990,14 +1055,7 @@ async def import_schedules(
         user_id=user.id,
         project_id=project.id,
         source_ip=ip,
-        metadata={
-            "mode": body.mode,
-            "inserted": summary.inserted,
-            "updated": summary.updated,
-            "unchanged": summary.unchanged,
-            "deleted": summary.deleted,
-            "failed": summary.failed,
-        },
+        metadata=audit_metadata,
     )
     await db_session.commit()
     return summary

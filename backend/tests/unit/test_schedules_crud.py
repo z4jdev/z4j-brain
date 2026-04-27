@@ -227,9 +227,13 @@ class TestCreateSchedule:
         assert r.status_code == 403, r.text
 
     @pytest.mark.asyncio
-    async def test_create_with_unknown_kind_returns_404(
+    async def test_create_with_unknown_kind_returns_422(
         self, settings: Settings, brain_app,
     ) -> None:
+        # Audit-Phase3-4 fix: bad enum is a semantic validation
+        # failure, not a "resource missing" condition. Endpoint
+        # returns 422 (Unprocessable Entity) so clients can
+        # distinguish "you sent garbage" from "we don't have it".
         seed = await _make_seed(
             settings=settings, brain_app=brain_app, is_admin=True,
         )
@@ -238,7 +242,7 @@ class TestCreateSchedule:
                 "/api/v1/projects/default/schedules",
                 json=_create_body(kind="not-a-kind"),
             )
-        assert r.status_code == 404
+        assert r.status_code == 422
         assert "kind" in r.text.lower() or "schedulekind" in r.text.lower()
 
 

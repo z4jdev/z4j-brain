@@ -7,6 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.17] - 2026-04-27
+
+### Fixed
+
+- **SQLite default-subscription save with channel ids no longer
+  500s.** `POST /api/v1/projects/{slug}/notifications/defaults`
+  with a non-empty `project_channel_ids` list raised
+  `TypeError: Object of type UUID is not JSON serializable` on
+  commit and surfaced as `{"error":"internal_error"}`. The
+  `uuid_array()` column adapter fell back to plain SQLAlchemy
+  `JSON` on SQLite, which calls `json.dumps` on the bind value -
+  and `json.dumps` doesn't know how to serialize `uuid.UUID`.
+  Wrapped the SQLite variant in a `TypeDecorator` that converts
+  UUIDs to strings on write and back to UUIDs on read, so callers
+  see native UUIDs on both Postgres (real `UUID[]`) and SQLite
+  (`JSON`-of-strings). Bug present in v1.0.0..v1.0.16; SQLite-only
+  - the Postgres path was unaffected. Three columns affected:
+  `user_subscriptions.project_channel_ids`,
+  `user_subscriptions.user_channel_ids`,
+  `project_default_subscriptions.project_channel_ids`. Pinned by
+  `tests/unit/test_uuid_array_sqlite.py`. Operator action: `pip
+  install -U z4j-brain==1.0.17` and restart - no DB migrations,
+  no env changes. Existing rows on SQLite (which would have
+  required the bug to never be triggered to exist at all) are
+  unaffected; new writes work correctly.
+
+### Compatibility
+
+- Backwards compatible. Postgres deployments see no change.
+  SQLite deployments gain working `list[UUID]` columns where they
+  previously 500'd. Wheel content delta vs 1.0.16 is just the new
+  TypeDecorator + regression test.
+
 ## [1.0.16] - 2026-04-27
 
 ### Fixed
