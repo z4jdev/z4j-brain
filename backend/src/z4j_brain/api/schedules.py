@@ -82,6 +82,12 @@ class SchedulePublic(BaseModel):
     external_id: str | None
     created_at: datetime
     updated_at: datetime
+    # Phase 2 columns surfaced for the dashboard + the reverse
+    # exporter. ``source`` lets the dashboard render a "managed by"
+    # badge; ``catch_up`` shows the missed-fire policy.
+    catch_up: str = "skip"
+    source: str = "dashboard"
+    source_hash: str | None = None
 
 
 def _payload(schedule: "Schedule") -> SchedulePublic:
@@ -106,6 +112,9 @@ def _payload(schedule: "Schedule") -> SchedulePublic:
         external_id=schedule.external_id,
         created_at=schedule.created_at,
         updated_at=schedule.updated_at,
+        catch_up=getattr(schedule, "catch_up", None) or "skip",
+        source=getattr(schedule, "source", None) or "dashboard",
+        source_hash=getattr(schedule, "source_hash", None),
     )
 
 
