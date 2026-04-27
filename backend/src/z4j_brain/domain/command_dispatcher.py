@@ -231,6 +231,8 @@ class CommandDispatcher:
         *,
         commands: CommandRepository,
         command_id: UUID,
+        project_id: UUID | None = None,
+        agent_id: UUID | None = None,
     ) -> None:
         """Mark a command as dispatched.
 
@@ -238,7 +240,11 @@ class CommandDispatcher:
         ``mark_dispatched`` SQL has a ``WHERE status='pending'``
         guard).
         """
-        await commands.mark_dispatched(command_id)
+        await commands.mark_dispatched(
+            command_id,
+            project_id=project_id,
+            agent_id=agent_id,
+        )
 
     async def handle_result(
         self,
@@ -249,6 +255,8 @@ class CommandDispatcher:
         status: str,
         result_payload: dict[str, Any] | None,
         error: str | None,
+        project_id: UUID | None = None,
+        agent_id: UUID | None = None,
     ) -> None:
         """Mark a command completed or failed based on the agent's reply.
 
@@ -258,7 +266,10 @@ class CommandDispatcher:
         """
         if status == "success":
             transitioned = await commands.mark_completed(
-                command_id, result_payload=result_payload,
+                command_id,
+                result_payload=result_payload,
+                project_id=project_id,
+                agent_id=agent_id,
             )
             outcome = "allow"
             audit_action = "command.completed"
@@ -267,6 +278,8 @@ class CommandDispatcher:
                 command_id,
                 error=(error or "agent reported failure"),
                 result_payload=result_payload,
+                project_id=project_id,
+                agent_id=agent_id,
             )
             outcome = "deny"
             audit_action = "command.failed"

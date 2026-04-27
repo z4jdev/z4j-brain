@@ -23,6 +23,7 @@ from z4j_brain.api.deps import (
     get_settings,
     require_csrf,
 )
+from z4j_brain.domain.ip_rate_limit import require_bulk_action_throttle
 from z4j_brain.errors import NotFoundError, ValidationError
 from z4j_brain.persistence.enums import ProjectRole, TaskState
 
@@ -392,7 +393,10 @@ class BulkDeleteResponse(BaseModel):
 @router.post(
     "/bulk-delete",
     response_model=BulkDeleteResponse,
-    dependencies=[Depends(require_csrf)],
+    dependencies=[
+        Depends(require_csrf),
+        Depends(require_bulk_action_throttle),
+    ],
 )
 async def bulk_delete_tasks(
     slug: str,

@@ -117,5 +117,5 @@ export function buildExportUrl(
     params.set("fields", customFields.join(","));
   }
   // "metadata" = server default (no fields param)
-  return `/api/v1/projects/${slug}/tasks?${params.toString()}`;
+  return `/api/v1/projects/${encodeURIComponent(slug)}/tasks?${params.toString()}`;
 }

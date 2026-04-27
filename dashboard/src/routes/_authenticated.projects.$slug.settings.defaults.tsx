@@ -95,13 +95,8 @@ function DefaultsPage() {
   return (
     <div className="space-y-4">
       {confirmDialog}
-      <div className="rounded-md border border-dashed bg-muted/40 px-4 py-3 text-xs text-muted-foreground">
-        These templates are copied into each new member&apos;s subscriptions
-        when they join. Existing members are not affected.
-      </div>
-
-      <div className="flex items-center justify-between">
-        <div>
+      <div className="flex items-start justify-between gap-4">
+        <div className="min-w-0 flex-1">
           <h3 className="text-sm font-semibold">
             Default Subscriptions
             {isFetching && !isLoading && (
@@ -127,6 +122,11 @@ function DefaultsPage() {
             />
           </DialogContent>
         </Dialog>
+      </div>
+
+      <div className="rounded-md border border-dashed bg-muted/40 px-4 py-3 text-xs text-muted-foreground">
+        These templates are copied into each new member&apos;s subscriptions
+        when they join. Existing members are not affected.
       </div>
 
       {isLoading && <Skeleton className="h-32 w-full" />}

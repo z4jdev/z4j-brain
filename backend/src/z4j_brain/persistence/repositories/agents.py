@@ -36,12 +36,28 @@ class AgentRepository(BaseRepository[Agent]):
         )
         return result.scalar_one_or_none()
 
-    async def list_for_project(self, project_id: UUID) -> list[Agent]:
-        """Return every agent registered to one project."""
+    async def list_for_project(
+        self,
+        project_id: UUID,
+        *,
+        limit: int = 500,
+    ) -> list[Agent]:
+        """Return agents for a project, newest first.
+
+        Hard-capped at ``limit`` rows (default 500, max 5000) so a
+        runaway agent fleet can't return tens of thousands of rows
+        and OOM the response (audit P-7, added v1.0.14). The cap is
+        well above any realistic single-project agent count
+        (operators with > 500 agents are doing something unusual and
+        should paginate at the API layer).
+        """
+        if limit < 1 or limit > 5000:
+            raise ValueError("limit must be between 1 and 5000")
         result = await self.session.execute(
             select(Agent)
             .where(Agent.project_id == project_id)
-            .order_by(Agent.created_at.desc()),
+            .order_by(Agent.created_at.desc())
+            .limit(limit),
         )
         return list(result.scalars().all())
 

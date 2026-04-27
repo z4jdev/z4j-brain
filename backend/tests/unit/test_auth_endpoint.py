@@ -162,6 +162,68 @@ class TestLoginFailureShape:
 
 
 @pytest.mark.asyncio
+class TestPasswordResetRequest:
+    async def test_unknown_email_uses_timing_floor(
+        self,
+        client,
+        settings: Settings,
+        monkeypatch,
+    ) -> None:
+        from z4j_brain.api import auth as auth_api
+
+        calls: list[int] = []
+
+        async def fake_hold(start: float, min_duration_ms: int) -> None:
+            assert start > 0
+            calls.append(min_duration_ms)
+
+        monkeypatch.setattr(
+            auth_api,
+            "_hold_minimum_response_time",
+            fake_hold,
+        )
+
+        response = await client.post(
+            "/api/v1/auth/password-reset/request",
+            json={"email": "nobody@example.com"},
+        )
+
+        assert response.status_code == 200
+        assert response.json() == {"accepted": True}
+        assert calls == [settings.login_min_duration_ms]
+
+    async def test_known_email_uses_same_timing_floor(
+        self,
+        client,
+        settings: Settings,
+        seeded_user,  # noqa: ARG002
+        monkeypatch,
+    ) -> None:
+        from z4j_brain.api import auth as auth_api
+
+        calls: list[int] = []
+
+        async def fake_hold(start: float, min_duration_ms: int) -> None:
+            assert start > 0
+            calls.append(min_duration_ms)
+
+        monkeypatch.setattr(
+            auth_api,
+            "_hold_minimum_response_time",
+            fake_hold,
+        )
+
+        response = await client.post(
+            "/api/v1/auth/password-reset/request",
+            json={"email": "alice@example.com"},
+        )
+
+        assert response.status_code == 200
+        assert response.json() == {"accepted": True}
+        assert calls == [settings.login_min_duration_ms]
+
+
+@pytest.mark.asyncio
 class TestLockout:
     async def test_lockout_triggers_after_threshold(
         self, client, settings: Settings, seeded_user,  # noqa: ARG002

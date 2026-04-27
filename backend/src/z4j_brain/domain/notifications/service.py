@@ -413,8 +413,34 @@ class NotificationService:
         # ------------------------------------------------------------------
         if outcomes:
             try:
+                from z4j_brain.domain.notifications.sanitize import (
+                    sanitize_audit_text,
+                )
+
                 for outcome in outcomes:
                     p = outcome.pending
+                    # Sanitize error + response_body before persistence
+                    # (audit H-1 / H-2 / H-3): the dispatcher's raw
+                    # error / body text can carry the channel's
+                    # webhook URL (containing the secret token), the
+                    # body of an attacker-controlled webhook, or
+                    # SSRF-guard rejection messages that leak resolved
+                    # internal IPs. p.channel_config is the original
+                    # config dict the dispatcher received - lets the
+                    # sanitizer mask URL-bearing substrings.
+                    raw_body = (
+                        outcome.response_body if not outcome.success else None
+                    )
+                    sanitized_error = sanitize_audit_text(
+                        outcome.error,
+                        channel_config=getattr(p, "channel_config", None),
+                        max_len=1024,
+                    )
+                    sanitized_body = sanitize_audit_text(
+                        raw_body,
+                        channel_config=getattr(p, "channel_config", None),
+                        max_len=2048,
+                    )
                     session.add(
                         NotificationDelivery(
                             subscription_id=p.subscription_id,
@@ -428,12 +454,17 @@ class NotificationService:
                             response_code=outcome.status_code,
                             # PERF-18: only persist response_body on
                             # failure. For successes it's just noise.
-                            response_body=(
-                                outcome.response_body
-                                if not outcome.success
-                                else None
-                            ),
-                            error=outcome.error,
+                            response_body=sanitized_body,
+                            error=sanitized_error,
+                            # Audit L-2: snapshot channel name + type
+                            # at insert time so a future channel
+                            # rename / delete can't rewrite the audit
+                            # row's view of which destination the
+                            # send actually went to. ``channel_name``
+                            # may not be on Pending for older
+                            # codepaths; getattr keeps the write safe.
+                            channel_name=getattr(p, "channel_name", None),
+                            channel_type=getattr(p, "channel_type", None),
                         ),
                     )
                     if outcome.success:
@@ -607,6 +638,28 @@ class NotificationService:
         pattern = filters.get("task_name_pattern")
         if pattern:
             if isinstance(pattern, str):
+                # Audit P-2: defense-in-depth against ReDoS from
+                # patterns that pre-date the v1.0.14 validator. A
+                # subscription created in 1.0.13 with
+                # ``"a*a*a*a*a*a*a*a*a*a*a*a*a*b"`` is already in
+                # the DB; fnmatch.fnmatch on a long task_name would
+                # backtrack catastrophically. Bound complexity here
+                # too so a stored subscription can't ReDoS the WS
+                # frame ingest path.
+                if (
+                    pattern.count("*") + pattern.count("?") > 5
+                    or pattern.count("[") > 3
+                    or len(pattern) > 200
+                ):
+                    logger.warning(
+                        "z4j notification: subscription %s has a "
+                        "high-complexity task_name_pattern (>5 wildcards "
+                        "or >3 char-classes); skipping match to avoid "
+                        "ReDoS. Edit the subscription to simplify the "
+                        "pattern.",
+                        sub_id,
+                    )
+                    return False
                 if not task_name or not fnmatch.fnmatch(task_name, pattern):
                     return False
             else:

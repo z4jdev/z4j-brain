@@ -127,6 +127,38 @@ enumeration (testing which emails have accounts) or token brute-
 force attempts.
 """
 
+_channel_test_bucket = _IPBucket(window_seconds=60, max_hits=20)
+"""Throttle for the ``/channels/test`` and ``/channels/{id}/test``
+preflight endpoints (audit P-3, added v1.0.14).
+
+20/min/IP across both project + user variants. Each test fires an
+external HTTP/SMTP request through validated config; the SSRF
+guards block private IPs but a determined admin can still use the
+endpoint as a webhook traffic generator against their own real
+destinations (Slack/PagerDuty), risking provider rate-limit bans
+on legitimate accounts.
+"""
+
+_channel_import_bucket = _IPBucket(window_seconds=60, max_hits=30)
+"""Throttle for the ``import_from_user`` / ``import_from_project``
+endpoints (audit L-3 + P-3, added v1.0.14).
+
+30/min/IP. The frontend "Select all + Import" loop can fire N
+requests in quick succession; this lets a 30-channel batch
+through but stops a runaway script. Each import does config
+validation including a SSRF DNS resolve.
+"""
+
+_bulk_action_bucket = _IPBucket(window_seconds=60, max_hits=10)
+"""Throttle for bulk-write operations (audit P-9, added v1.0.14).
+
+10/min/IP across bulk-delete tasks, bulk-retry, purge-queue,
+schedule trigger-now, and similar admin actions that perform
+expensive write work or fan out commands to agents. Each bulk
+op can touch up to 10000 rows; rate-limiting prevents a buggy
+script from amplifying DB load + replica lag.
+"""
+
 
 def _make_dependency(bucket: _IPBucket, name: str) -> Callable[..., Coroutine[Any, Any, None]]:
     async def _check(
@@ -150,13 +182,28 @@ require_login_throttle = _make_dependency(_login_bucket, "login")
 require_password_reset_throttle = _make_dependency(
     _password_reset_bucket, "password-reset",
 )
+require_channel_test_throttle = _make_dependency(
+    _channel_test_bucket, "channel-test",
+)
+require_channel_import_throttle = _make_dependency(
+    _channel_import_bucket, "channel-import",
+)
+require_bulk_action_throttle = _make_dependency(
+    _bulk_action_bucket, "bulk-action",
+)
 
 
 __all__ = [
     "_IPBucket",
+    "_bulk_action_bucket",
+    "_channel_import_bucket",
+    "_channel_test_bucket",
     "_invitation_bucket",
     "_login_bucket",
     "_password_reset_bucket",
+    "require_bulk_action_throttle",
+    "require_channel_import_throttle",
+    "require_channel_test_throttle",
     "require_invitation_throttle",
     "require_login_throttle",
     "require_password_reset_throttle",

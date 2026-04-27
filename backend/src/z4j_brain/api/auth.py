@@ -23,6 +23,8 @@ so we never accidentally leak sensitive ORM fields like
 
 from __future__ import annotations
 
+import asyncio
+import time
 import uuid
 from datetime import datetime
 from typing import TYPE_CHECKING
@@ -66,6 +68,8 @@ if TYPE_CHECKING:
     from z4j_brain.persistence.models import User
     from z4j_brain.persistence.repositories import (
         AuditLogRepository,
+        MembershipRepository,
+        ProjectRepository,
         SessionRepository,
         UserRepository,
     )
@@ -235,6 +239,17 @@ def _clear_session_cookies(response: Response, settings: "Settings") -> None:
         csrf_cookie_name(environment=settings.environment),
     ):
         response.delete_cookie(name, path="/")
+
+
+async def _hold_minimum_response_time(
+    start: float,
+    min_duration_ms: int,
+) -> None:
+    """Sleep until a route has taken at least ``min_duration_ms``."""
+    target_seconds = min_duration_ms / 1000.0
+    remaining = target_seconds - (time.monotonic() - start)
+    if remaining > 0:
+        await asyncio.sleep(remaining)
 
 
 # ---------------------------------------------------------------------------
@@ -765,6 +780,7 @@ async def password_reset_request(
     system deliberately does not confirm or deny account
     existence.
     """
+    start = time.monotonic()
     import secrets
     from datetime import UTC, datetime, timedelta
 
@@ -817,7 +833,10 @@ async def password_reset_request(
             settings=settings,
         )
     # No-op for unknown users - no DB writes, no background task.
-    # The response is returned immediately in both branches.
+    # Hold both branches to the same floor as login so the DB/audit
+    # work in the known-user branch does not become an account
+    # enumeration timing oracle.
+    await _hold_minimum_response_time(start, settings.login_min_duration_ms)
     return PasswordResetRequestResponse(accepted=True)
 
 

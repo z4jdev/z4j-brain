@@ -7,6 +7,97 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.14] - 2026-04-24
+
+### Security (BREAKING)
+
+- **`/metrics` exposed without auth and dev-mode-on-public-bind are no longer possible by default.** Two gates added:
+
+  **1. `Z4J_METRICS_AUTH_TOKEN` is auto-minted on first boot** (already shipped in 1.0.13, see that entry for details). `/metrics` returns 401 unless the bearer token is presented OR `Z4J_METRICS_PUBLIC=1` is set explicitly.
+
+  **2. `z4j serve` REFUSES to start when `Z4J_ENVIRONMENT=dev` AND the bind host is not loopback.** Pre-1.0.14 the brain would happily start in dev mode bound to `0.0.0.0`, silently exposing dev-mode cookies (`Secure: false`, no `__Host-` prefix), no HSTS, and disabled host validation to anyone who could reach the port. The dev-mode `0.0.0.0` combo is now a startup error with an actionable message naming both safe paths. Combined with the new `127.0.0.1` default bind for dev mode, this closes the silent-public-dev footgun.
+
+  **Operator action on upgrade from 1.0.13:**
+
+  If your brain runs behind a reverse proxy (Cloudflare Tunnel / Caddy / nginx / Traefik) — most deployments — set three env vars in your systemd unit (or wherever you set process env):
+
+  ```ini
+  [Service]
+  Environment=Z4J_ENVIRONMENT=production
+  Environment=Z4J_PUBLIC_URL=https://tasks.example.com
+  Environment=Z4J_ALLOWED_HOSTS=["tasks.example.com"]
+  ```
+
+  Then `sudo systemctl daemon-reload && sudo systemctl restart z4j`. **Existing dashboard sessions will be invalidated** because the cookie name changes from `z4j_session` to `__Host-z4j_session` (browser-enforced isolation in production mode). Users will need to log in again — one-time.
+
+  See [/operations/dev-vs-production/](https://z4j.dev/operations/dev-vs-production/) for the full migration guide including homelab-on-LAN and loopback-only paths.
+
+- **Auto-promote to production when production-shaped config is detected.** If `Z4J_PUBLIC_URL` starts with `https://` AND `Z4J_ALLOWED_HOSTS` is set explicitly, `Z4J_ENVIRONMENT` defaults to `production` instead of `dev`. Operator can still force `Z4J_ENVIRONMENT=dev` to override; explicit env always wins over the default. Removes the silent-leak case where an operator wired up TLS + allow-list but forgot the third env var.
+
+- **Default bind host is now `127.0.0.1` in dev mode** (was `0.0.0.0`). Bare `pip install z4j && z4j serve` no longer exposes anything beyond loopback. To bind publicly, switch to production mode (the auto-promote path is the easiest way).
+
+### Added
+
+- **PagerDuty native channel** (`type: "pagerduty"`). Routes notifications through the PagerDuty Events API v2 with proper severity mapping, dedup keys, and the canonical `events.pagerduty.com/v2/enqueue` endpoint. Configure with `{"integration_key": "<32-char routing key>", "severity_default": "warning", "severity_map": {"agent.offline": "critical", "task.failed": "error"}}`. Built-in defaults map z4j triggers to PD severities so most operators only need to paste the integration key. Full SSRF / DNS-pin protection consistent with the existing webhook + Slack + Telegram dispatchers.
+- **Discord native channel** (`type: "discord"`). POSTs Slack-compatible payloads to a Discord incoming webhook. The dispatcher auto-appends `/slack` to the webhook URL so operators paste the canonical URL Discord shows them in Server Settings -> Integrations -> Webhooks. Same SSRF protection as the generic webhook channel.
+- **`z4j metrics-token rotate`** CLI subcommand. Mints a fresh `/metrics` bearer token, atomically rewrites `~/.z4j/secret.env` (replacing or appending the `Z4J_METRICS_AUTH_TOKEN=` line), and prints the new token to stdout. Requires a brain restart for the new token to take effect; the command's stderr output reminds the operator to update their Prometheus scrape config first. The existing `z4j metrics-token` (no subcommand) is preserved as `z4j metrics-token show` for backward compatibility.
+
+### Changed
+
+- `z4j metrics-token` now accepts subcommands (`show` and `rotate`). Bare `z4j metrics-token` still prints the token (defaults to `show`), so existing scripts continue to work unchanged.
+- **`z4j --version` and `z4j -V` now print the version**, matching the standard Python CLI convention. The bare `z4j` (no subcommand) and `z4j version` paths still work — the new flags are additive. `-v` (lowercase) is intentionally NOT bound so it stays free for a future `--verbose` flag, matching pip / docker / kubectl.
+
+### Security audit pass — 2026-04-26
+
+Following Codex's audit hardening wave (also folded into this release), an independent three-axis audit was run against the v1.0.14 surface plus the rest of the brain (channels / IDOR / N+1 + DoS). Every Critical, High, Medium, and most Low findings are closed in this release. One pure-perf finding (heartbeat handler N+1 — pre-existing through 1.0.5–1.0.13) is deferred to v1.0.15 with dedicated concurrent-load regression tests.
+
+#### Notification audit log secret-leakage hardening (HIGH)
+
+- **`notification_deliveries.error` no longer leaks channel webhook URLs.** Slack / Discord / Telegram URLs embed the secret in the path (`hooks.slack.com/services/T../B../<secret>`, `discord.com/api/webhooks/<id>/<token>`, `api.telegram.org/bot<TOKEN>/...`). When `httpx` raised a timeout / DNS error its `__str__` included the full URL, which got persisted verbatim into `notification_deliveries.error[:1024]` and surfaced via `GET /deliveries` to any project admin — defeating the masking that `_mask_config` applied on `GET /channels`. New `domain.notifications.sanitize.sanitize_audit_text` scrubs the channel's `webhook_url` / `bot_token` / `integration_key` substrings from `error` and `response_body` before either persistence path writes (test-dispatch + real-event dispatch).
+- **`notification_deliveries.response_body` no longer stores hostile attacker bytes verbatim.** A malicious webhook target could plant phishing HTML / JS / fake CSRF tokens in its 200 response; the body got stored unsanitized and rendered on the Delivery Log page. Sanitizer strips control characters (`\x00`–`\x1f` except tab/CR/LF), enforces a 2 KB cap, and the dashboard already escapes via React text rendering — defense in depth at the write layer.
+- **SSRF probe error strings no longer leak internal-network DNS.** Rejection messages like `"target IP 10.0.0.5 is in blocked range 10.0.0.0/8"` used to let an admin enumerate internal-network DNS records via the audit log. Now collapsed to `"target rejected by policy"` in persisted/returned text; resolved IPs only land in operator-facing structlog. Private IP regex (`10.x`, `172.16-31.x`, `192.168.x`, `169.254.x`, `127.x`) is also masked as `<private-ip>` for any leaked address that escapes the SSRF-pattern collapse.
+
+#### `metrics-token rotate` hardening (MEDIUM)
+
+- **Atomic file creation.** Pre-1.0.14 used `Path.write_text` which created the temp file with the process umask (typically `0o644`) then narrowed to `0o600` via `chmod` — a small race window where any local user could read the new bearer from `~/.z4j/secret.env.rotate-tmp`. Now uses `os.open(tmp, O_WRONLY|O_CREAT|O_EXCL, 0o600)` so the file is created with the right mode from the start. The `chmod` follow-up still fires (defense in depth on systems with weird umask interactions) and now warns to stderr instead of silently swallowing failures.
+- **Structured log line on rotate** for ops-team correlation — previously rotates were silent, now they emit a `metrics_token_rotated` info-level log with `secret_env` path + uid.
+
+#### PagerDuty `severity_map` validator hardening (MEDIUM)
+
+- Validator now asserts `severity_map` keys are strings AND match the canonical trigger pattern (`task.failed` / `agent.online` / `test.dispatch` / etc.). Pre-1.0.14 the loop accepted any key type; a stored config with `None` / int / bool keys would crash the dispatcher mid-loop on string ops elsewhere.
+- `severity_map` capped at 32 entries — well above z4j's ~6 trigger types with headroom.
+
+#### `clear_deliveries` audit + retention (LOW)
+
+- Every `DELETE /api/v1/projects/{slug}/notifications/deliveries` writes one row to the brain audit log (`notifications.deliveries.clear` action) before the delete. Pre-1.0.14 a rogue admin could silently wipe the delivery audit log to cover the trail of a sensitive test dispatch. Audit row carries actor + deleted count + optional `before` timestamp.
+- New `?before=<iso8601>` query parameter on the same endpoint — lets future retention-policy automation delete only rows older than N days without wiping recent debugging history. Default behavior (omit `before`) unchanged.
+
+#### Channel-name snapshot in delivery rows (LOW)
+
+- `notification_deliveries` gains `channel_name` + `channel_type` columns (Alembic `2026_04_26_0005_deliv_snap`). Set at insert time in both the test-dispatch and real-event paths. Pre-1.0.14 the dashboard resolved channel name + type via a live JOIN at read time, which let an admin rename a channel after a sensitive dispatch and retroactively rewrite the audit story. Snapshot is now authoritative; live JOIN remains as a fallback for pre-1.0.14 rows where the snapshot is NULL.
+
+#### Defense-in-depth: import endpoints (LOW)
+
+- `import_from_user` and `import_from_project` now `copy.deepcopy` the source channel's `config` instead of `dict(...)` (shallow copy). Closes a future-aliasing bug class where nested dicts (`headers`, `severity_map`) shared references between source and imported channel — a PATCH on the source could leak into the imported copy via the shared reference if SQLAlchemy's `MutableDict` were ever added to the JSON column.
+
+#### Performance + DoS hardening (HIGH/MEDIUM)
+
+- **`task_name_pattern` ReDoS guard.** `fnmatch` on a hostile pattern like `"a*a*a*a*a*a*a*a*a*a*b"` is catastrophically backtracking on long inputs. The filter runs synchronously per event in the WS frame ingest path — one bad subscription DoSed event ingestion across all tenants on the worker. Pydantic validator now rejects patterns with > 5 wildcards or > 3 character classes; runtime guard in `NotificationService._matches_filters` skips the match (and logs) for stale subscriptions whose stored pattern slips past the validator (defense for pre-1.0.14 rows).
+- **DNS resolve in validators wrapped in `asyncio.wait_for(5.0)`.** Previously a slow / black-holed DNS server could pin a REST handler for the OS resolver's full retry budget (~30s). The 5s hard cap is well above legit DNS round-trip; a timeout caches the negative result for the same window so a flood of requests for a bad host doesn't multiply the wait.
+- **Notification dispatch detached from WS receive loop.** Pre-1.0.14 each `evaluate_and_dispatch` call awaited up to 16 concurrent HTTP deliveries with a 10s timeout *inside* the agent receive loop — a 50-event burst with email subscriptions could pin the WS frame handler for tens of seconds, dropping the agent's heartbeat clock. Now each evaluation runs in a detached `asyncio.Task` with its own DB session; the FrameRouter holds strong references to defeat GC + logs unhandled exceptions via done-callback. Backpressure cap of 256 in-flight tasks per connection prevents an event flood from spawning unbounded background work.
+- **Rate limits on test / import / bulk endpoints.** New per-IP throttle buckets:
+  - `channel-test` (20/min) — `/channels/test`, `/channels/{id}/test`, `/user/channels/test`, `/user/channels/{id}/test`
+  - `channel-import` (30/min) — `/channels/import_from_user`, `/user/channels/import_from_project`
+  - `bulk-action` (10/min) — `/tasks/bulk-delete`, `/commands/bulk-retry`, `/commands/purge-queue`, `/schedules/{id}/trigger`
+- **List-endpoint LIMIT caps.** `/agents`, `/workers`, `/channels` now enforce a server-side `limit` (default 500, max 5000) instead of returning the entire project's rows. Defends against unbounded result sets in projects with churning rows.
+- **Channel `config` size capped at 16 KiB JSON-serialized** at the pydantic boundary on every channel write path (`ChannelCreate`, `ChannelUpdate`, `ChannelTestRequest`, `UserChannelCreate`, `UserChannelUpdate`). Realistic configs are ~1–4 KiB; 16 KiB is comfortably above legit needs and rejects abusive 1 MiB payloads before they hit the DB.
+- **Tasks export ceiling lowered from 5 000 000 → 100 000 rows** (`Z4J_TASKS_EXPORT_MAX_ROWS`). Pre-1.0.14 a single export could materialize hundreds of MB of task rows + their JSONB blobs in Python memory. Streaming-cursor rewrite tracked for v1.1.x.
+- **`dashboard_hub` PostgreSQL NOTIFY fan-out tasks held by strong refs + done-callback** — pre-1.0.14 fire-and-forget `asyncio.create_task` could be GC'd mid-flight per asyncio docs, swallowing exceptions silently. Mirrors the pattern already used by `registry/postgres_notify.py`.
+
+#### Bonus: pre-existing bug fix
+
+- **POST `/user/subscriptions` no longer returns HTTP 500 for non-members.** Code imported `ForbiddenError` from `z4j_brain.errors` (no such name); should have been `AuthorizationError`. Every call from a user not in the project raised `ImportError` instead of returning 403. Caught during the audit smoke pass, fixed inline.
+
 ## [1.0.13] - 2026-04-24
 
 ### Security (BREAKING)

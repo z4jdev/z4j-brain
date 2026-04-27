@@ -49,11 +49,23 @@ def main(argv: Sequence[str] | None = None) -> int:
             f"  {prog} reset [--all]             # nuke DB state\n"
             f"  {prog} migrate upgrade head      # run alembic migrations\n"
             f"  {prog} audit verify              # verify audit-log HMAC chain\n"
-            f"  {prog} version                   # print installed version\n"
+            f"  {prog} --version                 # print installed version\n"
             "\n"
             f"Run `{prog} <command> --help` for per-command flags."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    # Standard Python convention: ``--version`` / ``-V`` print the
+    # version and exit. Mirrors the existing ``z4j version``
+    # subcommand and bare ``z4j`` (no subcommand) - all three paths
+    # produce the same output. -v (lowercase) is intentionally NOT
+    # bound here so it stays free for a future --verbose flag,
+    # matching pip / docker / kubectl convention.
+    parser.add_argument(
+        "--version",
+        "-V",
+        action="version",
+        version=__version__,
     )
     sub = parser.add_subparsers(
         dest="command",
@@ -68,6 +80,32 @@ def main(argv: Sequence[str] | None = None) -> int:
     serve.add_argument("--port", type=int, default=None, help="bind port")
     serve.add_argument("--workers", type=int, default=1)
     serve.add_argument("--reload", action="store_true")
+    # --environment / --env: CLI shortcut for setting Z4J_ENVIRONMENT.
+    # Wins over the env var (CLI > env > auto-detect default). Most
+    # operators set this once via systemd Environment= and never
+    # touch it; the flag exists for one-off testing ("does this work
+    # in production mode without restart loops?") and for the dev
+    # workflow ("flip to production for a smoke test, back to dev
+    # for the next iteration"). The choices are deliberately strict
+    # - no `prod` shorthand because Settings.environment is also
+    # a string field and accepting `prod` here would create a path
+    # that bypasses Settings's own validation.
+    serve.add_argument(
+        "--environment",
+        "--env",
+        default=None,
+        choices=("dev", "production"),
+        metavar="MODE",
+        help=(
+            "set the brain's security posture (dev | production). "
+            "Wins over Z4J_ENVIRONMENT. dev = loopback-only bind, "
+            "relaxed cookies, no HSTS, host validation off. production = "
+            "TLS-required (Z4J_PUBLIC_URL must be https://), explicit "
+            "Z4J_ALLOWED_HOSTS required, Secure cookies + __Host- prefix, "
+            "HSTS sent. Default: production if both Z4J_PUBLIC_URL=https:// "
+            "and Z4J_ALLOWED_HOSTS are set, else dev."
+        ),
+    )
     serve.add_argument(
         "--admin-email",
         default=None,
@@ -354,13 +392,32 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
 
     # metrics-token
-    sub.add_parser(
+    mt = sub.add_parser(
         "metrics-token",
         help=(
-            "print the /metrics bearer token (auto-minted on first "
-            "boot, persisted to ~/.z4j/secret.env). Paste into your "
-            "Prometheus scrape config's authorization.credentials or "
-            "use with curl -H 'Authorization: Bearer <token>'."
+            "manage the /metrics bearer token (auto-minted on first "
+            "boot, persisted to ~/.z4j/secret.env). Default action "
+            "prints the token; `rotate` mints a new one."
+        ),
+    )
+    mt_sub = mt.add_subparsers(
+        dest="metrics_action",
+        title="actions",
+        metavar="<action>",
+    )
+    mt_sub.add_parser(
+        "show",
+        help="print the current token (default action when no <action>)",
+    )
+    mt_sub.add_parser(
+        "rotate",
+        help=(
+            "mint a fresh token, replace it in ~/.z4j/secret.env, and "
+            "print the new value. Requires a brain restart for the new "
+            "token to take effect on the live process - the running "
+            "brain still validates against the old token in memory until "
+            "it re-reads secret.env at startup. Update your Prometheus "
+            "scrape config with the new token before restarting."
         ),
     )
 
@@ -424,7 +481,19 @@ def main(argv: Sequence[str] | None = None) -> int:
     return 2
 
 
-def _run_metrics_token(args: argparse.Namespace) -> int:  # noqa: ARG001
+def _run_metrics_token(args: argparse.Namespace) -> int:
+    """Dispatch ``z4j metrics-token [show|rotate]``.
+
+    Default (no action) is ``show`` for backward compatibility with
+    1.0.13's ``z4j metrics-token`` (no subcommand).
+    """
+    action = getattr(args, "metrics_action", None) or "show"
+    if action == "rotate":
+        return _run_metrics_token_rotate(args)
+    return _run_metrics_token_show(args)
+
+
+def _run_metrics_token_show(args: argparse.Namespace) -> int:  # noqa: ARG001
     """Print the ``/metrics`` bearer token.
 
     Resolution (first match wins):
@@ -433,9 +502,8 @@ def _run_metrics_token(args: argparse.Namespace) -> int:  # noqa: ARG001
          (auto-minted by ``z4j serve`` on first boot).
       3. Prints an error to stderr and exits 2.
 
-    Writes ONLY the token to stdout (no trailing newline from print's
-    default would be fine, but keep it deterministic so scripts can
-    ``$(z4j metrics-token)`` safely).
+    Writes ONLY the token to stdout so scripts can use
+    ``$(z4j metrics-token)`` safely.
     """
     import os
     from pathlib import Path as _Path
@@ -460,6 +528,128 @@ def _run_metrics_token(args: argparse.Namespace) -> int:  # noqa: ARG001
         file=sys.stderr,
     )
     return 2
+
+
+def _run_metrics_token_rotate(args: argparse.Namespace) -> int:  # noqa: ARG001
+    """Mint a fresh ``/metrics`` bearer token and replace it in
+    ``~/.z4j/secret.env``.
+
+    Atomically rewrites the file: read all lines, replace (or
+    append) the ``Z4J_METRICS_AUTH_TOKEN=`` line, write to a temp
+    file in the same dir, ``rename()`` over the original. This way
+    a concurrent ``z4j serve`` boot reads either the old file or
+    the new one, never a half-written one.
+
+    Does NOT touch the running brain process. Operators must
+    restart for the new token to take effect (the brain caches
+    the env var at startup; FastAPI's ``Settings`` is built once
+    per process).
+
+    Prints the new token to stdout (one line, no other noise) so
+    scripts can ``new=$(z4j metrics-token rotate)`` and immediately
+    push the value to a Prometheus reload.
+    """
+    import os
+    import secrets as _secrets
+    from pathlib import Path as _Path
+
+    secret_env = _Path.home() / ".z4j" / "secret.env"
+    if not secret_env.exists():
+        print(  # noqa: T201
+            "z4j metrics-token rotate: ~/.z4j/secret.env does not exist. "
+            "Run `z4j serve` once to auto-mint the secret store first.",
+            file=sys.stderr,
+        )
+        return 2
+
+    new_token = _secrets.token_urlsafe(32)
+    lines = secret_env.read_text(encoding="utf-8").splitlines()
+    out_lines: list[str] = []
+    found = False
+    for line in lines:
+        if line.strip().startswith("Z4J_METRICS_AUTH_TOKEN="):
+            out_lines.append(f"Z4J_METRICS_AUTH_TOKEN={new_token}")
+            found = True
+        else:
+            out_lines.append(line)
+    if not found:
+        # Pre-1.0.13 file with no metrics token line. Append.
+        out_lines.append(f"Z4J_METRICS_AUTH_TOKEN={new_token}")
+    new_content = ("\n".join(out_lines) + "\n").encode("utf-8")
+
+    # Atomic write: tmp file in the same directory, then rename. The
+    # tmp is created with O_EXCL + 0o600 from the start (audit M-1) so
+    # no race window exists where a local user could read the new
+    # token from the temp file before chmod tightens it. Pre-1.0.14
+    # used Path.write_text which created the file with the process
+    # umask (typically 0o644) and only narrowed it after; on Windows
+    # the followup chmod is a no-op so the file inherited the parent
+    # dir's ACLs.
+    tmp = secret_env.with_suffix(secret_env.suffix + ".rotate-tmp")
+    # If a previous rotate crashed mid-write, the EXCL would refuse
+    # to overwrite a stale tmp. Best-effort cleanup first.
+    try:
+        tmp.unlink()
+    except FileNotFoundError:
+        pass
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_BINARY"):
+        flags |= os.O_BINARY  # Windows: no implicit \r\n translation
+    fd = os.open(str(tmp), flags, 0o600)
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(new_content)
+    except Exception:
+        # Roll back the tmp file if the write fails so we don't leave
+        # a half-written sibling. Re-raise so the operator sees the
+        # original error - rotation should fail loudly, not silently.
+        try:
+            tmp.unlink()
+        except FileNotFoundError:
+            pass
+        raise
+    # On POSIX chmod is redundant (we already opened with 0o600) but
+    # this defends against rare umask-application bugs. On Windows
+    # chmod is a no-op; ACL handling is the file system's job.
+    if hasattr(os, "chmod"):
+        try:
+            os.chmod(tmp, 0o600)
+        except OSError as exc:
+            print(  # noqa: T201
+                f"z4j metrics-token rotate: WARNING - chmod 0o600 on "
+                f"{tmp} failed: {exc}. The new token may be readable "
+                f"to other local users until you tighten the file "
+                f"permissions manually.",
+                file=sys.stderr,
+            )
+    os.replace(tmp, secret_env)
+
+    # Audit log (best-effort): log the rotation to structlog so the
+    # operations team can correlate "Prometheus stopped scraping" with
+    # "someone rotated the token at 14:32". We deliberately don't
+    # write to the DB audit_events table from the CLI rotate path -
+    # the brain may not be running, and adding a DB dependency to a
+    # CLI hygiene command would be a footgun (rotate would fail when
+    # the DB was unreachable).
+    import logging as _logging
+
+    _logging.getLogger("z4j.brain.cli").info(
+        "metrics_token_rotated",
+        extra={
+            "secret_env": str(secret_env),
+            "uid": os.getuid() if hasattr(os, "getuid") else None,
+        },
+    )
+
+    print(new_token)  # noqa: T201
+    print(  # noqa: T201
+        f"z4j metrics-token rotate: new token written to {secret_env}. "
+        f"Restart the brain (`systemctl restart z4j` or equivalent) for "
+        f"the new token to take effect, and update your Prometheus "
+        f"scrape config's authorization.credentials before the restart.",
+        file=sys.stderr,
+    )
+    return 0
 
 
 def _run_doctor(args: argparse.Namespace) -> int:
@@ -492,13 +682,34 @@ def _run_doctor(args: argparse.Namespace) -> int:
     # mode, which is the exact footgun we already fixed in the host
     # middleware. Surface it up front so operators see it.
     env = os.environ.get("Z4J_ENVIRONMENT", "").lower()
-    bind_host = os.environ.get("Z4J_BIND_HOST", "0.0.0.0")
-    if env == "dev" and bind_host not in ("127.0.0.1", "localhost", "[::1]"):
+    # Only flag when Z4J_BIND_HOST is explicitly set to a non-loopback
+    # value AND env is dev. Pre-1.0.14 the default fallback was
+    # "0.0.0.0", which fired a false positive every time the operator
+    # ran `z4j doctor` between sessions (the env var is unset until
+    # `z4j serve` sets it during dev-mode auto-defaulting). v1.0.14's
+    # _run_serve sets Z4J_BIND_HOST=127.0.0.1 when env=dev and the
+    # operator hasn't pinned it - so the only path to this warning is
+    # an EXPLICIT Z4J_BIND_HOST != loopback set in the operator's
+    # environment, which IS the dangerous combo.
+    bind_host = os.environ.get("Z4J_BIND_HOST", "")
+    if env == "dev" and bind_host and bind_host not in (
+        "127.0.0.1", "localhost", "[::1]",
+    ):
+        # As of v1.0.14 `z4j serve` refuses to start with this combo
+        # (see _run_serve fail-closed gate). Doctor still flags it as
+        # an INFO-level warning so an operator running `z4j doctor`
+        # in a CI/IaC pipeline catches the env-var combo before it
+        # crashes the systemd unit on the next restart.
         warnings.append(
-            f"Z4J_ENVIRONMENT=dev AND bind_host={bind_host!r}. "
-            f"If this brain is reachable from anywhere beyond localhost "
-            f"(reverse proxy, LAN, Tailscale, public IP), switch to "
-            f"Z4J_ENVIRONMENT=production and pin Z4J_ALLOWED_HOSTS."
+            f"Z4J_ENVIRONMENT=dev AND Z4J_BIND_HOST={bind_host!r}. "
+            f"`z4j serve` will REFUSE to start with this combo "
+            f"(fail-closed since v1.0.14). Either set "
+            f"Z4J_BIND_HOST=127.0.0.1 for localhost-only dev, or switch "
+            f"to Z4J_ENVIRONMENT=production with explicit "
+            f"Z4J_PUBLIC_URL=https://... and Z4J_ALLOWED_HOSTS for "
+            f"public access. Setting both auto-promotes the environment "
+            f"to production. The CLI flag `z4j serve --environment "
+            f"production` is the easiest way to flip."
         )
 
     # Warning 2: Z4J_DEBUG_HOST_ERRORS is on - verbose host rejection
@@ -735,6 +946,16 @@ def _run_serve(args: argparse.Namespace) -> int:
 
     import uvicorn
 
+    # --environment / --env CLI flag wins over Z4J_ENVIRONMENT env var
+    # (CLI > env > auto-detect default). We set it BEFORE the rest of
+    # the env-var defaulting below so the auto-promote and bind-host
+    # logic see the operator's intent. Removing the env var first is
+    # the cleanest way to express "the flag is now authoritative" -
+    # otherwise os.environ.setdefault would race against an existing
+    # setting from the caller's shell.
+    if args.environment:
+        os.environ["Z4J_ENVIRONMENT"] = args.environment
+
     # Auto-setup: pass admin credentials as env vars so the brain's
     # first-boot hook creates the admin user + default project and
     # skips the setup-URL banner. The env var names below are the
@@ -878,7 +1099,29 @@ def _run_serve(args: argparse.Namespace) -> int:
     # values for allowed_hosts + a non-https public_url. Set sane defaults
     # if the operator hasn't pinned them. Mirrors the Docker entrypoint.
     if not os.environ.get("Z4J_DATABASE_URL", "").startswith("postgresql"):
-        os.environ.setdefault("Z4J_ENVIRONMENT", "dev")
+        # Auto-promote to production when the operator's already-declared
+        # config shape *is* production-shaped. Two signals taken together
+        # (added v1.0.14):
+        #   1. Z4J_PUBLIC_URL starts with https:// (operator wired TLS)
+        #   2. Z4J_ALLOWED_HOSTS is set explicitly (operator has named
+        #      the public hostnames)
+        # Either alone is ambiguous; both together prove production
+        # intent. Honor it instead of silently shipping dev-mode cookies
+        # behind their TLS terminator. Operator can still force dev with
+        # an explicit Z4J_ENVIRONMENT=dev (env always wins over our
+        # defaulting).
+        if "Z4J_ENVIRONMENT" not in os.environ:
+            pub = os.environ.get("Z4J_PUBLIC_URL", "")
+            has_allowed = "Z4J_ALLOWED_HOSTS" in os.environ
+            if pub.startswith("https://") and has_allowed:
+                os.environ["Z4J_ENVIRONMENT"] = "production"
+                print(  # noqa: T201
+                    "z4j-brain: auto-promoting Z4J_ENVIRONMENT=production "
+                    "(detected https Z4J_PUBLIC_URL + explicit "
+                    "Z4J_ALLOWED_HOSTS). Set Z4J_ENVIRONMENT=dev to override.",
+                )
+            else:
+                os.environ["Z4J_ENVIRONMENT"] = "dev"
         # Smart default allow-list: localhost + the machine's own hostname
         # and FQDN. Lets `pip install z4j && z4j serve` on a remote VM
         # work without the operator having to set Z4J_ALLOWED_HOSTS for
@@ -950,6 +1193,55 @@ def _run_serve(args: argparse.Namespace) -> int:
 
             os.environ["Z4J_ALLOWED_HOSTS"] = _json.dumps(auto_hosts)
 
+        # SAFE-BY-DEFAULT BIND (added v1.0.14, breaking from 1.0.13):
+        # In dev mode, force the bind host to loopback unless the
+        # operator explicitly set Z4J_BIND_HOST. Pre-1.0.14 the default
+        # was 0.0.0.0 in dev mode, which silently exposed dev-mode
+        # cookies (secure=False, no __Host- prefix, no HSTS) to any
+        # caller that could reach the port. Combined with the
+        # fail-closed gate in _run_serve, the brain now refuses to
+        # accept off-loopback connections without explicit production
+        # mode (Z4J_ENVIRONMENT=production + https Z4J_PUBLIC_URL +
+        # explicit Z4J_ALLOWED_HOSTS).
+        if (
+            os.environ.get("Z4J_ENVIRONMENT") == "dev"
+            and "Z4J_BIND_HOST" not in os.environ
+        ):
+            os.environ["Z4J_BIND_HOST"] = "127.0.0.1"
+
+        # PUBLIC_URL AUTO-DERIVATION (added v1.0.14): when the operator
+        # hasn't pinned Z4J_PUBLIC_URL, derive it from the actual bind
+        # host:port so the first-boot setup banner prints a URL that
+        # actually works. Pre-1.0.14 the banner hard-coded
+        # http://localhost:7700/setup?token=... regardless of --port,
+        # leaving anyone running on a non-default port staring at a
+        # 404 from whatever happened to be on :7700 (or a connection
+        # refusal). Production mode requires Z4J_PUBLIC_URL to be
+        # set explicitly (see Settings._enforce_security_invariants),
+        # so this fires only in dev mode where the default is
+        # operator-friendly rather than security-load-bearing.
+        if (
+            os.environ.get("Z4J_ENVIRONMENT") == "dev"
+            and "Z4J_PUBLIC_URL" not in os.environ
+        ):
+            # Mirror the precedence uvicorn will use:
+            # --host > Z4J_BIND_HOST > settings default.
+            # --port > Z4J_BIND_PORT > settings default (7700).
+            _bh = args.host or os.environ.get("Z4J_BIND_HOST", "127.0.0.1")
+            _bp = args.port or int(os.environ.get("Z4J_BIND_PORT", "7700"))
+            # Browsers prefer "localhost" over "127.0.0.1" / "::1" in
+            # display (it survives clipboard better and works
+            # cross-IPv4/IPv6). For non-loopback binds we keep the
+            # actual host so the URL still resolves; non-loopback in
+            # dev mode is fail-closed anyway, so this branch is mostly
+            # belt-and-suspenders.
+            _display = (
+                "localhost"
+                if _bh in ("127.0.0.1", "localhost", "[::1]", "::1", "0.0.0.0")
+                else _bh
+            )
+            os.environ["Z4J_PUBLIC_URL"] = f"http://{_display}:{_bp}"
+
     # --debug-host-errors opt-in: enables verbose host-rejection response
     # bodies, but ONLY in dev mode. Protects against the common footgun
     # where a homelab operator runs the pip/SQLite path (dev mode by
@@ -1020,6 +1312,50 @@ def _run_serve(args: argparse.Namespace) -> int:
     from z4j_brain.settings import Settings
 
     settings = Settings()  # type: ignore[call-arg]
+
+    # FAIL-CLOSED dev+public-bind gate (added v1.0.14, breaking from
+    # 1.0.13). Refuse to start when the brain is in dev mode AND
+    # binding to anything other than loopback. Dev mode relaxes:
+    #   - cookies: secure=False, no __Host- prefix
+    #   - HSTS header: not sent
+    #   - host validation: allowed_hosts can be empty
+    #   - public_url: can be plain http://
+    # All four are catastrophic if the brain is reachable from the
+    # internet, a LAN, Tailscale, or anywhere off-loopback. The
+    # auto-promote logic above already flips to production when the
+    # operator's config shape (https Z4J_PUBLIC_URL + explicit
+    # Z4J_ALLOWED_HOSTS) declares production intent, so this gate
+    # only fires when the operator has neither: dev mode AND a
+    # non-loopback bind WITHOUT the production-shaped config.
+    bind = args.host or settings.bind_host
+    _LOOPBACK = ("127.0.0.1", "localhost", "[::1]", "::1")
+    if settings.environment == "dev" and bind not in _LOOPBACK:
+        print(  # noqa: T201
+            "z4j-brain: REFUSING TO START.\n"
+            "\n"
+            f"  Z4J_ENVIRONMENT=dev + bind {bind!r} is unsafe:\n"
+            "  cookies are not Secure, no HSTS, no host-header\n"
+            "  validation. Dev defaults are localhost-only.\n"
+            "\n"
+            "  Pick one:\n"
+            "  1. Localhost-only dev:\n"
+            "       z4j serve --host 127.0.0.1\n"
+            "\n"
+            "  2. Public production:\n"
+            "       Z4J_ENVIRONMENT=production \\\n"
+            "       Z4J_PUBLIC_URL=https://tasks.example.com \\\n"
+            "       Z4J_ALLOWED_HOSTS='[\"tasks.example.com\"]' \\\n"
+            "       z4j serve --host 0.0.0.0\n"
+            "\n"
+            "  Setting BOTH Z4J_PUBLIC_URL=https://... AND\n"
+            "  Z4J_ALLOWED_HOSTS auto-promotes the environment to\n"
+            "  production - you don't have to set Z4J_ENVIRONMENT\n"
+            "  explicitly.\n"
+            "\n"
+            "  See: https://z4j.dev/operations/dev-vs-production",
+            file=sys.stderr,
+        )
+        return 2
 
     # Tell the operator exactly which Host headers will be accepted.
     # Without this banner the only way to learn what's whitelisted is to
@@ -1636,6 +1972,16 @@ def _run_check(args: argparse.Namespace) -> int:
     try:
         settings, engine = _build_settings_from_env()
         checks.append(("config", "OK"))
+        # Surface the active environment so operators don't have to
+        # infer it from a warning further down (added v1.0.14).
+        # Marked production-mode rows with the secure-default tag,
+        # dev-mode rows with the relaxed-defaults tag.
+        env_tag = (
+            "production (TLS-required, host validation, secure cookies)"
+            if settings.environment == "production"
+            else "dev (loopback-only, relaxed cookies, no HSTS)"
+        )
+        checks.append(("environment", f"{settings.environment}  -  {env_tag}"))
     except Exception as exc:  # noqa: BLE001
         print(  # noqa: T201
             f"z4j-brain check: config INVALID: "
@@ -1764,10 +2110,15 @@ def _run_status(args: argparse.Namespace) -> int:
             def _fmt(v: "int | str") -> str:
                 return f"{v:>8,}" if isinstance(v, int) else f"{v:>8}"
 
+            env_tag = (
+                "(TLS-required, host validation, secure cookies)"
+                if settings.environment == "production"
+                else "(loopback-only, relaxed cookies, no HSTS)"
+            )
             print("z4j status")  # noqa: T201
             print(f"  version             {__version__}")  # noqa: T201
             print(f"  alembic head        {rev}")  # noqa: T201
-            print(f"  environment         {settings.environment}")  # noqa: T201
+            print(f"  environment         {settings.environment}  {env_tag}")  # noqa: T201
             print(f"  database            {settings.database_url.split('@')[-1]}")  # noqa: T201
             print("")  # noqa: T201
             print("  row counts:")  # noqa: T201

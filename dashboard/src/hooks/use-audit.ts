@@ -43,5 +43,5 @@ export function buildAuditExportUrl(
   params.set("format", format);
   if (filters.action_prefix) params.set("action_prefix", filters.action_prefix);
   if (filters.outcome) params.set("outcome", filters.outcome);
-  return `/api/v1/projects/${slug}/audit?${params.toString()}`;
+  return `/api/v1/projects/${encodeURIComponent(slug)}/audit?${params.toString()}`;
 }

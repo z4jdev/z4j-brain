@@ -48,6 +48,28 @@ if TYPE_CHECKING:
 
 logger = structlog.get_logger("z4j.brain.dashboard_hub.pg_notify")
 
+
+def _log_dashboard_fanout_exception(task: asyncio.Task[object]) -> None:
+    """Done-callback for fan-out tasks. Logs unhandled exceptions so
+    a silent GC or asyncio loop teardown doesn't swallow them.
+
+    Audit P-10 (added v1.0.14): without strong-ref + done-callback
+    the task could be GC'd before its coroutine finished, and any
+    exception inside ``_fan_out_remote`` would never be logged.
+    Mirrors the pattern at ``registry/postgres_notify.py:60``.
+    """
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        logger.warning(
+            "dashboard_hub_fanout_failed",
+            task_name=task.get_name(),
+            error_class=type(exc).__name__,
+            error=str(exc)[:500],
+        )
+
+
 _DASHBOARD_CHANNEL: str = "z4j_dashboard"
 _HEARTBEAT_CHANNEL: str = "z4j_dashboard_hb"
 
@@ -85,6 +107,12 @@ class PostgresNotifyDashboardHub:
         self._listener_task: asyncio.Task[None] | None = None
         self._stop_event = asyncio.Event()
         self._last_heartbeat_round_trip: float = time.monotonic()
+        # Strong references to fire-and-forget fan-out tasks. Without
+        # this, Python may GC the task before its coroutine runs to
+        # completion (asyncio docs note this explicitly). Audit P-10.
+        # The set is bounded by NOTIFY arrival rate; tasks remove
+        # themselves on completion via the done callback.
+        self._pending_fanout_tasks: set[asyncio.Task[None]] = set()
 
     # ------------------------------------------------------------------
     # Subscribers - delegate straight to the local hub
@@ -318,10 +346,16 @@ class PostgresNotifyDashboardHub:
         if topic not in DASHBOARD_TOPICS:
             return  # forward-compat: unknown topic
 
-        asyncio.create_task(
+        # Strong-ref the fire-and-forget task to defeat GC + log any
+        # unhandled exception (audit P-10). Mirrors the registry
+        # pg-notify pattern at registry/postgres_notify.py:457.
+        task = asyncio.create_task(
             self._fan_out_remote(project_id, topic),
             name="z4j-dashboard-hub-fanout",
         )
+        self._pending_fanout_tasks.add(task)
+        task.add_done_callback(self._pending_fanout_tasks.discard)
+        task.add_done_callback(_log_dashboard_fanout_exception)
 
     def _on_heartbeat(
         self,

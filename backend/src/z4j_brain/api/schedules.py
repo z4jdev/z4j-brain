@@ -33,6 +33,7 @@ from z4j_brain.api.deps import (
     get_session,
     require_csrf,
 )
+from z4j_brain.domain.ip_rate_limit import require_bulk_action_throttle
 from z4j_brain.errors import NotFoundError
 from z4j_brain.persistence.enums import ProjectRole
 
@@ -373,7 +374,10 @@ async def disable_schedule(
 @router.post(
     "/{schedule_id}/trigger",
     response_model=SchedulePublic,
-    dependencies=[Depends(require_csrf)],
+    dependencies=[
+        Depends(require_csrf),
+        Depends(require_bulk_action_throttle),
+    ],
 )
 async def trigger_schedule_now(
     slug: str,

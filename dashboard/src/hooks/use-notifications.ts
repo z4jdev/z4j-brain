@@ -35,7 +35,13 @@ import { api } from "@/lib/api";
 // Types
 // ---------------------------------------------------------------------------
 
-export type ChannelType = "webhook" | "email" | "slack" | "telegram";
+export type ChannelType =
+  | "webhook"
+  | "email"
+  | "slack"
+  | "telegram"
+  | "pagerduty"
+  | "discord";
 
 export type TriggerType =
   | "task.failed"
@@ -43,7 +49,11 @@ export type TriggerType =
   | "task.retried"
   | "task.slow"
   | "agent.offline"
-  | "agent.online";
+  | "agent.online"
+  // Synthetic trigger written by /channels/test (1.0.14+) so the
+  // deliveries page can show "test" badge and operators have an
+  // audit trail of test fires. Not a real subscription trigger.
+  | "test.dispatch";
 
 // -- Project channels (shared) ------------------------------------------------
 
@@ -186,6 +196,12 @@ export interface NotificationDelivery {
   response_code: number | null;
   error: string | null;
   sent_at: string;
+  // 1.0.14+: backend enriches the page with channel name + type so
+  // the dashboard can render a "Channel" column without an N+1
+  // fetch. NULL when the channel was deleted, or when the row was
+  // an unsaved-config preflight test (no channel exists yet).
+  channel_name: string | null;
+  channel_type: ChannelType | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -237,6 +253,28 @@ export function useDeleteChannel(slug: string) {
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["notification-channels", slug] });
       qc.invalidateQueries({ queryKey: ["user-subscriptions"] });
+    },
+  });
+}
+
+/**
+ * Import one of the operator's personal channels into the project
+ * as a project-shared channel. Backend copies the row server-side
+ * so the unmasked secret never crosses the wire.
+ *
+ * Permission: project ADMIN. The source must be owned by the
+ * caller (no taking over another user's secret).
+ */
+export function useImportChannelFromUser(slug: string) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (body: { user_channel_id: string; name?: string }) =>
+      api.post<NotificationChannel>(
+        `/projects/${slug}/notifications/channels/import_from_user`,
+        body,
+      ),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["notification-channels", slug] });
     },
   });
 }
@@ -301,6 +339,28 @@ export function useCreateUserChannel() {
   return useMutation({
     mutationFn: (body: CreateUserChannelRequest) =>
       api.post<UserChannel>(`/user/channels`, body),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["user-channels"] });
+    },
+  });
+}
+
+/**
+ * Import a project's channel into the caller's personal channels.
+ * Backend copies the row server-side so the unmasked secret never
+ * crosses the wire.
+ *
+ * Permission: caller must be a member of the project (any role).
+ */
+export function useImportUserChannelFromProject() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (body: {
+      project_slug: string;
+      channel_id: string;
+      name?: string;
+    }) =>
+      api.post<UserChannel>(`/user/channels/import_from_project`, body),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["user-channels"] });
     },
@@ -534,6 +594,23 @@ export function useDeliveries(slug: string, limit = 50, cursor?: string | null) 
     },
     enabled: !!slug,
     staleTime: 30_000,
+  });
+}
+
+/**
+ * Bulk-delete every delivery row for the project (admin only).
+ * Returns the number of rows deleted so the UI can confirm.
+ */
+export function useClearDeliveries(slug: string) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: () =>
+      api.delete<{ deleted: number }>(
+        `/projects/${slug}/notifications/deliveries`,
+      ),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["notification-deliveries", slug] });
+    },
   });
 }
 

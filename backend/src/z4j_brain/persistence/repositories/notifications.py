@@ -61,12 +61,22 @@ class NotificationChannelRepository(BaseRepository[NotificationChannel]):
         project_id: UUID,
         *,
         active_only: bool = False,
+        limit: int = 500,
     ) -> list[NotificationChannel]:
-        """Return all channels for a project, newest first."""
+        """Return channels for a project, newest first.
+
+        Hard-capped at ``limit`` (default 500, max 5000) so a project
+        with hundreds of channels can't return an unbounded result
+        set (audit P-7, added v1.0.14). 500 is well above any
+        realistic single-project channel count.
+        """
+        if limit < 1 or limit > 5000:
+            raise ValueError("limit must be between 1 and 5000")
         stmt = (
             select(NotificationChannel)
             .where(NotificationChannel.project_id == project_id)
             .order_by(desc(NotificationChannel.created_at))
+            .limit(limit)
         )
         if active_only:
             stmt = stmt.where(NotificationChannel.is_active.is_(True))
@@ -686,6 +696,35 @@ class NotificationDeliveryRepository(BaseRepository[NotificationDelivery]):
         )
         result = await self.session.execute(stmt)
         return list(result.scalars().all())
+
+    async def delete_for_project(
+        self,
+        project_id: UUID,
+        *,
+        before: datetime | None = None,
+    ) -> int:
+        """Bulk-delete delivery rows for a project.
+
+        Used by the admin "Clear logs" UI action. Returns the row
+        count that was deleted so the caller can confirm the action
+        with a "deleted N rows" toast.
+
+        ``before``, when given, restricts the delete to rows older
+        than that timestamp - lets a future "Clear deliveries older
+        than 30 days" UI control reuse the same path. When None,
+        deletes everything for the project.
+        """
+        from sqlalchemy import delete as sql_delete
+
+        stmt = sql_delete(NotificationDelivery).where(
+            NotificationDelivery.project_id == project_id,
+        )
+        if before is not None:
+            stmt = stmt.where(NotificationDelivery.sent_at < before)
+        result = await self.session.execute(stmt)
+        # ``rowcount`` works on every SQLAlchemy dialect we support
+        # (SQLite + Postgres) for DELETE statements.
+        return int(result.rowcount or 0)
 
 
 __all__ = [

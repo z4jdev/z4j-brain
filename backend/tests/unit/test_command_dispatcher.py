@@ -7,7 +7,6 @@ import uuid
 from datetime import UTC, datetime, timedelta
 
 import pytest
-from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy.orm import sessionmaker
 
@@ -16,14 +15,13 @@ from z4j_brain.domain.command_dispatcher import CommandDispatcher
 from z4j_brain.persistence.base import Base
 from z4j_brain.persistence import models  # noqa: F401
 from z4j_brain.persistence.enums import AgentState, CommandStatus
-from z4j_brain.persistence.models import Agent, Command, Project
+from z4j_brain.persistence.models import Agent, Project
 from z4j_brain.persistence.repositories import (
     AuditLogRepository,
     CommandRepository,
 )
 from z4j_brain.settings import Settings
 from z4j_brain.websocket.registry._protocol import DeliveryResult
-from z4j_brain.websocket.registry.local import LocalRegistry
 
 
 @pytest.fixture
@@ -202,6 +200,54 @@ class TestHandleAck:
         await session.refresh(cmd)
         assert cmd.status == CommandStatus.DISPATCHED
 
+    async def test_ack_from_wrong_agent_is_ignored(
+        self,
+        session: AsyncSession,
+        project: Project,
+        agent: Agent,
+        settings: Settings,
+    ) -> None:
+        registry = FakeRegistry(notified_cluster=True)
+        audit = AuditService(settings)
+        dispatcher = CommandDispatcher(
+            settings=settings, registry=registry, audit=audit,
+        )
+        other_agent = Agent(
+            project_id=project.id,
+            name="web-02",
+            token_hash=secrets.token_hex(32),
+            protocol_version="1",
+            framework_adapter="django",
+            engine_adapters=["celery"],
+            scheduler_adapters=[],
+            capabilities={},
+            state=AgentState.ONLINE,
+        )
+        session.add(other_agent)
+        await session.flush()
+        commands = CommandRepository(session)
+        cmd = await commands.insert(
+            project_id=project.id,
+            agent_id=other_agent.id,
+            issued_by=None,
+            action="retry_task",
+            target_type="task",
+            target_id="celery:task-001",
+            payload={},
+            idempotency_key=None,
+            timeout_at=datetime.now(UTC) + timedelta(seconds=60),
+            source_ip=None,
+        )
+        await dispatcher.handle_ack(
+            commands=commands,
+            command_id=cmd.id,
+            project_id=project.id,
+            agent_id=agent.id,
+        )
+        await session.commit()
+        await session.refresh(cmd)
+        assert cmd.status == CommandStatus.PENDING
+
 
 @pytest.mark.asyncio
 class TestHandleResult:
@@ -280,6 +326,59 @@ class TestHandleResult:
         await session.refresh(cmd)
         assert cmd.status == CommandStatus.FAILED
         assert cmd.error == "task does not exist"
+
+    async def test_result_from_wrong_agent_is_ignored(
+        self,
+        session: AsyncSession,
+        project: Project,
+        agent: Agent,
+        settings: Settings,
+    ) -> None:
+        registry = FakeRegistry(notified_cluster=True)
+        audit = AuditService(settings)
+        dispatcher = CommandDispatcher(
+            settings=settings, registry=registry, audit=audit,
+        )
+        other_agent = Agent(
+            project_id=project.id,
+            name="web-02",
+            token_hash=secrets.token_hex(32),
+            protocol_version="1",
+            framework_adapter="django",
+            engine_adapters=["celery"],
+            scheduler_adapters=[],
+            capabilities={},
+            state=AgentState.ONLINE,
+        )
+        session.add(other_agent)
+        await session.flush()
+        commands = CommandRepository(session)
+        cmd = await commands.insert(
+            project_id=project.id,
+            agent_id=other_agent.id,
+            issued_by=None,
+            action="retry_task",
+            target_type="task",
+            target_id="celery:task-001",
+            payload={},
+            idempotency_key=None,
+            timeout_at=datetime.now(UTC) + timedelta(seconds=60),
+            source_ip=None,
+        )
+        await dispatcher.handle_result(
+            commands=commands,
+            audit_log=AuditLogRepository(session),
+            command_id=cmd.id,
+            status="success",
+            result_payload={"new_task_id": "task-002"},
+            error=None,
+            project_id=project.id,
+            agent_id=agent.id,
+        )
+        await session.commit()
+        await session.refresh(cmd)
+        assert cmd.status == CommandStatus.PENDING
+        assert cmd.result is None
 
     async def test_duplicate_result_is_noop(
         self,

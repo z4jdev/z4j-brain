@@ -44,6 +44,7 @@ from z4j_brain.api.deps import (
     get_settings,
     require_csrf,
 )
+from z4j_brain.domain.ip_rate_limit import require_bulk_action_throttle
 from z4j_brain.errors import NotFoundError
 from z4j_brain.persistence.enums import CommandStatus, ProjectRole
 
@@ -474,7 +475,10 @@ async def issue_cancel_task(
     "/bulk-retry",
     response_model=CommandPublic,
     status_code=202,
-    dependencies=[Depends(require_csrf)],
+    dependencies=[
+        Depends(require_csrf),
+        Depends(require_bulk_action_throttle),
+    ],
 )
 async def issue_bulk_retry(
     slug: str,
@@ -554,7 +558,10 @@ async def issue_bulk_retry(
     "/purge-queue",
     response_model=CommandPublic,
     status_code=202,
-    dependencies=[Depends(require_csrf)],
+    dependencies=[
+        Depends(require_csrf),
+        Depends(require_bulk_action_throttle),
+    ],
 )
 async def issue_purge_queue(
     slug: str,

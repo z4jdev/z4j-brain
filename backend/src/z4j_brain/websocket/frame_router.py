@@ -20,6 +20,7 @@ project.
 from __future__ import annotations
 
 from datetime import UTC, datetime
+import asyncio
 from typing import TYPE_CHECKING, Any
 from uuid import UUID
 
@@ -35,22 +36,45 @@ from z4j_core.transport.frames import (
 )
 
 if TYPE_CHECKING:
-    from sqlalchemy.ext.asyncio import AsyncSession
-
     from z4j_brain.domain import CommandDispatcher, EventIngestor
+    from z4j_brain.domain.notifications import NotificationService
     from z4j_brain.persistence.database import DatabaseManager
-    from z4j_brain.persistence.repositories import (
-        AgentRepository,
-        AuditLogRepository,
-        CommandRepository,
-        EventRepository,
-        QueueRepository,
-        TaskRepository,
-    )
     from z4j_brain.websocket.dashboard_hub import DashboardHub
 
 
 logger = structlog.get_logger("z4j.brain.frame_router")
+
+#: Backpressure cap on detached notification dispatch tasks per
+#: connection (audit P-4). Each task runs ``evaluate_and_dispatch``
+#: in its own DB session and may make external HTTP calls; an event
+#: flood from a misbehaving agent shouldn't be allowed to spawn
+#: thousands of in-flight tasks. The cap is per-FrameRouter (i.e.
+#: per agent connection); a busy fleet of 100 agents = 100 × cap
+#: ceiling. 256 leaves room for a 200-event burst with a normal
+#: subscription fanout.
+_MAX_PENDING_NOTIFICATION_TASKS = 256
+
+
+def _log_notify_task_exception(task: asyncio.Task[object]) -> None:
+    """Done-callback for fire-and-forget notification dispatch tasks.
+
+    Logs unhandled exceptions so a silent GC or asyncio loop
+    teardown doesn't swallow them. Audit P-4 + P-10 (added
+    v1.0.14). The dispatch coroutine
+    (``FrameRouter._dispatch_notification``) already wraps its body
+    in try/except + logger.exception, so this callback is mostly
+    insurance against asyncio-level cancellation surprises.
+    """
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        logger.warning(
+            "z4j frame_router: notification dispatch task exited with exception",
+            task_name=task.get_name(),
+            error_class=type(exc).__name__,
+            error=str(exc)[:500],
+        )
 
 
 class FrameRouter:
@@ -72,6 +96,12 @@ class FrameRouter:
         self._project_id = project_id
         self._agent_id = agent_id
         self._dashboard_hub = dashboard_hub
+        # Strong references to detached notification dispatch tasks
+        # (audit P-4 + P-10). Without this the asyncio event loop
+        # may GC the task before its coroutine completes, swallowing
+        # any exception. Tasks remove themselves on completion via
+        # the done callback.
+        self._pending_notify_tasks: set[asyncio.Task[None]] = set()
 
     async def dispatch(self, frame: Frame) -> None:
         """Route ``frame`` to the right service. Never raises."""
@@ -242,7 +272,6 @@ class FrameRouter:
                                     stats = _json.loads(stats)
                                 pool = stats.get("pool", {}) if isinstance(stats, dict) else {}
                                 rusage = stats.get("rusage", {}) if isinstance(stats, dict) else {}
-                                total = stats.get("total", {}) if isinstance(stats, dict) else {}
 
                                 updates: dict[str, Any] = {
                                     "state": WorkerState.ONLINE,
@@ -376,6 +405,8 @@ class FrameRouter:
             await self._dispatcher.handle_ack(
                 commands=CommandRepository(session),
                 command_id=command_id,
+                project_id=self._project_id,
+                agent_id=self._agent_id,
             )
             await session.commit()
 
@@ -401,6 +432,8 @@ class FrameRouter:
                 status=frame.payload.status,
                 result_payload=frame.payload.result,
                 error=frame.payload.error,
+                project_id=self._project_id,
+                agent_id=self._agent_id,
             )
             await session.commit()
 
@@ -414,7 +447,26 @@ class FrameRouter:
         self,
         events: list[dict[str, Any]],
     ) -> None:
-        """Fire per-user notification subscriptions for task state changes."""
+        """Fire per-user notification subscriptions for task state changes.
+
+        As of v1.0.14 (audit P-4) each evaluation runs in a detached
+        background task instead of blocking the WS receive loop.
+        Pre-1.0.14 this method awaited each ``evaluate_and_dispatch``
+        in series, which itself awaits up to 16 concurrent HTTP
+        deliveries with 10s timeouts - a 50-event burst with email
+        subscriptions could pin the WS frame handler for tens of
+        seconds, dropping the agent's heartbeat clock.
+
+        The detached tasks each open their own DB session (sessions
+        are not safe to share across tasks). A class-level set holds
+        strong references so Python doesn't GC the task before the
+        coroutine finishes (audit P-10 same-pattern fix).
+        Backpressure: if the pending set exceeds
+        ``_MAX_PENDING_NOTIFICATION_TASKS`` we log + drop (event
+        ingestion under burst takes priority over notification
+        delivery; the next agent reconnect / heartbeat re-fires
+        anything important).
+        """
         from z4j_core.models.event import EventKind
 
         from z4j_brain.domain.notifications import NotificationService
@@ -440,32 +492,81 @@ class FrameRouter:
             seen.add((trigger, task_id))
 
             data = raw_event.get("data") or {}
-            try:
-                async with self._db.session() as session:
-                    svc = NotificationService()
-                    await svc.evaluate_and_dispatch(
-                        session=session,
-                        project_id=self._project_id,
-                        trigger=trigger,
-                        task_id=task_id,
-                        task_name=data.get("task_name"),
-                        # Forward the engine name onto the notification
-                        # payload so the dashboard can deep-link to
-                        # /tasks/<engine>/<task_id> for RQ + Dramatiq
-                        # tasks (fixes the BUG-2 celery-fallback 404).
-                        engine=raw_event.get("engine"),
-                        priority=data.get("priority", "normal"),
-                        state=kind.split(".")[-1] if "." in kind else kind,
-                        queue=data.get("queue"),
-                        exception=data.get("exception"),
-                        traceback=data.get("traceback"),
-                    )
-            except Exception:  # noqa: BLE001
-                logger.exception(
-                    "z4j frame_router: notification evaluation failed",
+            # Backpressure cap (audit P-4): if too many notification
+            # tasks are already in flight we drop new ones rather than
+            # let the FrameRouter's pending set grow unbounded under
+            # an event flood from a misbehaving agent.
+            if len(self._pending_notify_tasks) >= _MAX_PENDING_NOTIFICATION_TASKS:
+                logger.warning(
+                    "z4j frame_router: notification pending queue full "
+                    "(%d tasks); dropping trigger=%s task_id=%s",
+                    len(self._pending_notify_tasks),
+                    trigger,
+                    task_id,
+                )
+                continue
+
+            task = asyncio.create_task(
+                self._dispatch_notification(
+                    NotificationService(),
                     trigger=trigger,
                     task_id=task_id,
+                    task_name=data.get("task_name"),
+                    engine=raw_event.get("engine"),
+                    priority=data.get("priority", "normal"),
+                    state=kind.split(".")[-1] if "." in kind else kind,
+                    queue=data.get("queue"),
+                    exception=data.get("exception"),
+                    traceback=data.get("traceback"),
+                ),
+                name=f"z4j-notify-{trigger}",
+            )
+            self._pending_notify_tasks.add(task)
+            task.add_done_callback(self._pending_notify_tasks.discard)
+            task.add_done_callback(_log_notify_task_exception)
+
+    async def _dispatch_notification(
+        self,
+        svc: "NotificationService",
+        *,
+        trigger: str,
+        task_id: str,
+        task_name: str | None,
+        engine: str | None,
+        priority: str,
+        state: str,
+        queue: str | None,
+        exception: str | None,
+        traceback: str | None,
+    ) -> None:
+        """Single notification dispatch with its own DB session.
+
+        Designed to be called from ``asyncio.create_task`` from
+        ``_evaluate_notifications`` (audit P-4). Each task owns its
+        own DB session because sessions are not safe to share across
+        tasks. Errors are logged in the done-callback, not raised.
+        """
+        try:
+            async with self._db.session() as session:
+                await svc.evaluate_and_dispatch(
+                    session=session,
+                    project_id=self._project_id,
+                    trigger=trigger,
+                    task_id=task_id,
+                    task_name=task_name,
+                    engine=engine,
+                    priority=priority,
+                    state=state,
+                    queue=queue,
+                    exception=exception,
+                    traceback=traceback,
                 )
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "z4j frame_router: notification dispatch task failed",
+                trigger=trigger,
+                task_id=task_id,
+            )
 
     async def _publish_task_change(self) -> None:
         if self._dashboard_hub is None:

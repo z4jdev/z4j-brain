@@ -59,14 +59,25 @@ class CommandRepository(BaseRepository[Command]):
     # State transitions (single UPDATE, guarded by current status)
     # ------------------------------------------------------------------
 
-    async def mark_dispatched(self, command_id: UUID) -> bool:
+    async def mark_dispatched(
+        self,
+        command_id: UUID,
+        *,
+        project_id: UUID | None = None,
+        agent_id: UUID | None = None,
+    ) -> bool:
         """Pending → dispatched. Returns True if the row transitioned."""
+        predicates = [
+            Command.id == command_id,
+            Command.status == CommandStatus.PENDING,
+        ]
+        if project_id is not None:
+            predicates.append(Command.project_id == project_id)
+        if agent_id is not None:
+            predicates.append(Command.agent_id == agent_id)
         result = await self.session.execute(
             update(Command)
-            .where(
-                Command.id == command_id,
-                Command.status == CommandStatus.PENDING,
-            )
+            .where(*predicates)
             .values(
                 status=CommandStatus.DISPATCHED,
                 dispatched_at=datetime.now(UTC),
@@ -79,15 +90,22 @@ class CommandRepository(BaseRepository[Command]):
         command_id: UUID,
         *,
         result_payload: dict[str, Any] | None,
+        project_id: UUID | None = None,
+        agent_id: UUID | None = None,
     ) -> bool:
+        predicates = [
+            Command.id == command_id,
+            Command.status.in_(
+                [CommandStatus.PENDING, CommandStatus.DISPATCHED],
+            ),
+        ]
+        if project_id is not None:
+            predicates.append(Command.project_id == project_id)
+        if agent_id is not None:
+            predicates.append(Command.agent_id == agent_id)
         result = await self.session.execute(
             update(Command)
-            .where(
-                Command.id == command_id,
-                Command.status.in_(
-                    [CommandStatus.PENDING, CommandStatus.DISPATCHED],
-                ),
-            )
+            .where(*predicates)
             .values(
                 status=CommandStatus.COMPLETED,
                 completed_at=datetime.now(UTC),
@@ -103,15 +121,22 @@ class CommandRepository(BaseRepository[Command]):
         *,
         error: str,
         result_payload: dict[str, Any] | None = None,
+        project_id: UUID | None = None,
+        agent_id: UUID | None = None,
     ) -> bool:
+        predicates = [
+            Command.id == command_id,
+            Command.status.in_(
+                [CommandStatus.PENDING, CommandStatus.DISPATCHED],
+            ),
+        ]
+        if project_id is not None:
+            predicates.append(Command.project_id == project_id)
+        if agent_id is not None:
+            predicates.append(Command.agent_id == agent_id)
         result = await self.session.execute(
             update(Command)
-            .where(
-                Command.id == command_id,
-                Command.status.in_(
-                    [CommandStatus.PENDING, CommandStatus.DISPATCHED],
-                ),
-            )
+            .where(*predicates)
             .values(
                 status=CommandStatus.FAILED,
                 completed_at=datetime.now(UTC),

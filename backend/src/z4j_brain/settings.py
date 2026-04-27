@@ -161,7 +161,16 @@ class Settings(BaseSettings):
     #: Exports don't paginate; this cap is the backstop that
     #: prevents a single export from pulling a multi-million-row
     #: resultset into memory. Audit 2026-04-24 Low-3.
-    tasks_export_max_rows: int = Field(default=50_000, ge=100, le=5_000_000)
+    # Export row cap (audit P-6, lowered v1.0.14). Pre-1.0.14 the
+    # ceiling was 5_000_000 - a single CSV/XLSX export at that size
+    # materializes hundreds of MB of task rows (with their JSONB
+    # args/kwargs/result/traceback blobs) into Python memory before
+    # serialization, which can OOM a worker. The new ceiling of
+    # 100_000 keeps per-export memory bounded to ~hundreds of MB
+    # worst case; the proper streaming rewrite (server-side cursor
+    # via session.stream_scalars) is tracked for v1.1.x as it
+    # requires a larger refactor of the repository methods.
+    tasks_export_max_rows: int = Field(default=50_000, ge=100, le=100_000)
 
     # ------------------------------------------------------------------
     # Registry (asyncpg LISTEN/NOTIFY)

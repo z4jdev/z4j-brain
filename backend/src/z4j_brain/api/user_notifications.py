@@ -16,21 +16,27 @@ data even within projects they administer.
 
 from __future__ import annotations
 
+import copy
 import uuid
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, Literal
 
 from fastapi import APIRouter, Depends, Query
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy.exc import IntegrityError
 
 from z4j_brain.api.deps import (
     get_current_user,
     get_membership_repo,
+    get_project_repo,
     get_session,
     require_csrf,
 )
 from z4j_brain.api.notifications import ChannelTestRequest, ChannelTestResult
+from z4j_brain.domain.ip_rate_limit import (
+    require_channel_import_throttle,
+    require_channel_test_throttle,
+)
 from z4j_brain.domain.notifications.channels import (
     validate_smtp_config,
     validate_telegram_config,
@@ -38,12 +44,16 @@ from z4j_brain.domain.notifications.channels import (
     validate_webhook_url,
 )
 from z4j_brain.errors import ConflictError
+from z4j_brain.persistence.enums import ProjectRole
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
 
     from z4j_brain.persistence.models import User
-    from z4j_brain.persistence.repositories import MembershipRepository
+    from z4j_brain.persistence.repositories import (
+        MembershipRepository,
+        ProjectRepository,
+    )
 
 
 router = APIRouter(prefix="/user", tags=["user-notifications"])
@@ -58,9 +68,15 @@ _TRIGGER_PATTERN = (
     r"^(task\.failed|task\.succeeded|task\.retried|"
     r"task\.slow|agent\.offline|agent\.online)$"
 )
-_CHANNEL_TYPE_PATTERN = r"^(webhook|email|slack|telegram)$"
+_CHANNEL_TYPE_PATTERN = r"^(webhook|email|slack|telegram|pagerduty|discord)$"
 
-_SENSITIVE_KEYS = ("smtp_pass", "hmac_secret", "bot_token", "password")
+_SENSITIVE_KEYS = (
+    "smtp_pass",
+    "hmac_secret",
+    "bot_token",
+    "password",
+    "integration_key",
+)
 _MASK = "••••••••"
 
 
@@ -159,6 +175,25 @@ async def _validate_channel_config(
         err = await validate_smtp_config(config)
         if err:
             raise ConflictError(f"unsafe email config: {err}")
+    elif channel_type == "pagerduty":
+        from z4j_brain.domain.notifications.channels import (
+            validate_pagerduty_config,
+        )
+        err = validate_pagerduty_config(config)
+        if err:
+            raise ConflictError(f"invalid pagerduty config: {err}")
+    elif channel_type == "discord":
+        from z4j_brain.domain.notifications.channels import (
+            validate_discord_config,
+        )
+        err = validate_discord_config(config)
+        if err:
+            raise ConflictError(f"invalid discord config: {err}")
+        url = config.get("webhook_url", "")
+        if url:
+            err = await validate_webhook_url(url)
+            if err:
+                raise ConflictError(f"unsafe discord webhook URL: {err}")
 
 
 class SubscriptionFilters(BaseModel):
@@ -189,11 +224,28 @@ class UserChannelCreate(BaseModel):
     config: dict[str, Any] = Field(default_factory=dict)
     is_active: bool = True
 
+    @field_validator("config")
+    @classmethod
+    def _check_config_size(cls, v: dict[str, Any]) -> dict[str, Any]:
+        # Audit P-8: cap config size at the request boundary (16 KiB
+        # JSON-serialized) so a hostile or runaway client can't bloat
+        # the channel row.
+        from z4j_brain.api.notifications import _validate_config_size
+
+        return _validate_config_size(v) or {}
+
 
 class UserChannelUpdate(BaseModel):
     name: str | None = Field(default=None, min_length=1, max_length=200)
     config: dict[str, Any] | None = None
     is_active: bool | None = None
+
+    @field_validator("config")
+    @classmethod
+    def _check_config_size(cls, v: dict[str, Any] | None) -> dict[str, Any] | None:
+        from z4j_brain.api.notifications import _validate_config_size
+
+        return _validate_config_size(v)
 
 
 class UserChannelPublic(BaseModel):
@@ -205,6 +257,33 @@ class UserChannelPublic(BaseModel):
     is_active: bool
     created_at: datetime
     updated_at: datetime
+
+
+class UserChannelImportFromProjectRequest(BaseModel):
+    """Body for ``POST /user/channels/import_from_project`` (v1.0.14).
+
+    Caller wants a personal copy of a channel that already exists
+    in one of their projects (e.g. the project Slack webhook, but
+    routed to their inbox via a personal subscription). Backend
+    copies the row server-side so the unmasked secret never crosses
+    the wire.
+
+    Caller MUST be a project admin because the operation copies
+    secret-bearing delivery config into a personal scope. The
+    channel must belong to that project.
+    """
+    project_slug: str = Field(min_length=1, max_length=63)
+    channel_id: uuid.UUID
+    name: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=200,
+        description=(
+            "Override the imported channel's name. Defaults to "
+            "'Copy of {original}' if omitted."
+        ),
+    )
+    model_config = {"extra": "forbid"}
 
 
 # -- User subscriptions -----------------------------------------------------
@@ -376,6 +455,112 @@ async def create_user_channel(
     return _channel_payload(channel)
 
 
+@router.post(
+    "/channels/import_from_project",
+    response_model=UserChannelPublic,
+    status_code=201,
+    dependencies=[
+        Depends(require_csrf),
+        Depends(require_channel_import_throttle),
+    ],
+)
+async def import_user_channel_from_project(
+    body: UserChannelImportFromProjectRequest,
+    user: "User" = Depends(get_current_user),
+    memberships: "MembershipRepository" = Depends(get_membership_repo),
+    projects: "ProjectRepository" = Depends(get_project_repo),
+    db_session: "AsyncSession" = Depends(get_session),
+) -> UserChannelPublic:
+    """Copy a project's channel into the caller's personal channels.
+
+    Use case: the project has a verified Slack webhook / Telegram
+    bot / PagerDuty key. A member wants the same destination as
+    their personal channel (so they can attach it to subscriptions
+    that aren't part of the project's defaults, or use it across
+    multiple projects without re-pasting the secret).
+
+    Server-side copy: the source NotificationChannel's config (incl.
+    real secrets) is read directly from the DB and written to a new
+    UserChannel owned by the caller. The unmasked secret never
+    crosses the wire.
+
+    Permission model:
+      - Caller must be a project admin. A read-only member can use a
+        project channel in subscriptions, but cannot copy its secret
+        config into a personal channel and then export/reuse it
+        across projects.
+      - Source channel must belong to that project.
+      - Re-validates through the same SSRF / format guards used at
+        create time.
+    """
+    from z4j_brain.errors import NotFoundError
+    from z4j_brain.persistence.models.notification import UserChannel
+    from z4j_brain.persistence.repositories import (
+        NotificationChannelRepository,
+    )
+
+    # Resolve slug -> project_id via the policy engine, then verify
+    # the caller has membership. Mirrors the pattern in
+    # api/notifications.py::_resolve_member_project but keeps the
+    # logic local so we don't cross-module-import a private helper.
+    from z4j_brain.domain.policy_engine import PolicyEngine
+
+    policy = PolicyEngine()
+    project = await policy.get_project_or_404(projects, body.project_slug)
+    project_id = project.id
+
+    # This copies the real, unmasked channel secret server-side.
+    # Project viewers/operators may reference project channels in
+    # subscriptions, but they cannot clone those credentials into a
+    # personal scope where they could be re-exported to another project.
+    await policy.require_member(
+        memberships,
+        user=user,
+        project_id=project_id,
+        min_role=ProjectRole.ADMIN,
+    )
+
+    source = await NotificationChannelRepository(db_session).get_for_project(
+        project_id, body.channel_id,
+    )
+    if source is None:
+        raise NotFoundError(
+            "channel not found in project",
+            details={
+                "project_slug": body.project_slug,
+                "channel_id": str(body.channel_id),
+            },
+        )
+
+    # Defense in depth: re-validate the config (see project-side
+    # import endpoint for the same rationale).
+    await _validate_channel_config(source.type, source.config)
+
+    new_name = body.name or f"Copy of {source.name}"
+    channel = UserChannel(
+        user_id=user.id,
+        name=new_name,
+        type=source.type,
+        # Audit L-4: deep-copy so nested dicts (headers, severity_map)
+        # don't share references with the source row's SQLAlchemy
+        # JSON-column dict. See api/notifications.py for the same fix.
+        config=copy.deepcopy(source.config or {}),
+        is_active=source.is_active,
+    )
+    db_session.add(channel)
+    await db_session.flush()
+    try:
+        await db_session.commit()
+    except IntegrityError:
+        await db_session.rollback()
+        raise ConflictError(
+            f"a channel named {new_name!r} already exists in your "
+            f"personal channels",
+        ) from None
+    await db_session.refresh(channel)
+    return _channel_payload(channel)
+
+
 @router.patch(
     "/channels/{channel_id}",
     response_model=UserChannelPublic,
@@ -506,7 +691,10 @@ async def _dispatch_user_test(
 @router.post(
     "/channels/test",
     response_model=ChannelTestResult,
-    dependencies=[Depends(require_csrf)],
+    dependencies=[
+        Depends(require_csrf),
+        Depends(require_channel_test_throttle),
+    ],
 )
 async def test_user_channel_config(
     body: ChannelTestRequest,
@@ -526,7 +714,10 @@ async def test_user_channel_config(
 @router.post(
     "/channels/{channel_id}/test",
     response_model=ChannelTestResult,
-    dependencies=[Depends(require_csrf)],
+    dependencies=[
+        Depends(require_csrf),
+        Depends(require_channel_test_throttle),
+    ],
 )
 async def test_saved_user_channel(
     channel_id: uuid.UUID,
@@ -608,7 +799,13 @@ async def create_user_subscription(
     memberships: "MembershipRepository" = Depends(get_membership_repo),
     db_session: "AsyncSession" = Depends(get_session),
 ) -> UserSubscriptionPublic:
-    from z4j_brain.errors import ForbiddenError
+    # Pre-existing bug fix (rolled into v1.0.14): this used to import
+    # ``ForbiddenError`` from ``z4j_brain.errors`` which does not
+    # exist - the brain reuses ``z4j_core.errors.AuthorizationError``
+    # (HTTP 403) for "authenticated but not allowed". Every call to
+    # POST /user/subscriptions on a project the caller is not a member
+    # of produced HTTP 500 instead of 403.
+    from z4j_brain.errors import AuthorizationError
     from z4j_brain.persistence.models.notification import UserSubscription
     from z4j_brain.persistence.repositories import (
         NotificationChannelRepository,
@@ -621,7 +818,7 @@ async def create_user_subscription(
         user_id=user.id, project_id=body.project_id,
     )
     if membership is None:
-        raise ForbiddenError(
+        raise AuthorizationError(
             "you are not a member of this project",
             details={"project_id": str(body.project_id)},
         )

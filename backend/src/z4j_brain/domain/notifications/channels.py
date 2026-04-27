@@ -262,22 +262,44 @@ _DNS_CACHE: dict[str, tuple[float, list[str]]] = {}
 _DNS_TTL = 30.0
 
 
-async def _resolve_cached(hostname: str) -> list[str]:
-    """Resolve ``hostname`` with a short TTL cache.
+#: Hard timeout on a DNS resolve (audit P-5, added v1.0.14). The OS
+#: resolver normally takes 5-50ms but a stale /etc/resolv.conf or
+#: a slow upstream resolver can block for 30s+. Wrapping in
+#: asyncio.wait_for caps the wait so a slow-DNS host can't block a
+#: REST handler indefinitely.
+_DNS_RESOLVE_TIMEOUT = 5.0
 
-    Returns a list of IP strings (may be empty if resolution failed).
-    Uses ``asyncio.to_thread`` so the event loop never blocks on a
-    slow resolver. Cache hits return without crossing the GIL.
+
+async def _resolve_cached(hostname: str) -> list[str]:
+    """Resolve ``hostname`` with a short TTL cache and timeout.
+
+    Returns a list of IP strings (may be empty if resolution failed
+    or timed out). Uses ``asyncio.to_thread`` so the event loop
+    never blocks on a slow resolver. Cache hits return without
+    crossing the GIL.
+
+    Per audit P-5 (v1.0.14+) the resolve is wrapped in
+    ``asyncio.wait_for(_DNS_RESOLVE_TIMEOUT)`` so a hostname that
+    points at a black-holed DNS server can't pin a REST request for
+    the OS resolver's full retry budget (often 30s). On timeout the
+    cache stores an empty result for the TTL window so we don't
+    re-attempt every 100ms during a flood.
     """
     now = time.monotonic()
     entry = _DNS_CACHE.get(hostname)
     if entry is not None and entry[0] > now:
         return entry[1]
     try:
-        infos = await asyncio.to_thread(
-            socket.getaddrinfo, hostname, None, socket.AF_UNSPEC,
+        infos = await asyncio.wait_for(
+            asyncio.to_thread(
+                socket.getaddrinfo, hostname, None, socket.AF_UNSPEC,
+            ),
+            timeout=_DNS_RESOLVE_TIMEOUT,
         )
-    except socket.gaierror:
+    except (socket.gaierror, TimeoutError):
+        # Both no-such-host and slow-resolver land here. Cache the
+        # negative result so a flood of requests for the same bad
+        # hostname doesn't multiply the wait.
         _DNS_CACHE[hostname] = (now + _DNS_TTL, [])
         return []
     ips: list[str] = []
@@ -971,6 +993,295 @@ async def deliver_telegram(
 
 
 # ---------------------------------------------------------------------------
+# PagerDuty (Events API v2 - one POST per alert, integration key in body)
+# ---------------------------------------------------------------------------
+
+
+#: Allowed PagerDuty severity levels per Events API v2.
+#: https://developer.pagerduty.com/docs/events-api-v2/trigger-events/
+_PAGERDUTY_SEVERITIES = frozenset({"critical", "error", "warning", "info"})
+
+#: Default mapping from z4j trigger -> PagerDuty severity. Operators
+#: can override per-trigger via config["severity_map"]. Choices:
+#: agent.offline -> critical (production outage signal)
+#: task.failed -> error (something is wrong but the system is up)
+#: task.retried, task.slow -> warning (degraded but recovering)
+#: task.succeeded, agent.online -> info (audit-trail level)
+_DEFAULT_SEVERITY_MAP: dict[str, str] = {
+    "agent.offline": "critical",
+    "agent.online": "info",
+    "task.failed": "error",
+    "task.retried": "warning",
+    "task.slow": "warning",
+    "task.succeeded": "info",
+}
+
+
+def validate_pagerduty_config(config: dict[str, Any]) -> str | None:
+    """Return error string or None if config is acceptable.
+
+    Required: integration_key (32-char routing key from a PD service's
+    Events API v2 integration). Optional: severity_default (one of
+    critical/error/warning/info), severity_map (per-trigger override).
+    """
+    key = config.get("integration_key", "")
+    if not isinstance(key, str) or not key.strip():
+        return "missing integration_key (32-char routing key from PagerDuty)"
+    # PD integration keys are 32 hex chars, but we accept any 8-64 char
+    # printable string in case PD changes the format. Reject obvious
+    # smells (whitespace, control chars).
+    if not re.fullmatch(r"[A-Za-z0-9_-]{8,64}", key.strip()):
+        return "integration_key must be 8-64 chars [A-Za-z0-9_-]"
+    sev = config.get("severity_default", "warning")
+    if sev not in _PAGERDUTY_SEVERITIES:
+        return f"severity_default must be one of {sorted(_PAGERDUTY_SEVERITIES)}"
+    smap = config.get("severity_map", {})
+    if not isinstance(smap, dict):
+        return "severity_map must be an object {trigger: severity}"
+    # Cap dict size so a hostile or accidental large config can't
+    # bloat the channel row or amplify dispatch-time payload merge
+    # work (audit M-3). 32 is well above the universe of triggers
+    # z4j supports today (~6) with headroom for future additions.
+    if len(smap) > 32:
+        return f"severity_map has too many entries ({len(smap)} > 32)"
+    # Trigger pattern matches the project subscription trigger enum
+    # plus the synthetic "test.dispatch" so test rows can be mapped
+    # to a custom severity if the operator wants.
+    _trigger_pattern = re.compile(
+        r"^(task\.failed|task\.succeeded|task\.retried|task\.slow|"
+        r"agent\.offline|agent\.online|test\.dispatch)$",
+    )
+    for trig, mapped in smap.items():
+        # Audit M-3: enforce that keys are strings AND match a known
+        # trigger pattern. Pre-1.0.14 the loop accepted any key type
+        # (None, ints, bools) which would crash the dispatcher mid-
+        # loop on str-only ops elsewhere.
+        if not isinstance(trig, str):
+            return (
+                f"severity_map keys must be strings (got {type(trig).__name__})"
+            )
+        if not _trigger_pattern.fullmatch(trig):
+            return (
+                f"severity_map[{trig!r}] is not a recognized trigger "
+                f"(must match task.* / agent.* / test.dispatch)"
+            )
+        if mapped not in _PAGERDUTY_SEVERITIES:
+            return (
+                f"severity_map[{trig!r}]={mapped!r} is not a valid PD "
+                f"severity (one of {sorted(_PAGERDUTY_SEVERITIES)})"
+            )
+    return None
+
+
+async def deliver_pagerduty(
+    config: dict[str, Any],
+    payload: dict[str, Any],
+) -> DeliveryResult:
+    """POST a trigger event to the PagerDuty Events API v2.
+
+    Constructs the canonical payload shape PagerDuty expects:
+
+      {"routing_key": "...", "event_action": "trigger",
+       "dedup_key": "<project>/<trigger>/<task_id>",
+       "payload": {
+         "summary": "z4j: <trigger> on <task_name>",
+         "source": "<project_id>",
+         "severity": "<critical|error|warning|info>",
+         "custom_details": {...full payload...},
+       }}
+
+    The dedup_key collapses repeat firings of the same alert into one
+    PagerDuty incident (e.g. agent.offline retried every minute won't
+    page someone 60 times - PD groups by dedup_key).
+    """
+    integration_key = config.get("integration_key", "").strip()
+    if not integration_key:
+        return DeliveryResult(
+            success=False,
+            error="PagerDuty config incomplete (need integration_key)",
+        )
+
+    trigger = str(payload.get("trigger", "notification"))
+    task_name = str(payload.get("task_name", ""))
+    task_id = str(payload.get("task_id", ""))
+    project_id = str(payload.get("project_id", "z4j"))
+
+    # Severity: per-trigger override > config default > built-in default.
+    severity_map = {**_DEFAULT_SEVERITY_MAP, **config.get("severity_map", {})}
+    severity = severity_map.get(
+        trigger,
+        config.get("severity_default", "warning"),
+    )
+    if severity not in _PAGERDUTY_SEVERITIES:
+        severity = "warning"  # paranoia after a config edit gone wrong
+
+    # dedup_key: collapses repeat firings into one PD incident. We
+    # include task_id (when present) so distinct task failures don't
+    # collapse together; trigger-only events (agent.offline) collapse
+    # by (project, trigger, agent).
+    dedup_parts = [project_id, trigger]
+    if task_id:
+        dedup_parts.append(task_id)
+    elif payload.get("agent_id"):
+        dedup_parts.append(str(payload["agent_id"]))
+    dedup_key = "/".join(dedup_parts)[:255]  # PD caps at 255 chars
+
+    summary_parts = [f"z4j: {trigger}"]
+    if task_name:
+        summary_parts.append(f"on `{task_name}`")
+    summary = " ".join(summary_parts)[:1024]  # PD caps at 1024
+
+    body = {
+        "routing_key": integration_key,
+        "event_action": "trigger",
+        "dedup_key": dedup_key,
+        "payload": {
+            "summary": summary,
+            "source": project_id,
+            "severity": severity,
+            "component": str(payload.get("agent_name") or "z4j-brain"),
+            "group": trigger,
+            "class": "z4j.notification",
+            "custom_details": {
+                k: v for k, v in payload.items()
+                # PD's UI handles ~64KB of custom_details; trim very
+                # large fields to keep page-load fast.
+                if not (isinstance(v, str) and len(v) > 4096)
+            },
+        },
+    }
+
+    url = "https://events.pagerduty.com/v2/enqueue"
+    try:
+        # Defense-in-depth DNS pin at dispatch time. events.pagerduty.com
+        # is trusted-public, but consistent treatment with the other
+        # public-host dispatchers (Telegram, Slack) prevents drift.
+        err, safe_ip = await resolve_and_pin(url)
+        if err is not None:
+            return DeliveryResult(
+                success=False,
+                error=f"unsafe pagerduty URL at dispatch: {err}",
+            )
+        resp = await _post(
+            url,
+            json=body,
+            headers={"Content-Type": "application/json"},
+            pin_ip=safe_ip,
+        )
+        # PD returns 202 Accepted on success. 4xx = client error
+        # (bad routing key, malformed payload). 5xx = retry.
+        return DeliveryResult(
+            success=resp.status_code == 202,
+            status_code=resp.status_code,
+            response_body=resp.text[:500],
+        )
+    except Exception as exc:
+        return DeliveryResult(success=False, error=str(exc)[:500])
+
+
+# ---------------------------------------------------------------------------
+# Discord (incoming webhook - Slack-compatible payload via /slack endpoint)
+# ---------------------------------------------------------------------------
+
+
+def validate_discord_config(config: dict[str, Any]) -> str | None:
+    """Discord webhooks live at ``discord.com/api/webhooks/<id>/<token>``.
+
+    We intentionally do NOT enforce that hostname here - the SSRF
+    helpers in :func:`validate_webhook_url` reject private IPs and
+    bad schemes already, and a strict hostname check would break
+    proxied / forwarded setups. The dispatcher hits the webhook URL
+    verbatim (with optional ``/slack`` suffix to accept Slack payloads).
+    """
+    url = config.get("webhook_url", "")
+    if not isinstance(url, str) or not url.strip():
+        return "missing webhook_url"
+    return None
+
+
+async def deliver_discord(
+    config: dict[str, Any],
+    payload: dict[str, Any],
+) -> DeliveryResult:
+    """POST a notification to a Discord incoming webhook.
+
+    Discord webhooks accept a Slack-compatible payload when the URL
+    has the ``/slack`` suffix. We auto-append it so operators only
+    need to paste the canonical webhook URL Discord shows them in
+    Server Settings -> Integrations -> Webhooks.
+    """
+    webhook_url = config.get("webhook_url", "").strip()
+    if not webhook_url:
+        return DeliveryResult(
+            success=False,
+            error="Discord webhook URL is empty",
+        )
+
+    # SSRF protection - same checks the generic webhook dispatcher runs.
+    ssrf_error = await validate_webhook_url(webhook_url)
+    if ssrf_error:
+        return DeliveryResult(
+            success=False,
+            error=f"blocked: {ssrf_error}",
+        )
+
+    # Discord's Slack-compat endpoint accepts the same Block Kit-ish
+    # payload deliver_slack already constructs, but Discord doesn't
+    # render Slack Block Kit blocks - it falls back to the `text`
+    # field. So we build a single text message instead.
+    trigger = payload.get("trigger", "notification")
+    task_name = payload.get("task_name", "")
+    priority = payload.get("priority", "normal")
+    state = payload.get("state", "")
+    task_id = payload.get("task_id", "")
+
+    emoji = {"critical": "🔴", "high": "🟠", "normal": "🔵", "low": "⚪"}.get(
+        priority, "🔵",
+    )
+    lines = [
+        f"{emoji} **z4j: {trigger}**",
+        f"Task: `{task_name}`" if task_name else None,
+        f"State: {state}" if state else None,
+        f"Priority: {priority}",
+        f"ID: `{task_id[:12]}`" if task_id else None,
+    ]
+    exception = payload.get("exception")
+    if exception:
+        lines.append(f"```{exception[:1500]}```")
+    text = "\n".join(line for line in lines if line)
+
+    # Auto-append /slack so operators paste the canonical webhook URL.
+    target_url = webhook_url.rstrip("/")
+    if not target_url.endswith("/slack"):
+        target_url = target_url + "/slack"
+
+    body = {"text": text, "username": "z4j"}
+
+    try:
+        err, safe_ip = await resolve_and_pin(target_url)
+        if err is not None:
+            return DeliveryResult(
+                success=False,
+                error=f"unsafe discord URL at dispatch: {err}",
+            )
+        resp = await _post(
+            target_url,
+            json=body,
+            headers={"Content-Type": "application/json"},
+            pin_ip=safe_ip,
+        )
+        # Discord returns 204 No Content on success for the /slack
+        # endpoint (200 from /slack?wait=true).
+        return DeliveryResult(
+            success=resp.status_code in (200, 204),
+            status_code=resp.status_code,
+            response_body=resp.text[:500],
+        )
+    except Exception as exc:
+        return DeliveryResult(success=False, error=str(exc)[:500])
+
+
+# ---------------------------------------------------------------------------
 # Dispatch router
 # ---------------------------------------------------------------------------
 
@@ -980,17 +1291,23 @@ CHANNEL_DISPATCHERS = {
     "email": deliver_email,
     "slack": deliver_slack,
     "telegram": deliver_telegram,
+    "pagerduty": deliver_pagerduty,
+    "discord": deliver_discord,
 }
 
 
 __all__ = [
     "CHANNEL_DISPATCHERS",
     "DeliveryResult",
+    "deliver_discord",
     "deliver_email",
+    "deliver_pagerduty",
     "deliver_slack",
     "deliver_telegram",
     "deliver_webhook",
     "set_shared_client",
+    "validate_discord_config",
+    "validate_pagerduty_config",
     "validate_webhook_headers",
     "validate_webhook_url",
 ]

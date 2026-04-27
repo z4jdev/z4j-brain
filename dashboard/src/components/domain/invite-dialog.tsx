@@ -84,7 +84,7 @@ export function InviteDialog({ slug }: { slug: string }) {
   return (
     <Dialog open={open} onOpenChange={setOpen}>
       <DialogTrigger asChild>
-        <Button>
+        <Button size="sm">
           <UserPlus className="size-4" />
           Invite
         </Button>

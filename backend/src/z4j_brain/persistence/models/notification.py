@@ -78,6 +78,16 @@ class ChannelType:
     EMAIL = "email"
     SLACK = "slack"
     TELEGRAM = "telegram"
+    #: PagerDuty Events API v2 - one POST per alert. Config:
+    #: ``{"integration_key": "...", "severity_default": "warning",
+    #: "severity_map": {"task.failed": "error", "agent.offline":
+    #: "critical", ...}}``. Added v1.0.14.
+    PAGERDUTY = "pagerduty"
+    #: Discord incoming webhook - accepts a Slack-compatible payload
+    #: when posted to ``<webhook_url>/slack``. Config:
+    #: ``{"webhook_url": "https://discord.com/api/webhooks/..."}``.
+    #: Added v1.0.14.
+    DISCORD = "discord"
 
 
 class TriggerType:
@@ -454,6 +464,16 @@ class NotificationDelivery(PKMixin, Base):
     response_code: Mapped[int | None] = mapped_column(Integer, nullable=True)
     response_body: Mapped[str | None] = mapped_column(Text, nullable=True)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Snapshot at insert time (audit L-2, added v1.0.14). Pre-1.0.14
+    # the dashboard resolved channel_name + channel_type via a live
+    # join on read - which let an admin rename a channel after a
+    # sensitive dispatch and retroactively rewrite the audit story.
+    # Snapshotting at write time freezes the audit row's view of
+    # what destination it actually went to. NULL for pre-1.0.14
+    # rows (the migration doesn't backfill); the read path falls
+    # back to a live join when both snapshot fields are NULL.
+    channel_name: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    channel_type: Mapped[str | None] = mapped_column(String(20), nullable=True)
     sent_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,

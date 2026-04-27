@@ -13,17 +13,21 @@ import {
   CheckCircle2,
   Globe,
   Mail,
-  MessageSquare,
   Pencil,
   Plus,
   RefreshCw,
-  Send,
   TestTube,
   Trash2,
   Webhook,
   X,
   XCircle,
 } from "lucide-react";
+import {
+  DiscordIcon,
+  PagerDutyIcon,
+  SlackIcon,
+  TelegramIcon,
+} from "@/components/icons/brand-icons";
 import { toast } from "sonner";
 import { useConfirm } from "@/components/domain/confirm-dialog";
 import { EmptyState } from "@/components/domain/empty-state";
@@ -39,6 +43,12 @@ import {
   DialogTitle,
   DialogTrigger,
 } from "@/components/ui/dialog";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import {
@@ -54,12 +64,15 @@ import {
   useChannels,
   useCreateChannel,
   useDeleteChannel,
+  useImportChannelFromUser,
   useTestChannel,
   useTestChannelConfig,
   useUpdateChannel,
+  useUserChannels,
   type ChannelType,
   type ChannelTestResult,
   type NotificationChannel,
+  type UserChannel,
 } from "@/hooks/use-notifications";
 
 export const Route = createFileRoute(
@@ -71,8 +84,10 @@ export const Route = createFileRoute(
 const CHANNEL_ICONS = {
   webhook: Webhook,
   email: Mail,
-  slack: MessageSquare,
-  telegram: Send,
+  slack: SlackIcon,
+  telegram: TelegramIcon,
+  pagerduty: PagerDutyIcon,
+  discord: DiscordIcon,
 } as const;
 
 /**
@@ -91,6 +106,7 @@ function ProvidersPage() {
     | { mode: "closed" }
     | { mode: "create" }
     | { mode: "edit"; channel: NotificationChannel }
+    | { mode: "import" }
   >({ mode: "closed" });
   // Per-card test result so the Test button produces visible
   // feedback even if the corner toast is missed. Keyed by
@@ -120,8 +136,8 @@ function ProvidersPage() {
   return (
     <div className="space-y-4">
       {confirmDialog}
-      <div className="flex items-center justify-between">
-        <div>
+      <div className="flex items-start justify-between gap-4">
+        <div className="min-w-0 flex-1">
           <h3 className="text-sm font-semibold">
             Project Channels
             {isFetching && !isLoading && (
@@ -134,23 +150,42 @@ function ProvidersPage() {
             private destinations, use Global Settings → My Channels.
           </p>
         </div>
+        <DropdownMenu>
+          <DropdownMenuTrigger asChild>
+            <Button size="sm">
+              <Plus className="size-4" />
+              Add Channel
+            </Button>
+          </DropdownMenuTrigger>
+          <DropdownMenuContent align="end" className="w-72">
+            <DropdownMenuItem
+              onClick={() => setDialogState({ mode: "create" })}
+              className="flex flex-col items-start gap-0.5"
+            >
+              <span className="font-medium">From scratch</span>
+              <span className="text-xs text-muted-foreground">
+                Create a new channel and enter credentials.
+              </span>
+            </DropdownMenuItem>
+            <DropdownMenuItem
+              onClick={() => setDialogState({ mode: "import" })}
+              className="flex flex-col items-start gap-0.5"
+            >
+              <span className="font-medium">Import from My Channels</span>
+              <span className="text-xs text-muted-foreground">
+                Copy one of your personal destinations into the project.
+              </span>
+            </DropdownMenuItem>
+          </DropdownMenuContent>
+        </DropdownMenu>
         <Dialog
           open={dialogState.mode !== "closed"}
           onOpenChange={(open) => {
             if (!open) closeDialog();
           }}
         >
-          <DialogTrigger asChild>
-            <Button
-              size="sm"
-              onClick={() => setDialogState({ mode: "create" })}
-            >
-              <Plus className="size-4" />
-              Add Channel
-            </Button>
-          </DialogTrigger>
           <DialogContent>
-            {dialogState.mode !== "closed" && (
+            {dialogState.mode === "create" || dialogState.mode === "edit" ? (
               <ChannelDialog
                 slug={slug}
                 mode={dialogState.mode}
@@ -159,7 +194,12 @@ function ProvidersPage() {
                 }
                 onClose={closeDialog}
               />
-            )}
+            ) : dialogState.mode === "import" ? (
+              <ImportFromUserDialog
+                slug={slug}
+                onClose={closeDialog}
+              />
+            ) : null}
           </DialogContent>
         </Dialog>
       </div>
@@ -209,6 +249,12 @@ function ProvidersPage() {
                     {ch.type === "telegram" &&
                       typeof ch.config.chat_id === "string" &&
                       ` · chat ${ch.config.chat_id}`}
+                    {ch.type === "pagerduty" &&
+                      typeof ch.config.severity_default === "string" &&
+                      ` · default severity: ${ch.config.severity_default}`}
+                    {ch.type === "discord" &&
+                      typeof ch.config.webhook_url === "string" &&
+                      ` · discord.com/api/webhooks/...`}
                   </p>
                 </div>
                 <div className="flex shrink-0 items-center">
@@ -302,7 +348,7 @@ function ProvidersPage() {
                     aria-live="polite"
                     className={
                       testResult.success
-                        ? "rounded-md border border-success/40 bg-success/10 px-3 py-2 text-xs text-success-foreground"
+                        ? "rounded-md border border-success/40 bg-success/10 px-3 py-2 text-xs text-success"
                         : "rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-xs text-destructive"
                     }
                   >
@@ -350,6 +396,171 @@ function ProvidersPage() {
 // Channel dialog - handles create AND edit
 // ---------------------------------------------------------------------------
 
+interface ImportFromUserDialogProps {
+  slug: string;
+  onClose: () => void;
+}
+
+/**
+ * Picker dialog for importing one of the operator's personal channels
+ * into the current project. Backend-side copy: the secret never
+ * crosses the wire (see useImportChannelFromUser).
+ */
+function ImportFromUserDialog({ slug, onClose }: ImportFromUserDialogProps) {
+  const { data: userChannels, isLoading } = useUserChannels();
+  const importChannel = useImportChannelFromUser(slug);
+  // Multi-select with select-all toggle. See notes on the
+  // ImportFromProjectDialog twin for why we batch toasts.
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+  const [submitting, setSubmitting] = useState(false);
+
+  const toggleSelected = (id: string) => {
+    setSelectedIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  };
+
+  const allChecked =
+    userChannels !== undefined &&
+    userChannels.length > 0 &&
+    selectedIds.size === userChannels.length;
+
+  const toggleAll = () => {
+    if (!userChannels) return;
+    if (allChecked) setSelectedIds(new Set());
+    else setSelectedIds(new Set(userChannels.map((c) => c.id)));
+  };
+
+  const handleImport = async () => {
+    if (selectedIds.size === 0) return;
+    setSubmitting(true);
+    let okCount = 0;
+    const failures: string[] = [];
+    for (const id of selectedIds) {
+      const ch = userChannels?.find((c) => c.id === id);
+      try {
+        await importChannel.mutateAsync({ user_channel_id: id });
+        okCount += 1;
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        failures.push(`${ch?.name ?? id}: ${msg}`);
+      }
+    }
+    setSubmitting(false);
+    if (okCount > 0) {
+      toast.success(
+        okCount === 1
+          ? "Imported 1 channel"
+          : `Imported ${okCount} channels`,
+      );
+    }
+    if (failures.length > 0) {
+      toast.error(
+        failures.length === 1
+          ? `Import failed: ${failures[0]}`
+          : `${failures.length} imports failed (e.g. ${failures[0]})`,
+      );
+    }
+    if (okCount > 0 && failures.length === 0) onClose();
+  };
+
+  return (
+    <>
+      <DialogHeader>
+        <DialogTitle>Import from My Channels</DialogTitle>
+      </DialogHeader>
+      <div className="mt-4 space-y-4">
+        <p className="text-sm text-muted-foreground">
+          Pick one or more personal channels to copy into this project.
+          Secrets (bot token, integration key, password) are copied
+          server-side and never displayed. Each imported channel is
+          named &quot;Copy of {"{name}"}&quot;.
+        </p>
+        {isLoading && <Skeleton className="h-32 w-full" />}
+        {userChannels && userChannels.length === 0 && (
+          <div className="rounded-md border border-border bg-muted/40 p-4 text-sm text-muted-foreground">
+            You have no personal channels yet. Create one in{" "}
+            <a href="/settings/channels" className="underline">
+              Settings → My Channels
+            </a>{" "}
+            first.
+          </div>
+        )}
+        {userChannels && userChannels.length > 0 && (
+          <div className="space-y-2">
+            <div className="flex items-center justify-between">
+              <Label>Source channels</Label>
+              <button
+                type="button"
+                onClick={toggleAll}
+                className="text-xs text-primary hover:underline"
+              >
+                {allChecked ? "Clear all" : "Select all"}
+              </button>
+            </div>
+            <div className="max-h-72 overflow-y-auto rounded-md border border-border">
+              {userChannels.map((ch) => {
+                const Icon =
+                  CHANNEL_ICONS[ch.type as keyof typeof CHANNEL_ICONS] ?? Globe;
+                const isChecked = selectedIds.has(ch.id);
+                return (
+                  <label
+                    key={ch.id}
+                    className={`flex cursor-pointer items-center gap-3 border-b border-border/50 px-3 py-2.5 text-sm last:border-b-0 hover:bg-muted/50 ${
+                      isChecked ? "bg-primary/10" : ""
+                    }`}
+                  >
+                    <input
+                      type="checkbox"
+                      checked={isChecked}
+                      onChange={() => toggleSelected(ch.id)}
+                      className="size-4 shrink-0 cursor-pointer accent-primary"
+                    />
+                    <Icon className="size-4 shrink-0 text-muted-foreground" />
+                    <div className="min-w-0 flex-1">
+                      <div className="font-medium">{ch.name}</div>
+                      <div className="text-xs text-muted-foreground">
+                        {ch.type}
+                        {!ch.is_active && " · disabled"}
+                      </div>
+                    </div>
+                  </label>
+                );
+              })}
+            </div>
+          </div>
+        )}
+      </div>
+      <DialogFooter className="mt-6">
+        <Button
+          type="button"
+          variant="outline"
+          onClick={onClose}
+          disabled={submitting}
+        >
+          Cancel
+        </Button>
+        <Button
+          type="button"
+          onClick={handleImport}
+          disabled={selectedIds.size === 0 || submitting}
+        >
+          {submitting
+            ? `Importing ${selectedIds.size}...`
+            : selectedIds.size === 0
+              ? "Import"
+              : selectedIds.size === 1
+                ? "Import 1 channel"
+                : `Import ${selectedIds.size} channels`}
+        </Button>
+      </DialogFooter>
+    </>
+  );
+}
+
 interface ChannelDialogProps {
   slug: string;
   mode: "create" | "edit";
@@ -390,6 +601,9 @@ function ChannelDialog({ slug, mode, channel, onClose }: ChannelDialogProps) {
   const [slackUrl, setSlackUrl] = useState(initial.slackUrl);
   const [botToken, setBotToken] = useState(initial.botToken);
   const [chatId, setChatId] = useState(initial.chatId);
+  const [pdKey, setPdKey] = useState(initial.pdKey);
+  const [pdSeverity, setPdSeverity] = useState(initial.pdSeverity);
+  const [discordUrl, setDiscordUrl] = useState(initial.discordUrl);
 
   // When the user switches channel type in create mode, clear the
   // type-specific state so an abandoned-webhook URL doesn't leak
@@ -406,6 +620,9 @@ function ChannelDialog({ slug, mode, channel, onClose }: ChannelDialogProps) {
     setSlackUrl("");
     setBotToken("");
     setChatId("");
+    setPdKey("");
+    setPdSeverity("warning");
+    setDiscordUrl("");
   }, [type, mode]);
 
   /**
@@ -446,6 +663,19 @@ function ChannelDialog({ slug, mode, channel, onClose }: ChannelDialogProps) {
         if (tok !== undefined) cfg.bot_token = tok;
         return cfg;
       }
+      case "pagerduty": {
+        // integration_key is treated as a secret in edit mode (the
+        // backend masks it on read). Skip it when blank to keep the
+        // stored value via _safe_merge_config.
+        const cfg: Record<string, unknown> = {
+          severity_default: pdSeverity || "warning",
+        };
+        const key = keepIfBlank(pdKey);
+        if (key !== undefined) cfg.integration_key = key;
+        return cfg;
+      }
+      case "discord":
+        return { webhook_url: discordUrl };
       default:
         return {};
     }
@@ -557,6 +787,8 @@ function ChannelDialog({ slug, mode, channel, onClose }: ChannelDialogProps) {
               <SelectItem value="email">Email (SMTP)</SelectItem>
               <SelectItem value="slack">Slack</SelectItem>
               <SelectItem value="telegram">Telegram</SelectItem>
+              <SelectItem value="pagerduty">PagerDuty</SelectItem>
+              <SelectItem value="discord">Discord</SelectItem>
             </SelectContent>
           </Select>
           {mode === "edit" && (
@@ -788,6 +1020,80 @@ function ChannelDialog({ slug, mode, channel, onClose }: ChannelDialogProps) {
             </div>
           </>
         )}
+
+        {type === "pagerduty" && (
+          <>
+            <div className="space-y-2">
+              <Label htmlFor="new-channel-pd-key">Integration key</Label>
+              <Input
+                id="new-channel-pd-key"
+                placeholder={
+                  mode === "edit"
+                    ? "Leave blank to keep current"
+                    : "32-char routing key from PagerDuty"
+                }
+                value={pdKey}
+                onChange={(e) => setPdKey(e.target.value)}
+                required={mode === "create"}
+              />
+              <p className="text-xs text-muted-foreground">
+                In PagerDuty: Service → Integrations → +Add Integration →
+                Events API v2. Copy the{" "}
+                <span className="font-mono">Integration Key</span>.
+              </p>
+            </div>
+            <div className="space-y-2">
+              <Label htmlFor="new-channel-pd-severity">
+                Default severity
+              </Label>
+              <Select
+                value={pdSeverity}
+                onValueChange={(v) => setPdSeverity(v)}
+              >
+                <SelectTrigger id="new-channel-pd-severity">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="critical">critical</SelectItem>
+                  <SelectItem value="error">error</SelectItem>
+                  <SelectItem value="warning">warning (default)</SelectItem>
+                  <SelectItem value="info">info</SelectItem>
+                </SelectContent>
+              </Select>
+              <p className="text-xs text-muted-foreground">
+                z4j auto-maps known triggers (
+                <span className="font-mono">agent.offline</span> →{" "}
+                <span className="font-mono">critical</span>,{" "}
+                <span className="font-mono">task.failed</span> →{" "}
+                <span className="font-mono">error</span>). This default
+                applies to anything else.
+              </p>
+            </div>
+          </>
+        )}
+
+        {type === "discord" && (
+          <div className="space-y-2">
+            <Label htmlFor="new-channel-discord-url">
+              Discord webhook URL
+            </Label>
+            <Input
+              id="new-channel-discord-url"
+              type="url"
+              pattern="https://discord(app)?\.com/api/webhooks/.*"
+              placeholder="https://discord.com/api/webhooks/.../..."
+              title="Must be a Discord webhook URL"
+              value={discordUrl}
+              onChange={(e) => setDiscordUrl(e.target.value)}
+              required
+            />
+            <p className="text-xs text-muted-foreground">
+              In Discord: Server Settings → Integrations → Webhooks → New
+              Webhook. Paste the canonical URL — z4j auto-appends{" "}
+              <span className="font-mono">/slack</span> at dispatch time.
+            </p>
+          </div>
+        )}
       </div>
       {testResult && (
         <Alert
@@ -885,6 +1191,9 @@ interface FormFields {
   slackUrl: string;
   botToken: string;
   chatId: string;
+  pdKey: string;
+  pdSeverity: string;
+  discordUrl: string;
 }
 
 function extractFormFields(ch: NotificationChannel | undefined): FormFields {
@@ -900,6 +1209,9 @@ function extractFormFields(ch: NotificationChannel | undefined): FormFields {
     slackUrl: "",
     botToken: "",
     chatId: "",
+    pdKey: "",
+    pdSeverity: "warning",
+    discordUrl: "",
   };
   if (!ch) return empty;
   const cfg = ch.config ?? {};
@@ -913,6 +1225,11 @@ function extractFormFields(ch: NotificationChannel | undefined): FormFields {
     const s = str(v);
     return s === MASK ? "" : s;
   };
+  // Discord and Slack both store their webhook in `webhook_url` -
+  // disambiguate by the channel's `type` so an edit on a Discord
+  // channel doesn't accidentally pre-fill the Slack input.
+  const isDiscord = ch.type === "discord";
+  const isSlack = ch.type === "slack";
   return {
     name: ch.name,
     url: str(cfg.url),
@@ -925,8 +1242,11 @@ function extractFormFields(ch: NotificationChannel | undefined): FormFields {
     smtpPass: unmask(cfg.smtp_pass),
     fromAddr: str(cfg.from_addr),
     toAddrs: toAddrsVal(cfg.to_addrs),
-    slackUrl: str(cfg.webhook_url),
+    slackUrl: isSlack ? str(cfg.webhook_url) : "",
     botToken: unmask(cfg.bot_token),
     chatId: str(cfg.chat_id),
+    pdKey: unmask(cfg.integration_key),
+    pdSeverity: str(cfg.severity_default) || "warning",
+    discordUrl: isDiscord ? str(cfg.webhook_url) : "",
   };
 }

@@ -19,12 +19,13 @@ under the ``/api/v1/user/`` prefix.
 
 from __future__ import annotations
 
+import copy
 import uuid
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, Literal
 
-from fastapi import APIRouter, Depends, Query
-from pydantic import BaseModel, Field
+from fastapi import APIRouter, Depends, Query, Request
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy.exc import IntegrityError
 
 from z4j_brain.api.deps import (
@@ -33,6 +34,10 @@ from z4j_brain.api.deps import (
     get_project_repo,
     get_session,
     require_csrf,
+)
+from z4j_brain.domain.ip_rate_limit import (
+    require_channel_import_throttle,
+    require_channel_test_throttle,
 )
 from z4j_brain.domain.notifications.channels import (
     validate_webhook_headers,
@@ -66,7 +71,39 @@ _TRIGGER_PATTERN = (
     r"^(task\.failed|task\.succeeded|task\.retried|"
     r"task\.slow|agent\.offline|agent\.online)$"
 )
-_CHANNEL_TYPE_PATTERN = r"^(webhook|email|slack|telegram)$"
+_CHANNEL_TYPE_PATTERN = r"^(webhook|email|slack|telegram|pagerduty|discord)$"
+
+
+#: Hard cap on the JSON-serialized size of a channel config dict.
+#: 16 KiB is comfortably more than the largest legitimate config
+#: (an SMTP block with full server cert chain runs ~4 KiB) but
+#: rejects abusive 1 MiB payloads before they hit the DB / are
+#: re-serialized into HMAC bodies / copied into PD custom_details.
+#: Audit P-8 (added v1.0.14).
+_CHANNEL_CONFIG_MAX_BYTES = 16 * 1024
+
+
+def _validate_config_size(config: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Reject channel configs whose JSON form exceeds the hard cap.
+
+    Used as a pydantic ``field_validator`` on every ``config`` field
+    in this module + ``user_notifications`` so the size cap is
+    enforced at the request boundary, before anything writes to the
+    DB or constructs a delivery payload.
+    """
+    if config is None:
+        return None
+    import json as _json
+
+    try:
+        size = len(_json.dumps(config, ensure_ascii=False).encode("utf-8"))
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"config must be JSON-serialisable: {exc}") from exc
+    if size > _CHANNEL_CONFIG_MAX_BYTES:
+        raise ValueError(
+            f"config too large ({size} bytes; max {_CHANNEL_CONFIG_MAX_BYTES})",
+        )
+    return config
 
 
 class ChannelCreate(BaseModel):
@@ -75,11 +112,45 @@ class ChannelCreate(BaseModel):
     config: dict[str, Any] = Field(default_factory=dict)
     is_active: bool = True
 
+    @field_validator("config")
+    @classmethod
+    def _check_config_size(cls, v: dict[str, Any]) -> dict[str, Any]:
+        return _validate_config_size(v) or {}
+
 
 class ChannelUpdate(BaseModel):
     name: str | None = Field(default=None, min_length=1, max_length=200)
     config: dict[str, Any] | None = None
     is_active: bool | None = None
+
+    @field_validator("config")
+    @classmethod
+    def _check_config_size(cls, v: dict[str, Any] | None) -> dict[str, Any] | None:
+        return _validate_config_size(v)
+
+
+class ChannelImportFromUserRequest(BaseModel):
+    """Body for ``POST /channels/import_from_user`` (added v1.0.14).
+
+    Operator already has a personal channel with verified credentials
+    (Telegram bot token, Slack webhook, PagerDuty integration key,
+    etc.) and wants to share that destination with the project
+    without re-pasting the secret. Backend copies the row server-side
+    so the unmasked secret never crosses the wire.
+
+    The source must be owned by the caller (anti-takeover: an admin
+    can't import another user's personal channel into their project).
+    """
+    user_channel_id: uuid.UUID
+    name: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=200,
+        description=(
+            "Override the imported channel's name. Defaults to "
+            "'Copy of {original}' if omitted."
+        ),
+    )
 
 
 class ChannelPublic(BaseModel):
@@ -105,6 +176,11 @@ class ChannelTestRequest(BaseModel):
 
     type: str = Field(pattern=_CHANNEL_TYPE_PATTERN)
     config: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("config")
+    @classmethod
+    def _check_config_size(cls, v: dict[str, Any]) -> dict[str, Any]:
+        return _validate_config_size(v) or {}
 
 
 class ChannelTestResult(BaseModel):
@@ -140,6 +216,44 @@ class SubscriptionFilters(BaseModel):
     queue: str | None = Field(default=None, max_length=200)
     model_config = {"extra": "forbid"}
 
+    @field_validator("task_name_pattern")
+    @classmethod
+    def _check_pattern_complexity(cls, v: str | None) -> str | None:
+        """Reject pathologically catastrophic-backtracking fnmatch patterns.
+
+        ``fnmatch`` translates to a regex via ``fnmatch.translate``. A
+        pattern like ``"a*a*a*a*a*a*a*a*a*a*a*a*a*b"`` compiles to a
+        regex that is exponentially backtracking on long inputs (a
+        20+ char task name takes seconds). Since this filter runs
+        synchronously per event in the WS frame ingest path
+        (``NotificationService._matches_filters``), a hostile
+        subscription is a ReDoS DoS vector against event ingestion.
+
+        We bound complexity by counting wildcards (``*`` and ``?``)
+        and character classes (``[...]``). Realistic operator
+        patterns use 1-3 wildcards (``"my_app.*.send_email"``);
+        20+ wildcards is always pathological.
+
+        Audit P-2 (added v1.0.14).
+        """
+        if v is None:
+            return None
+        wildcard_count = v.count("*") + v.count("?")
+        # Each "[...]" character class is one bracket open.
+        bracket_count = v.count("[")
+        if wildcard_count > 5:
+            raise ValueError(
+                f"task_name_pattern has too many wildcards "
+                f"({wildcard_count}; max 5). Use the more specific "
+                f"task_name field for exact matches.",
+            )
+        if bracket_count > 3:
+            raise ValueError(
+                f"task_name_pattern has too many [...] character classes "
+                f"({bracket_count}; max 3).",
+            )
+        return v
+
 
 class DefaultSubscriptionCreate(BaseModel):
     trigger: str = Field(pattern=_TRIGGER_PATTERN)
@@ -172,6 +286,13 @@ class DeliveryPublic(BaseModel):
     response_code: int | None
     error: str | None
     sent_at: datetime
+    # Denormalized at read time (1.0.14+) so the dashboard doesn't
+    # have to issue a separate per-channel fetch to label the row.
+    # NULL when the underlying channel was deleted, or when the row
+    # was an unsaved-config test (no channel exists). The list
+    # endpoint resolves these via a single batch query per page.
+    channel_name: str | None = None
+    channel_type: str | None = None
 
 
 class DeliveryListPublic(BaseModel):
@@ -192,7 +313,20 @@ class DeliveryListPublic(BaseModel):
 # ---------------------------------------------------------------------------
 
 
-_SENSITIVE_CONFIG_KEYS = ("smtp_pass", "hmac_secret", "bot_token", "password")
+_SENSITIVE_CONFIG_KEYS = (
+    "smtp_pass",
+    "hmac_secret",
+    "bot_token",
+    "password",
+    # PagerDuty Events API v2 routing key. Anyone with this key can
+    # open incidents on the linked PD service, so treat it like a
+    # password: masked on read, preserved on PATCH-with-blank.
+    "integration_key",
+)
+
+# Audit-log sanitization helper lives in domain so service.py and
+# api.notifications.py share one implementation (audit H-1/H-2/H-3).
+from z4j_brain.domain.notifications.sanitize import sanitize_audit_text as _sanitize_audit_text  # noqa: E501
 
 # Telegram bot-token and chat-id regexes now live in the domain
 # module (``z4j_brain.domain.notifications.channels``) so the
@@ -305,6 +439,27 @@ async def _validate_channel_config(
         err = await validate_smtp_config(config)
         if err:
             raise ConflictError(f"unsafe email config: {err}")
+    elif channel_type == "pagerduty":
+        from z4j_brain.domain.notifications.channels import (
+            validate_pagerduty_config,
+        )
+        err = validate_pagerduty_config(config)
+        if err:
+            raise ConflictError(f"invalid pagerduty config: {err}")
+    elif channel_type == "discord":
+        from z4j_brain.domain.notifications.channels import (
+            validate_discord_config,
+        )
+        # First the static checks (URL present, etc.).
+        err = validate_discord_config(config)
+        if err:
+            raise ConflictError(f"invalid discord config: {err}")
+        # Then the SSRF + scheme checks shared with the webhook path.
+        url = config.get("webhook_url", "")
+        if url:
+            err = await validate_webhook_url(url)
+            if err:
+                raise ConflictError(f"unsafe discord webhook URL: {err}")
 
 
 async def _resolve_member_project(
@@ -352,7 +507,41 @@ def _default_payload(d: Any) -> DefaultSubscriptionPublic:
     )
 
 
-def _delivery_payload(d: Any) -> DeliveryPublic:
+def _delivery_payload(
+    d: Any,
+    *,
+    channel_lookup: dict[uuid.UUID, tuple[str, str]] | None = None,
+    user_channel_lookup: dict[uuid.UUID, tuple[str, str]] | None = None,
+) -> DeliveryPublic:
+    """Convert a NotificationDelivery row to its public payload.
+
+    Resolution order for ``channel_name`` / ``channel_type``:
+
+    1. **Snapshot columns** on the delivery row itself (audit L-2,
+       added v1.0.14). This is the authoritative source for the
+       audit log: snapshotted at write time, so a later channel
+       rename / delete cannot rewrite history.
+    2. **Live join via ``channel_lookup``** as a fallback for
+       pre-1.0.14 rows that don't have the snapshot.
+    3. None when neither is available (channel was deleted before
+       1.0.14, or this row was an unsaved-config test).
+
+    The two lookup dicts are built once per request by
+    ``list_deliveries`` so the fallback path is still O(1) per row.
+    """
+    # Snapshot fields (set at write time as of v1.0.14).
+    name: str | None = getattr(d, "channel_name", None)
+    type_: str | None = getattr(d, "channel_type", None)
+    # Live join fallback for older rows without the snapshot.
+    if name is None and type_ is None:
+        if d.channel_id and channel_lookup and d.channel_id in channel_lookup:
+            name, type_ = channel_lookup[d.channel_id]
+        elif (
+            d.user_channel_id
+            and user_channel_lookup
+            and d.user_channel_id in user_channel_lookup
+        ):
+            name, type_ = user_channel_lookup[d.user_channel_id]
     return DeliveryPublic(
         id=d.id,
         subscription_id=d.subscription_id,
@@ -365,6 +554,8 @@ def _delivery_payload(d: Any) -> DeliveryPublic:
         response_code=d.response_code,
         error=d.error,
         sent_at=d.sent_at,
+        channel_name=name,
+        channel_type=type_,
     )
 
 
@@ -431,6 +622,98 @@ async def create_channel(
     except IntegrityError:
         await db_session.rollback()
         raise ConflictError("channel already exists") from None
+    await db_session.refresh(channel)
+    return _channel_payload(channel)
+
+
+@router.post(
+    "/channels/import_from_user",
+    response_model=ChannelPublic,
+    status_code=201,
+    dependencies=[
+        Depends(require_csrf),
+        Depends(require_channel_import_throttle),
+    ],
+)
+async def import_channel_from_user(
+    slug: str,
+    body: ChannelImportFromUserRequest,
+    user: "User" = Depends(get_current_user),
+    memberships: "MembershipRepository" = Depends(get_membership_repo),
+    projects: "ProjectRepository" = Depends(get_project_repo),
+    db_session: "AsyncSession" = Depends(get_session),
+) -> ChannelPublic:
+    """Copy one of the caller's personal channels into the project.
+
+    Use case: operator has a Telegram bot token / Slack webhook /
+    PagerDuty key set up and verified in their personal channels,
+    and wants to make the same destination available project-wide
+    without re-pasting the secret.
+
+    Server-side copy: the source UserChannel's config (incl. real
+    secrets) is read directly from the DB and written to a new
+    NotificationChannel. The unmasked secret never crosses the wire.
+
+    Permission model:
+      - Caller must be project ADMIN (creating shared resources).
+      - Source channel MUST be owned by the caller (no taking over
+        another user's secret without their knowledge).
+      - Re-validates the channel config through the same SSRF /
+        format guards used at create time, so a stale unsafe config
+        in a UserChannel can't backdoor into the project.
+    """
+    from z4j_brain.errors import NotFoundError
+    from z4j_brain.persistence.models.notification import NotificationChannel
+    from z4j_brain.persistence.repositories import UserChannelRepository
+
+    project_id = await _resolve_member_project(
+        slug, user, memberships, projects, min_role=ProjectRole.ADMIN,
+    )
+
+    source = await UserChannelRepository(db_session).get_for_user(
+        user.id, body.user_channel_id,
+    )
+    if source is None:
+        # NotFound (not Forbidden) so we don't leak whether a channel
+        # exists owned by another user. Same shape as get_for_user
+        # missing.
+        raise NotFoundError(
+            "user channel not found",
+            details={"user_channel_id": str(body.user_channel_id)},
+        )
+
+    # Defense in depth: the source was created via the same validator
+    # we'd run here, but a config that was valid at creation time
+    # might not be valid now (e.g. URL allow-list tightened in a
+    # later release). Re-validate before persisting into the project.
+    await _validate_channel_config(source.type, source.config)
+
+    new_name = body.name or f"Copy of {source.name}"
+    channel = NotificationChannel(
+        project_id=project_id,
+        name=new_name,
+        type=source.type,
+        # Deep-copy the dict so any later mutation in either copy
+        # doesn't accidentally mutate the other through a shared
+        # reference (SQLAlchemy hands back the same dict instance
+        # on subsequent reads of the JSON column).
+        # Audit L-4: deep-copy so nested dicts (headers, severity_map)
+        # don't share references with the source row's SQLAlchemy
+        # JSON-column dict. A future PATCH on the source mutating a
+        # nested dict in place would otherwise leak into the imported
+        # copy via the shared reference.
+        config=copy.deepcopy(source.config or {}),
+        is_active=source.is_active,
+    )
+    db_session.add(channel)
+    await db_session.flush()
+    try:
+        await db_session.commit()
+    except IntegrityError:
+        await db_session.rollback()
+        raise ConflictError(
+            f"a channel named {new_name!r} already exists in this project",
+        ) from None
     await db_session.refresh(channel)
     return _channel_payload(channel)
 
@@ -566,7 +849,13 @@ def _test_payload() -> dict[str, Any]:
 
 
 async def _dispatch_test(
-    channel_type: str, config: dict[str, Any],
+    channel_type: str,
+    config: dict[str, Any],
+    *,
+    project_id: uuid.UUID | None = None,
+    channel_id: uuid.UUID | None = None,
+    user_channel_id: uuid.UUID | None = None,
+    db_session: "AsyncSession | None" = None,
 ) -> ChannelTestResult:
     """Run the real dispatcher with a canned test payload.
 
@@ -574,6 +863,17 @@ async def _dispatch_test(
     there is a single test path. Validates the config through the
     same SSRF / format guards create / update use, then returns the
     dispatcher's structured result.
+
+    As of v1.0.14, when ``project_id`` and ``db_session`` are passed,
+    the test dispatch is logged to ``notification_deliveries`` with
+    ``trigger="test.dispatch"`` so the operator sees test history on
+    the dashboard's Delivery Log page. Pre-1.0.14 tests were silently
+    not logged - operators couldn't tell if a test had actually
+    fired or not without checking the destination directly. The
+    audit row is marked with the ``test.dispatch`` trigger so the UI
+    can render a "test" badge to distinguish from real notifications.
+    Callers without a project_id (e.g. user-channel test that's not
+    project-scoped) skip the log step.
     """
     from z4j_brain.domain.notifications.channels import (
         CHANNEL_DISPATCHERS,
@@ -591,6 +891,76 @@ async def _dispatch_test(
         )
 
     result = await dispatcher(config, _test_payload())
+
+    # Audit-log the test dispatch (1.0.14+). Best-effort: a logging
+    # failure must not turn a successful test into a failed one
+    # the operator sees as red - we swallow + log to structlog only.
+    if project_id is not None and db_session is not None:
+        try:
+            from z4j_brain.persistence.models.notification import (
+                NotificationDelivery,
+            )
+
+            # Sanitize error + response_body before persistence
+            # (audit H-1, H-2, H-3): the dispatcher's raw error /
+            # response_body can carry the channel's webhook URL
+            # (which contains the secret token), the body of a
+            # hostile attacker-controlled webhook, or SSRF-guard
+            # rejection messages that leak resolved internal IPs.
+            # _sanitize_audit_text scrubs all three before write.
+            sanitized_error = _sanitize_audit_text(
+                result.error,
+                channel_config=config,
+                max_len=1024,
+            )
+            sanitized_body = _sanitize_audit_text(
+                result.response_body,
+                channel_config=config,
+                max_len=2048,
+            )
+            # Snapshot channel name + type (audit L-2) so historical
+            # rows survive a future channel rename / delete with their
+            # original destination intact. For unsaved-config preflight
+            # tests there's no channel name; store None so the read
+            # path renders "(unsaved test)".
+            snapshot_name: str | None = None
+            if channel_id is not None and db_session is not None:
+                from z4j_brain.persistence.repositories import (
+                    NotificationChannelRepository,
+                )
+                src = await NotificationChannelRepository(db_session).get_for_project(
+                    project_id, channel_id,
+                )
+                if src is not None:
+                    snapshot_name = src.name
+            row = NotificationDelivery(
+                project_id=project_id,
+                channel_id=channel_id,
+                user_channel_id=user_channel_id,
+                subscription_id=None,
+                trigger="test.dispatch",
+                task_id=None,
+                task_name=None,
+                status="sent" if result.success else "failed",
+                response_code=result.status_code,
+                response_body=sanitized_body,
+                error=sanitized_error,
+                channel_name=snapshot_name,
+                channel_type=channel_type,
+            )
+            db_session.add(row)
+            await db_session.commit()
+        except Exception:  # noqa: BLE001
+            import logging as _logging
+
+            try:
+                await db_session.rollback()
+            except Exception:  # noqa: BLE001
+                pass
+            _logging.getLogger("z4j.brain.notifications").exception(
+                "test_dispatch_audit_failed",
+            )
+
     return ChannelTestResult(
         success=result.success,
         status_code=result.status_code,
@@ -604,7 +974,10 @@ async def _dispatch_test(
 @router.post(
     "/channels/test",
     response_model=ChannelTestResult,
-    dependencies=[Depends(require_csrf)],
+    dependencies=[
+        Depends(require_csrf),
+        Depends(require_channel_test_throttle),
+    ],
 )
 async def test_channel_config(
     slug: str,
@@ -612,27 +985,42 @@ async def test_channel_config(
     user: "User" = Depends(get_current_user),
     memberships: "MembershipRepository" = Depends(get_membership_repo),
     projects: "ProjectRepository" = Depends(get_project_repo),
+    db_session: "AsyncSession" = Depends(get_session),
 ) -> ChannelTestResult:
     """Dispatch a single test notification against an UNSAVED config.
 
     Used by the dashboard's "Test" button in the create dialog so
     admins can verify SMTP / webhook / Slack / Telegram credentials
-    BEFORE persisting the channel (audit trail: the delivery is NOT
-    logged to ``notification_deliveries`` - this is a preflight, not
-    a real send).
+    BEFORE persisting the channel.
+
+    The dispatch IS logged to ``notification_deliveries`` (1.0.14+)
+    with ``trigger="test.dispatch"`` so operators see test history on
+    the Delivery Log page. ``channel_id`` is NULL for unsaved-config
+    tests (the channel doesn't exist yet) - the row's audit value is
+    "did this test fire and what did the destination say?", which is
+    independent of any specific channel row.
 
     Admin-only; same role gate as create_channel.
     """
-    await _resolve_member_project(
+    project_id = await _resolve_member_project(
         slug, user, memberships, projects, min_role=ProjectRole.ADMIN,
     )
-    return await _dispatch_test(body.type, body.config)
+    return await _dispatch_test(
+        body.type,
+        body.config,
+        project_id=project_id,
+        channel_id=None,
+        db_session=db_session,
+    )
 
 
 @router.post(
     "/channels/{channel_id}/test",
     response_model=ChannelTestResult,
-    dependencies=[Depends(require_csrf)],
+    dependencies=[
+        Depends(require_csrf),
+        Depends(require_channel_test_throttle),
+    ],
 )
 async def test_saved_channel(
     slug: str,
@@ -668,7 +1056,13 @@ async def test_saved_channel(
             "channel not found",
             details={"channel_id": str(channel_id)},
         )
-    return await _dispatch_test(channel.type, channel.config or {})
+    return await _dispatch_test(
+        channel.type,
+        channel.config or {},
+        project_id=project_id,
+        channel_id=channel.id,
+        db_session=db_session,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -807,6 +1201,91 @@ async def delete_default(
 # ---------------------------------------------------------------------------
 
 
+class ClearDeliveriesResult(BaseModel):
+    """Response shape for the admin clear-log endpoint (added v1.0.14)."""
+    deleted: int
+
+
+@router.delete(
+    "/deliveries",
+    response_model=ClearDeliveriesResult,
+    dependencies=[Depends(require_csrf)],
+)
+async def clear_deliveries(
+    request: Request,
+    slug: str,
+    before: datetime | None = Query(
+        default=None,
+        description=(
+            "When set, only delete delivery rows older than this "
+            "ISO-8601 timestamp. Useful for retention policy "
+            "(e.g. delete rows older than 30 days) without wiping "
+            "recent debugging history. When unset, deletes everything."
+        ),
+    ),
+    user: "User" = Depends(get_current_user),
+    memberships: "MembershipRepository" = Depends(get_membership_repo),
+    projects: "ProjectRepository" = Depends(get_project_repo),
+    db_session: "AsyncSession" = Depends(get_session),
+) -> ClearDeliveriesResult:
+    """Bulk-delete every delivery row for the project.
+
+    Admin-only - the audit log is the same data the dashboard
+    surfaces, so the same role gate applies. Returns the number of
+    rows deleted so the UI can render a "Cleared N entries" toast.
+
+    NOTE: this is destructive. Once deleted, the rows are gone -
+    they don't move to a soft-delete table. The notification
+    deliveries are already an *audit* of external sends, not a
+    source of truth (the message reached its destination either
+    way), so wiping them is a UX choice (clean view) rather than a
+    data-loss risk. Operators who need long-term retention should
+    forward via webhooks to an external log store.
+
+    Audit: as of v1.0.14 (audit L-1) every clear writes one row to
+    the brain audit_log so a rogue admin cannot silently delete
+    delivery history to cover the trail of a sensitive test
+    dispatch. The audit row carries the actor, the row count, and
+    the optional ``before`` timestamp.
+    """
+    from z4j_brain.api.deps import get_settings
+    from z4j_brain.domain.audit_service import AuditService
+    from z4j_brain.persistence.repositories import (
+        AuditLogRepository,
+        NotificationDeliveryRepository,
+    )
+
+    project_id = await _resolve_member_project(
+        slug, user, memberships, projects, min_role=ProjectRole.ADMIN,
+    )
+    deleted = await NotificationDeliveryRepository(db_session).delete_for_project(
+        project_id,
+        before=before,
+    )
+
+    # Audit the wipe BEFORE commit so deletion + audit happen
+    # atomically; if the audit insert fails the delete rolls back.
+    settings = get_settings(request)
+    await AuditService(settings).record(
+        AuditLogRepository(db_session),
+        action="notifications.deliveries.clear",
+        target_type="project",
+        target_id=str(project_id),
+        result="success",
+        outcome="allow",
+        user_id=user.id,
+        project_id=project_id,
+        source_ip=request.client.host if request.client else None,
+        user_agent=request.headers.get("user-agent"),
+        metadata={
+            "deleted_count": deleted,
+            "before": before.isoformat() if before else None,
+        },
+    )
+    await db_session.commit()
+    return ClearDeliveriesResult(deleted=deleted)
+
+
 @router.get("/deliveries", response_model=DeliveryListPublic)
 async def list_deliveries(
     slug: str,
@@ -849,8 +1328,59 @@ async def list_deliveries(
         overflow = rows[limit]
         next_cursor = _encode_cursor(overflow.sent_at, overflow.id)
         rows = rows[:limit]
+
+    # Batch-resolve channel name + type for each row in this page so
+    # the dashboard can label "which Slack channel did this fire to?"
+    # without an N+1 fetch (added v1.0.14). Two queries: one for
+    # project channels, one for user channels. Both use the
+    # already-imported repos. Empty input lists short-circuit so the
+    # common-case "all rows are project channels" path still fires
+    # only one query.
+    from sqlalchemy import select
+
+    from z4j_brain.persistence.models.notification import (
+        NotificationChannel,
+        UserChannel,
+    )
+
+    project_channel_ids = list(
+        {r.channel_id for r in rows if r.channel_id is not None},
+    )
+    user_channel_ids = list(
+        {r.user_channel_id for r in rows if r.user_channel_id is not None},
+    )
+
+    channel_lookup: dict[uuid.UUID, tuple[str, str]] = {}
+    if project_channel_ids:
+        result = await db_session.execute(
+            select(
+                NotificationChannel.id,
+                NotificationChannel.name,
+                NotificationChannel.type,
+            ).where(NotificationChannel.id.in_(project_channel_ids)),
+        )
+        channel_lookup = {row.id: (row.name, row.type) for row in result.all()}
+
+    user_channel_lookup: dict[uuid.UUID, tuple[str, str]] = {}
+    if user_channel_ids:
+        result = await db_session.execute(
+            select(
+                UserChannel.id,
+                UserChannel.name,
+                UserChannel.type,
+            ).where(UserChannel.id.in_(user_channel_ids)),
+        )
+        user_channel_lookup = {row.id: (row.name, row.type) for row in result.all()}
+
     return DeliveryListPublic(
-        items=[_delivery_payload(r) for r in rows],
+        items=[
+            _delivery_payload(
+                r,
+                channel_lookup=channel_lookup,
+                user_channel_lookup=user_channel_lookup,
+            )
+            for r in rows
+        ],
         next_cursor=next_cursor,
     )
 

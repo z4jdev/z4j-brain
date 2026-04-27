@@ -31,11 +31,28 @@ class WorkerRepository(BaseRepository[Worker]):
     def __init__(self, session: AsyncSession) -> None:
         super().__init__(session, Worker)
 
-    async def list_for_project(self, project_id: UUID) -> list[Worker]:
+    async def list_for_project(
+        self,
+        project_id: UUID,
+        *,
+        limit: int = 500,
+    ) -> list[Worker]:
+        """Workers for a project, freshest heartbeat first.
+
+        Hard-capped at ``limit`` (default 500, max 5000) so a busy
+        project with churning worker rows from autoscaling pods
+        doesn't return tens of thousands of rows (audit P-7, added
+        v1.0.14). AgentHygieneWorker normally sweeps stale rows but
+        in environments where it's behind, the cap protects the
+        response path.
+        """
+        if limit < 1 or limit > 5000:
+            raise ValueError("limit must be between 1 and 5000")
         result = await self.session.execute(
             select(Worker)
             .where(Worker.project_id == project_id)
-            .order_by(Worker.last_heartbeat.desc().nulls_last(), Worker.name),
+            .order_by(Worker.last_heartbeat.desc().nulls_last(), Worker.name)
+            .limit(limit),
         )
         return list(result.scalars().all())
 

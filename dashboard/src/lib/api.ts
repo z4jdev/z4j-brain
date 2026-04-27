@@ -59,7 +59,11 @@ function getCookie(name: string): string | null {
     .split("; ")
     .find((row) => row.startsWith(`${name}=`));
   if (!value) return null;
-  return decodeURIComponent(value.split("=")[1] ?? "");
+  try {
+    return decodeURIComponent(value.split("=")[1] ?? "");
+  } catch {
+    return null;
+  }
 }
 
 function getCsrfToken(): string | null {
@@ -119,9 +123,7 @@ export async function apiCall<T>(
     }
   }
 
-  let url = path.startsWith("http")
-    ? path
-    : `${API_BASE}${path.startsWith("/") ? path : `/${path}`}`;
+  let url = buildRequestUrl(path);
 
   if (options.query) {
     const params = new URLSearchParams();
@@ -219,3 +221,17 @@ export const api = {
     return apiCall<T>(path, { method: "DELETE" });
   },
 };
+
+function buildRequestUrl(path: string): string {
+  if (/^https?:\/\//i.test(path)) {
+    if (typeof window === "undefined") {
+      throw new Error("absolute API URLs require a browser origin");
+    }
+    const url = new URL(path);
+    if (url.origin !== window.location.origin) {
+      throw new Error("refusing cross-origin API request");
+    }
+    return `${url.pathname}${url.search}${url.hash}`;
+  }
+  return `${API_BASE}${path.startsWith("/") ? path : `/${path}`}`;
+}

@@ -36,6 +36,7 @@ from __future__ import annotations
 import asyncio
 import json
 from typing import TYPE_CHECKING, Any
+from urllib.parse import urlsplit
 from uuid import UUID
 
 import structlog
@@ -62,6 +63,10 @@ async def ws_dashboard(websocket: WebSocket) -> None:
     hub = _hub_from(websocket)
 
     await websocket.accept()
+
+    if not _origin_allowed(websocket.headers.get("origin"), settings=settings):
+        await _safe_close(websocket, code=4403)
+        return
 
     # ------------------------------------------------------------------
     # 1) Authenticate (session cookie)
@@ -225,6 +230,65 @@ def _parse_subscribe(raw: str) -> UUID | None:
         return UUID(pid_raw)
     except ValueError:
         return None
+
+
+def _origin_allowed(origin: str | None, *, settings: "Settings") -> bool:
+    """Return True when a browser WebSocket Origin is trusted.
+
+    ``/ws/dashboard`` is cookie-authenticated, so Origin is the WS
+    equivalent of the CSRF check used by REST mutations. Browsers set
+    this header on WebSocket handshakes; missing Origin is tolerated
+    only in dev/test for local tooling.
+    """
+    if not origin:
+        return settings.environment == "dev"
+    normalized = _normalise_origin(origin)
+    if normalized is None:
+        return False
+    return normalized in _allowed_origins(settings)
+
+
+def _allowed_origins(settings: "Settings") -> set[str]:
+    allowed: set[str] = set()
+    public_origin = _normalise_origin(settings.public_url)
+    if public_origin is not None:
+        allowed.add(public_origin)
+    for raw in settings.cors_origins:
+        if raw == "*":
+            continue
+        parsed = _normalise_origin(raw)
+        if parsed is not None:
+            allowed.add(parsed)
+    if settings.environment == "dev":
+        port = settings.bind_port
+        allowed.update({
+            f"http://localhost:{port}",
+            f"http://127.0.0.1:{port}",
+            f"http://testserver:{port}",
+            "http://testserver",
+        })
+    return allowed
+
+
+def _normalise_origin(raw: str) -> str | None:
+    try:
+        parsed = urlsplit(raw.strip())
+        port = parsed.port
+    except ValueError:
+        return None
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        return None
+    host = parsed.hostname.lower()
+    default_port = (
+        parsed.scheme == "http"
+        and port == 80
+    ) or (
+        parsed.scheme == "https"
+        and port == 443
+    )
+    if port is not None and not default_port:
+        host = f"{host}:{port}"
+    return f"{parsed.scheme}://{host}"
 
 
 async def _user_can_see_project(
