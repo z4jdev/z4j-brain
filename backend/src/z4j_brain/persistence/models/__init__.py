@@ -28,6 +28,7 @@ from z4j_brain.persistence.models.membership import Membership
 from z4j_brain.persistence.models.password_reset_token import (
     PasswordResetToken,
 )
+from z4j_brain.persistence.models.pending_fire import PendingFire
 from z4j_brain.persistence.models.project import Project
 from z4j_brain.persistence.models.queue import Queue
 from z4j_brain.persistence.models.schedule import Schedule
@@ -64,6 +65,7 @@ __all__ = [
     "NotificationChannel",
     "NotificationDelivery",
     "PasswordResetToken",
+    "PendingFire",
     "Project",
     "ProjectDefaultSubscription",
     "Queue",

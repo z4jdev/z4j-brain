@@ -111,6 +111,34 @@ class Schedule(PKMixin, TimestampsMixin, Base):
     )
     external_id: Mapped[str | None] = mapped_column(String(200), nullable=True)
 
+    # ------------------------------------------------------------------
+    # z4j-scheduler columns (migration 2026_04_26_0004_sched_cols)
+    # ------------------------------------------------------------------
+    # ``catch_up`` - per-schedule policy when a fire is late:
+    # ``skip`` drops the late fire, ``fire_one_missed`` runs once,
+    # ``fire_all_missed`` runs every missed slot in sequence.
+    catch_up: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="skip", server_default="skip",
+    )
+    # ``source`` - which surface created this schedule. Used by the
+    # dashboard to render a "managed by" badge and by the importers
+    # to resolve idempotency on re-import.
+    source: Mapped[str] = mapped_column(
+        String(64), nullable=False, default="dashboard",
+        server_default="dashboard",
+    )
+    # ``source_hash`` - content hash for declarative reconciliation
+    # (the Z4J["schedules"] dict diff in framework adapters).
+    source_hash: Mapped[str | None] = mapped_column(
+        String(128), nullable=True,
+    )
+    # ``last_fire_id`` - UUID of the most recent fire issued by
+    # z4j-scheduler. Used by the brain's AcknowledgeFireResult
+    # handler to correlate the ack back to its schedule row.
+    last_fire_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True), nullable=True,
+    )
+
     __table_args__ = (
         UniqueConstraint(
             "project_id", "scheduler", "name",
@@ -121,6 +149,11 @@ class Schedule(PKMixin, TimestampsMixin, Base):
         # - SQLAlchemy supports partial indexes via postgresql_where
         # but only on Postgres, and emitting it on SQLite is a
         # syntax error.
+        # The CHECK constraint on ``catch_up`` is also migration-only
+        # (Postgres) - at the model level we keep the column as a
+        # plain String so SQLite-mode tests can DROP COLUMN cleanly
+        # on downgrade. The application layer (_convert.py) validates
+        # the same vocabulary on every wire-protocol read.
     )
 
 

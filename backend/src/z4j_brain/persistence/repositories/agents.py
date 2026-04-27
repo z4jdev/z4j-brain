@@ -158,10 +158,22 @@ class AgentRepository(BaseRepository[Agent]):
 
     async def touch_heartbeat(self, agent_id: UUID) -> None:
         """Bump ``last_seen_at`` to now. Single indexed UPDATE."""
+        await self.touch_heartbeat_at(agent_id, when=None)
+
+    async def touch_heartbeat_at(
+        self, agent_id: UUID, *, when: datetime | None = None,
+    ) -> None:
+        """Bump ``last_seen_at`` to ``when`` (defaults to now).
+
+        Added in v1.0.15 (P-1) so :class:`EventIngestor.ingest_batch`
+        can carry the ``max(occurred_at)`` from the batch instead of
+        racing with wall-clock ``now()`` on every batch. Single
+        indexed UPDATE either way.
+        """
         await self.session.execute(
             update(Agent)
             .where(Agent.id == agent_id)
-            .values(last_seen_at=datetime.now(UTC)),
+            .values(last_seen_at=when or datetime.now(UTC)),
         )
 
     async def sweep_offline(self, *, cutoff: datetime) -> int:

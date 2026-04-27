@@ -20,17 +20,19 @@ import uuid
 from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Request
 from pydantic import BaseModel
 
 from z4j_brain.api.deps import (
     get_audit_log_repo,
+    get_audit_service,
     get_client_ip,
     get_command_dispatcher,
     get_current_user,
     get_membership_repo,
     get_project_repo,
     get_session,
+    get_settings,
     require_csrf,
 )
 from z4j_brain.domain.ip_rate_limit import require_bulk_action_throttle
@@ -40,6 +42,7 @@ from z4j_brain.persistence.enums import ProjectRole
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
 
+    from z4j_brain.domain.audit_service import AuditService
     from z4j_brain.domain.command_dispatcher import CommandDispatcher
     from z4j_brain.persistence.models import Agent, Schedule, User
     from z4j_brain.persistence.repositories import (
@@ -47,6 +50,7 @@ if TYPE_CHECKING:
         MembershipRepository,
         ProjectRepository,
     )
+    from z4j_brain.settings import Settings
 
 
 router = APIRouter(prefix="/projects/{slug}/schedules", tags=["schedules"])
@@ -382,11 +386,14 @@ async def disable_schedule(
 async def trigger_schedule_now(
     slug: str,
     schedule_id: uuid.UUID,
+    request: "Request",
     user: "User" = Depends(get_current_user),
     memberships: "MembershipRepository" = Depends(get_membership_repo),
     projects: "ProjectRepository" = Depends(get_project_repo),
     audit_log: "AuditLogRepository" = Depends(get_audit_log_repo),
+    audit: "AuditService" = Depends(get_audit_service),
     dispatcher: "CommandDispatcher" = Depends(get_command_dispatcher),
+    settings: "Settings" = Depends(get_settings),
     db_session: "AsyncSession" = Depends(get_session),
     ip: str = Depends(get_client_ip),
 ) -> SchedulePublic:
@@ -420,6 +427,64 @@ async def trigger_schedule_now(
             details={"schedule_id": str(schedule_id)},
         )
 
+    # Phase 2: when the schedule is owned by z4j-scheduler AND the
+    # operator has wired the trigger client, route the trigger
+    # through the scheduler so its local cache last_fire_at gets
+    # the update (preventing the next tick from double-firing).
+    # Falls through to the v1 direct-dispatch path for any
+    # combination that doesn't match.
+    # Phase 2: when the schedule is owned by z4j-scheduler AND the
+    # operator has wired the trigger client, route through the
+    # scheduler so its local cache last_fire_at gets the update
+    # (preventing the next tick from double-firing).
+    use_scheduler_grpc = (
+        schedule.scheduler == "z4j-scheduler"
+        and bool(settings.scheduler_trigger_url)
+    )
+    if use_scheduler_grpc:
+        client = await _get_or_build_trigger_client(request, settings)
+        response = await client.trigger(
+            schedule_id=schedule_id,
+            user_id=user.id,
+            idempotency_key=f"trigger:{schedule_id}:{user.id}",
+        )
+        if response.error_code:
+            raise NotFoundError(
+                f"scheduler rejected trigger: {response.error_code}",
+                details={
+                    "error_code": response.error_code,
+                    "error_message": response.error_message,
+                },
+            )
+        # Audit the trigger on the brain side (the scheduler audits
+        # its dispatch separately). One row per click is the
+        # operator-facing record.
+        await audit.record(
+            audit_log,
+            action="schedule.trigger_now.via_scheduler",
+            target_type="schedule",
+            target_id=str(schedule_id),
+            result="success",
+            outcome="allow",
+            user_id=user.id,
+            project_id=project.id,
+            source_ip=ip,
+            metadata={
+                "scheduler_command_id": response.command_id,
+                "scheduler_url": settings.scheduler_trigger_url,
+            },
+        )
+        await db_session.commit()
+        refreshed = await schedules_repo.get_for_project(
+            project_id=project.id, schedule_id=schedule_id,
+        )
+        assert refreshed is not None
+        return _payload(refreshed)
+
+    # v1 direct-dispatch path: pick a matching agent and issue the
+    # schedule.trigger_now command. Used when no scheduler is
+    # attached, or when the schedule is owned by celery-beat /
+    # apscheduler / etc. on the agent side.
     target_agent = await _pick_scheduler_agent(
         db_session=db_session,
         project_id=project.id,
@@ -455,4 +520,196 @@ async def trigger_schedule_now(
     return _payload(refreshed)
 
 
-__all__ = ["SchedulePublic", "router"]
+# ---------------------------------------------------------------------------
+# Trigger-client singleton helper
+# ---------------------------------------------------------------------------
+
+
+async def _get_or_build_trigger_client(
+    request: "Request",
+    settings: "Settings",
+):
+    """Return a process-wide :class:`TriggerScheduleClient` singleton.
+
+    First call lazily constructs the client + opens the gRPC channel
+    and caches it on ``app.state.scheduler_trigger_client``. Every
+    subsequent trigger reuses the same channel - which means one TLS
+    handshake per brain process, not one per click. The previous
+    per-call construction was an audit-Phase2 finding (TLS cost on
+    every trigger button push).
+
+    The brain shutdown path closes the client in
+    ``z4j_brain.main._lifespan`` finally-block.
+    """
+    cached = getattr(request.app.state, "scheduler_trigger_client", None)
+    if cached is not None:
+        return cached
+    from z4j_brain.scheduler_grpc.trigger_client import (  # noqa: PLC0415
+        TriggerScheduleClient,
+    )
+
+    client = TriggerScheduleClient(settings=settings)
+    await client.connect()
+    request.app.state.scheduler_trigger_client = client
+    return client
+
+
+# ---------------------------------------------------------------------------
+# Bulk import (z4j-scheduler migration importers)
+# ---------------------------------------------------------------------------
+
+
+class ImportedScheduleIn(BaseModel):
+    """One row of a bulk import payload.
+
+    Mirrors :class:`z4j_scheduler.importers._core.ImportedSchedule` -
+    the importers compute ``source_hash`` for re-import idempotency
+    and carry through ``source`` so the dashboard can render a
+    "managed by celery-beat (imported)" badge.
+
+    ``project_slug`` is dropped on the wire because the URL already
+    pins the project; we accept it if the importer still sends it
+    (using ``model_config = ConfigDict(extra="ignore")``) but never
+    use it.
+    """
+
+    name: str
+    engine: str
+    kind: str
+    expression: str
+    task_name: str
+    timezone: str = "UTC"
+    queue: str | None = None
+    args: list[Any] = []
+    kwargs: dict[str, Any] = {}
+    catch_up: str = "skip"
+    is_enabled: bool = True
+    scheduler: str = "z4j-scheduler"
+    source: str = "imported"
+    source_hash: str | None = None
+
+    # Pydantic v2 - allow extra keys (project_slug from importer
+    # client) without erroring. We only consume the fields above.
+    model_config = {"extra": "ignore"}
+
+
+class ImportSchedulesRequest(BaseModel):
+    """POST body for ``/api/v1/projects/{slug}/schedules:import``."""
+
+    schedules: list[ImportedScheduleIn]
+
+
+class ImportSchedulesResponse(BaseModel):
+    """Per-batch summary returned to the importer.
+
+    Lets the operator see at a glance whether their re-import was a
+    real diff or a no-op. ``errors`` carries human-readable messages
+    keyed by index in the input list so the operator can pinpoint
+    which row failed without re-correlating by name.
+    """
+
+    inserted: int
+    updated: int
+    unchanged: int
+    failed: int
+    errors: dict[int, str] = {}
+
+
+@router.post(
+    ":import",
+    response_model=ImportSchedulesResponse,
+    status_code=200,
+    dependencies=[Depends(require_csrf)],
+)
+async def import_schedules(
+    slug: str,
+    body: ImportSchedulesRequest,
+    user: "User" = Depends(get_current_user),
+    memberships: "MembershipRepository" = Depends(get_membership_repo),
+    projects: "ProjectRepository" = Depends(get_project_repo),
+    audit_log: "AuditLogRepository" = Depends(get_audit_log_repo),
+    audit: "AuditService" = Depends(get_audit_service),
+    db_session: "AsyncSession" = Depends(get_session),
+    ip: str = Depends(get_client_ip),
+) -> ImportSchedulesResponse:
+    """Bulk-import schedules from a migration tool.
+
+    Called by ``z4j-scheduler import --from <tool>``. Each row is
+    upserted by ``(project_id, scheduler, name)``. Re-imports with
+    matching ``source_hash`` are no-ops so the operator can re-run
+    the importer without flooding the audit log.
+
+    Authorization: project ADMIN. Schedule import is a privileged
+    operation - it adds new fire surfaces to a project, which can
+    move money, send emails, etc. ADMIN matches the existing
+    convention for membership / retention / token mutations.
+    """
+    from z4j_brain.domain.policy_engine import PolicyEngine
+    from z4j_brain.persistence.repositories import upsert_imported_schedule
+
+    policy = PolicyEngine()
+    project = await policy.get_project_or_404(projects, slug)
+    await policy.require_member(
+        memberships,
+        user=user,
+        project_id=project.id,
+        min_role=ProjectRole.ADMIN,
+    )
+
+    summary = ImportSchedulesResponse(
+        inserted=0, updated=0, unchanged=0, failed=0, errors={},
+    )
+    for idx, row in enumerate(body.schedules):
+        try:
+            outcome = await upsert_imported_schedule(
+                session=db_session,
+                project_id=project.id,
+                data=row.model_dump(),
+            )
+        except ValueError as exc:
+            # Per-row validation failure (bad kind, empty name, etc.)
+            # - record + continue. The whole batch still commits if
+            # at least one row succeeded; the operator gets the
+            # error map so they can fix the source and re-import.
+            summary.failed += 1
+            summary.errors[idx] = str(exc)
+            continue
+        if outcome == "inserted":
+            summary.inserted += 1
+        elif outcome == "updated":
+            summary.updated += 1
+        else:
+            summary.unchanged += 1
+
+    # Single audit row for the whole batch. Per-row audit would
+    # spam the log when the importer is run on a big celery-beat
+    # config (a 50-schedule import generating 50 audit entries
+    # buries everything else for that minute).
+    await audit.record(
+        audit_log,
+        action="schedules.import",
+        target_type="project",
+        target_id=str(project.id),
+        result="success" if summary.failed == 0 else "partial",
+        outcome="allow",
+        user_id=user.id,
+        project_id=project.id,
+        source_ip=ip,
+        metadata={
+            "inserted": summary.inserted,
+            "updated": summary.updated,
+            "unchanged": summary.unchanged,
+            "failed": summary.failed,
+        },
+    )
+    await db_session.commit()
+    return summary
+
+
+__all__ = [
+    "ImportSchedulesRequest",
+    "ImportSchedulesResponse",
+    "ImportedScheduleIn",
+    "SchedulePublic",
+    "router",
+]

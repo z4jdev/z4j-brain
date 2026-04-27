@@ -48,6 +48,7 @@ from z4j_core.transport.frames import (
     serialize_frame,
 )
 from z4j_core.transport.framing import FrameSigner
+from z4j_core.transport.hmac import derive_project_secret
 
 from z4j_brain.auth.passwords import PasswordHasher
 from z4j_brain.auth.sessions import SessionCookieCodec, cookie_name
@@ -203,14 +204,24 @@ class TestEndToEndLoop:
 
                 # Protocol v2: every post-handshake frame has to be
                 # signed with an envelope HMAC bound to the session's
-                # agent_id + project_id. The brain built its
-                # FrameVerifier with the project's ``secret`` as the
-                # signing key, so the fake agent must sign with the
-                # same key.
+                # agent_id + project_id. The brain derives a per-
+                # project signing secret from the master key (see
+                # ``websocket/gateway.py`` and
+                # ``z4j_core.transport.hmac.derive_project_secret``)
+                # so a leaked agent host secret can't forge frames
+                # against other projects. The fake agent must mirror
+                # the same derivation or the verifier rejects every
+                # frame with ``hmac signature mismatch``.
+                from uuid import UUID as _UUID
+
+                master = integration_settings.secret.get_secret_value().encode(
+                    "utf-8",
+                )
+                project_secret = derive_project_secret(
+                    master, _UUID(ack.payload.project_id),
+                )
                 signer = FrameSigner(
-                    secret=integration_settings.secret.get_secret_value().encode(
-                        "utf-8",
-                    ),
+                    secret=project_secret,
                     agent_id=ack.payload.agent_id,
                     project_id=ack.payload.project_id,
                 )

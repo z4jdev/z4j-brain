@@ -114,20 +114,49 @@ class EventIngestor:
         The full batch participates in the caller's transaction.
         Per-event redaction failures do NOT poison the batch - the
         bad event is logged + skipped, the rest still ingest.
+
+        Worker upserts and the agent heartbeat are batched (v1.0.15
+        P-1): instead of one ``upsert_from_event`` per event +
+        ``touch_heartbeat`` at the end (N+1 round-trips), we
+        accumulate ``(engine, worker_name) -> max_occurred_at`` while
+        iterating and emit ONE bulk upsert + ONE
+        ``touch_heartbeat_at`` after the loop. Saves ~N round-trips
+        per batch on the workers + agents tables.
         """
         new_count = 0
+        # Accumulator for worker upserts. Key is (engine, name);
+        # value is the latest occurred_at observed for that worker
+        # in this batch. We pick max so a stale event late in the
+        # batch can't roll the worker's heartbeat backwards.
+        worker_seen: dict[tuple[str, str], datetime] = {}
+        # Track max(occurred_at) across the whole batch so the agent
+        # heartbeat carries a real event timestamp instead of racing
+        # with wall-clock now() (which would let a hostile clock
+        # skew between brain replicas reorder agent liveness).
+        batch_max_occurred_at: datetime | None = None
+
         for raw_event in events:
             try:
-                if await self._ingest_one(
+                event_max = await self._ingest_one(
                     raw_event=raw_event,
                     project_id=project_id,
                     agent_id=agent_id,
                     event_repo=event_repo,
                     task_repo=task_repo,
                     queue_repo=queue_repo,
-                    worker_repo=worker_repo,
-                ):
+                    worker_seen=worker_seen,
+                )
+                if event_max is None:
+                    # Per-event ingest skipped (bad envelope, dup, etc.)
+                    continue
+                inserted, occurred_at = event_max
+                if inserted:
                     new_count += 1
+                if (
+                    batch_max_occurred_at is None
+                    or occurred_at > batch_max_occurred_at
+                ):
+                    batch_max_occurred_at = occurred_at
             except Exception:  # noqa: BLE001
                 logger.exception(
                     "z4j event_ingestor: per-event ingest failed; skipping",
@@ -135,10 +164,85 @@ class EventIngestor:
                     agent_id=str(agent_id),
                 )
 
+        # Bulk worker upsert. One round-trip for the whole batch.
+        # Wrapped in a savepoint with per-row fallback so a deadlock
+        # under concurrent heartbeats (the scenario the per-row
+        # savepoint scaffolding originally guarded against) does not
+        # poison the events transaction.
+        if worker_repo is not None and worker_seen:
+            await self._flush_worker_upserts(
+                worker_repo=worker_repo,
+                project_id=project_id,
+                worker_seen=worker_seen,
+            )
+
         # Heartbeat: any event traffic counts as the agent being
-        # alive.
-        await agents.touch_heartbeat(agent_id)
+        # alive. Carries the batch's max occurred_at when available
+        # (avoids race with wall-clock now() across brain replicas).
+        await agents.touch_heartbeat_at(agent_id, when=batch_max_occurred_at)
         return new_count
+
+    async def _flush_worker_upserts(
+        self,
+        *,
+        worker_repo: "WorkerRepository",
+        project_id: UUID,
+        worker_seen: dict[tuple[str, str], datetime],
+    ) -> None:
+        """Issue the bulk worker upsert with a per-row fallback.
+
+        On Postgres a deadlock between two concurrent heartbeats
+        (which was the original motivation for the per-row savepoint
+        scaffolding in :meth:`WorkerRepository.upsert_from_event`)
+        raises ``OperationalError``. The bulk path holds locks for
+        milliseconds vs the seconds the N+1 path held them, so the
+        deadlock window is dramatically smaller - but defense in
+        depth: on any SQL error, fall back to the original per-row
+        savepointed path so a single batch can never poison the
+        outer transaction.
+        """
+        from sqlalchemy.exc import OperationalError
+
+        from z4j_brain.persistence.enums import WorkerState
+
+        rows = [
+            {
+                "project_id": project_id,
+                "engine": engine,
+                "name": name,
+                "state": WorkerState.ONLINE,
+                "last_heartbeat": occurred_at,
+            }
+            for (engine, name), occurred_at in worker_seen.items()
+        ]
+        try:
+            async with worker_repo.session.begin_nested():
+                await worker_repo.upsert_from_events_bulk(rows)
+        except OperationalError:
+            logger.warning(
+                "z4j event_ingestor: bulk worker upsert hit OperationalError "
+                "(likely deadlock); falling back to per-row path",
+                project_id=str(project_id),
+                worker_count=len(rows),
+            )
+            for row in rows:
+                try:
+                    await worker_repo.upsert_from_event(
+                        project_id=row["project_id"],
+                        engine=row["engine"],
+                        name=row["name"],
+                        updates={
+                            "state": row["state"],
+                            "last_heartbeat": row["last_heartbeat"],
+                        },
+                    )
+                except Exception:  # noqa: BLE001
+                    logger.exception(
+                        "z4j event_ingestor: per-row worker upsert "
+                        "fallback failed; skipping",
+                        engine=row["engine"],
+                        worker=row["name"],
+                    )
 
     async def _ingest_one(
         self,
@@ -149,13 +253,26 @@ class EventIngestor:
         event_repo: "EventRepository",
         task_repo: "TaskRepository",
         queue_repo: "QueueRepository",
-        worker_repo: "WorkerRepository | None" = None,
-    ) -> bool:
-        """Ingest one event. Returns True if a new events row was inserted."""
+        worker_seen: dict[tuple[str, str], datetime],
+    ) -> tuple[bool, datetime] | None:
+        """Ingest one event.
+
+        Returns ``(inserted, occurred_at)`` on success and ``None``
+        when the event was rejected before insert (bad envelope,
+        unparseable payload, etc.). ``inserted`` is True only when
+        a new row landed in the partitioned events table; replays
+        return False but still propagate ``occurred_at`` so the
+        batch-level heartbeat sees the freshest timestamp.
+
+        Worker hostnames carried in the event payload are recorded
+        into ``worker_seen`` (an out-parameter dict) instead of
+        being upserted inline; the caller flushes them as one bulk
+        statement after the loop (v1.0.15 P-1).
+        """
         # Redaction defense in depth.
         scrubbed = self._redaction.scrub(raw_event)
         if not isinstance(scrubbed, dict):
-            return False
+            return None
 
         engine = str(scrubbed.get("engine", "")).strip()
         kind_value = str(scrubbed.get("kind", "")).strip()
@@ -164,7 +281,7 @@ class EventIngestor:
         data = scrubbed.get("data") or {}
 
         if not engine or not kind_value:
-            return False
+            return None
 
         try:
             kind = EventKind(kind_value)
@@ -245,23 +362,17 @@ class EventIngestor:
             except Exception:  # noqa: BLE001
                 logger.exception("z4j event_ingestor: queue touch failed")
 
-        # 3) Touch the worker if the event carries a hostname.
+        # 3) Record the worker into the batch-level accumulator.
+        # The bulk upsert runs once after the whole batch is in;
+        # see :meth:`ingest_batch` (v1.0.15 P-1). Picking max
+        # occurred_at means a stale event arriving late in the
+        # batch can't roll the worker's heartbeat backwards.
         worker_name = data.get("worker") if isinstance(data, dict) else None
-        if isinstance(worker_name, str) and worker_name and worker_repo is not None:
-            try:
-                from z4j_brain.persistence.enums import WorkerState
-
-                await worker_repo.upsert_from_event(
-                    project_id=project_id,
-                    engine=engine,
-                    name=worker_name,
-                    updates={
-                        "state": WorkerState.ONLINE,
-                        "last_heartbeat": occurred_at,
-                    },
-                )
-            except Exception:  # noqa: BLE001
-                logger.exception("z4j event_ingestor: worker upsert failed")
+        if isinstance(worker_name, str) and worker_name:
+            key = (engine, worker_name)
+            previous = worker_seen.get(key)
+            if previous is None or occurred_at > previous:
+                worker_seen[key] = occurred_at
 
         # 4) Project onto tasks (only for task-shaped events).
         if task_id and kind != EventKind.UNKNOWN:
@@ -314,7 +425,7 @@ class EventIngestor:
                         "z4j event_ingestor: schedule upsert failed",
                     )
 
-        return inserted
+        return (inserted, occurred_at)
 
     async def _project_task(
         self,

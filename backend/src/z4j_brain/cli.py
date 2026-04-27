@@ -421,6 +421,51 @@ def main(argv: Sequence[str] | None = None) -> int:
         ),
     )
 
+    # mint-scheduler-cert
+    msc = sub.add_parser(
+        "mint-scheduler-cert",
+        help=(
+            "mint a fresh mTLS client certificate for a z4j-scheduler "
+            "instance. Requires the brain operator's CA cert + key "
+            "(typically the same CA that signed the brain's gRPC "
+            "server cert). Writes <name>.crt and <name>.key into "
+            "--out-dir with mode 0600."
+        ),
+    )
+    msc.add_argument(
+        "--name",
+        required=True,
+        help=(
+            "CN + DNS SAN of the cert (e.g. 'scheduler-1'). Add this "
+            "value to Z4J_SCHEDULER_GRPC_ALLOWED_CNS on the brain "
+            "before deploying the cert."
+        ),
+    )
+    msc.add_argument(
+        "--ca-cert",
+        required=True,
+        metavar="PATH",
+        help="path to the CA certificate (PEM)",
+    )
+    msc.add_argument(
+        "--ca-key",
+        required=True,
+        metavar="PATH",
+        help="path to the CA private key (PEM, unencrypted)",
+    )
+    msc.add_argument(
+        "--out-dir",
+        required=True,
+        metavar="PATH",
+        help="directory where <name>.crt and <name>.key will be written",
+    )
+    msc.add_argument(
+        "--validity-days",
+        type=int,
+        default=365,
+        help="certificate validity in days (default: 365)",
+    )
+
     # version
     sub.add_parser("version", help="print installed z4j-brain version")
 
@@ -477,8 +522,76 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "doctor":
         return _run_doctor(args)
 
+    if args.command == "mint-scheduler-cert":
+        return _run_mint_scheduler_cert(args)
+
     parser.error(f"unknown command {args.command!r}")
     return 2
+
+
+def _run_mint_scheduler_cert(args: argparse.Namespace) -> int:
+    """Dispatch ``z4j mint-scheduler-cert``.
+
+    Reads the operator's CA material, mints a fresh cert + key for
+    the named scheduler instance, writes them to ``--out-dir``, and
+    prints the on-disk paths so the operator can scp them to the
+    scheduler host.
+
+    Imported lazily so the ``cryptography`` dep is only required for
+    operators who actually run this command.
+    """
+    try:
+        from z4j_brain.scheduler_grpc.auth import (  # noqa: PLC0415
+            mint_scheduler_cert,
+            write_minted_cert,
+        )
+    except ImportError as exc:
+        print(
+            "z4j: mint-scheduler-cert requires the scheduler-grpc extra. "
+            "Install with: pip install 'z4j[scheduler-grpc]'",
+            file=sys.stderr,
+        )
+        print(f"  underlying error: {exc}", file=sys.stderr)
+        return 2
+
+    ca_cert_path = Path(args.ca_cert)
+    ca_key_path = Path(args.ca_key)
+    out_dir = Path(args.out_dir)
+
+    if not ca_cert_path.is_file():
+        print(f"z4j: --ca-cert {ca_cert_path!s} not found", file=sys.stderr)
+        return 2
+    if not ca_key_path.is_file():
+        print(f"z4j: --ca-key {ca_key_path!s} not found", file=sys.stderr)
+        return 2
+
+    try:
+        cert_pem, key_pem = mint_scheduler_cert(
+            name=args.name,
+            ca_cert_pem=ca_cert_path.read_bytes(),
+            ca_key_pem=ca_key_path.read_bytes(),
+            validity_days=args.validity_days,
+        )
+        cert_path, key_path = write_minted_cert(
+            out_dir=out_dir,
+            name=args.name,
+            cert_pem=cert_pem,
+            key_pem=key_pem,
+        )
+    except Exception as exc:  # noqa: BLE001
+        print(f"z4j mint-scheduler-cert failed: {exc}", file=sys.stderr)
+        return 1
+
+    print(f"wrote certificate: {cert_path}")
+    print(f"wrote private key: {key_path}")
+    print(
+        f"\nNext steps:\n"
+        f"  1. Add '{args.name}' to Z4J_SCHEDULER_GRPC_ALLOWED_CNS on the brain\n"
+        f"  2. Restart the brain so the new allow-list takes effect\n"
+        f"  3. scp {cert_path.name} {key_path.name} to the scheduler host\n"
+        f"  4. Set Z4J_SCHEDULER_TLS_CERT and Z4J_SCHEDULER_TLS_KEY on the scheduler",
+    )
+    return 0
 
 
 def _run_metrics_token(args: argparse.Namespace) -> int:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import uuid
 from datetime import datetime
 from typing import Any
 from uuid import UUID
@@ -12,6 +13,22 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from z4j_brain.persistence.enums import WorkerState
 from z4j_brain.persistence.models import Event, Worker
 from z4j_brain.persistence.repositories._base import BaseRepository
+
+#: Columns that vary between heartbeats and should be updated on
+#: ON CONFLICT. ``id``, ``project_id``, ``engine``, ``name``,
+#: ``created_at`` are immutable per row; everything else may change.
+_UPSERT_VARIABLE_COLS = (
+    "state",
+    "last_heartbeat",
+    "hostname",
+    "pid",
+    "concurrency",
+    "queues",
+    "load_average",
+    "memory_bytes",
+    "active_tasks",
+    "worker_metadata",
+)
 
 
 #: Event kinds we count per worker. Source of truth is
@@ -118,6 +135,127 @@ class WorkerRepository(BaseRepository[Worker]):
             setattr(existing, key, value)
         await self.session.flush()
         return existing
+
+    async def upsert_from_events_bulk(
+        self,
+        rows: list[dict[str, Any]],
+    ) -> int:
+        """Bulk upsert N worker rows in one statement (v1.0.15 P-1).
+
+        Each ``rows`` entry must include ``project_id``, ``engine``,
+        ``name``; any of the columns in :data:`_UPSERT_VARIABLE_COLS`
+        may be present. Missing columns are NOT touched on the
+        conflict path - only keys actually present in the input
+        propagate into the ``ON CONFLICT DO UPDATE`` set, so this
+        method is safe to call with partial-update payloads (e.g. a
+        heartbeat that only carries ``last_heartbeat`` + ``state``
+        will not blank the previously-recorded ``concurrency`` /
+        ``hostname``).
+
+        On Postgres + SQLite (≥ 3.24) we emit one
+        ``INSERT ... ON CONFLICT (project_id, engine, name) DO UPDATE``
+        statement. On any other dialect we transparently fall back
+        to the per-row :meth:`upsert_from_event` path so non-prod
+        adapters keep working.
+
+        Returns the number of input rows processed (not the number
+        of new inserts; ``ON CONFLICT DO UPDATE`` does not surface
+        that distinction to the client).
+
+        Replaces the per-event N+1 round-trips in
+        :meth:`EventIngestor.ingest_batch` and the per-hostname
+        savepointed loop in :class:`WebSocketFrameRouter._handle_heartbeat`.
+        """
+        if not rows:
+            return 0
+
+        # Validate the contract early so a malformed caller fails
+        # the whole batch instead of corrupting half of it.
+        for r in rows:
+            if "project_id" not in r or "engine" not in r or "name" not in r:
+                raise ValueError(
+                    "each row must include project_id, engine, name",
+                )
+
+        bind = await self.session.connection()
+        dialect = bind.dialect.name
+
+        if dialect == "postgresql":
+            from sqlalchemy.dialects.postgresql import insert as _ins
+        elif dialect == "sqlite":
+            from sqlalchemy.dialects.sqlite import insert as _ins
+        else:
+            # Unknown dialect - fall back to the per-row safe path.
+            # Preserves correctness on any future adapter we add.
+            for r in rows:
+                await self.upsert_from_event(
+                    project_id=r["project_id"],
+                    engine=r["engine"],
+                    name=r["name"],
+                    updates={
+                        k: v for k, v in r.items()
+                        if k in _UPSERT_VARIABLE_COLS
+                    },
+                )
+            return len(rows)
+
+        # Build the dense INSERT payload. ``id`` needs a Python-side
+        # uuid because ``pg_insert(...).values(list_of_dicts)`` does
+        # not honor SQLAlchemy ORM column defaults. ``state`` falls
+        # back to UNKNOWN to satisfy NOT NULL on insert; on the
+        # update path the caller's value (if any) wins.
+        prepared: list[dict[str, Any]] = []
+        present_update_cols: set[str] = set()
+        for r in rows:
+            row_payload: dict[str, Any] = {
+                "id": uuid.uuid4(),
+                "project_id": r["project_id"],
+                "engine": r["engine"],
+                "name": r["name"],
+                "state": r.get("state", WorkerState.UNKNOWN),
+            }
+            # Pass-through optional columns so INSERT carries them
+            # if this row is the first observation. Only keys we
+            # whitelist propagate - extra junk gets dropped.
+            for col in _UPSERT_VARIABLE_COLS:
+                if col == "state":
+                    continue
+                if col in r:
+                    row_payload[col] = r[col]
+                    present_update_cols.add(col)
+            # ``state`` is always present (we just defaulted it) but
+            # we only want to OVERWRITE on conflict if the caller
+            # supplied one - otherwise the existing online state
+            # would get clobbered to UNKNOWN.
+            if "state" in r:
+                present_update_cols.add("state")
+            prepared.append(row_payload)
+
+        stmt = _ins(Worker).values(prepared)
+
+        # Build ON CONFLICT DO UPDATE set_ from the union of columns
+        # any input row carried. This preserves "no key, no touch"
+        # semantics: a heartbeat carrying only ``last_heartbeat`` +
+        # ``state`` will not write NULL into ``hostname``.
+        update_cols: dict[str, Any] = {}
+        for col in present_update_cols:
+            update_cols[col] = getattr(stmt.excluded, col)
+
+        if not update_cols:
+            # Nothing to update on conflict - degenerate case where
+            # every input row is just (project, engine, name) with
+            # no payload. Insert-or-do-nothing then.
+            stmt = stmt.on_conflict_do_nothing(
+                index_elements=("project_id", "engine", "name"),
+            )
+        else:
+            stmt = stmt.on_conflict_do_update(
+                index_elements=("project_id", "engine", "name"),
+                set_=update_cols,
+            )
+
+        await self.session.execute(stmt)
+        return len(prepared)
 
     async def counts_for_project(
         self, project_id: UUID,

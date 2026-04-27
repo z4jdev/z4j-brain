@@ -394,6 +394,78 @@ class Settings(BaseSettings):
     # Dashboard assets
     # ------------------------------------------------------------------
     dashboard_dist: str = "/app/dashboard/dist"
+    #: When True, ``create_app`` skips registering the SPA catch-all
+    #: route. Production never sets this (the SPA must be served);
+    #: the unit-test fixture sets it so tests can ``include_router``
+    #: extra API routes after build time without the catch-all
+    #: shadowing them. v1.0.15 enterprise-grade test isolation fix.
+    disable_spa_fallback: bool = False
+
+    # ------------------------------------------------------------------
+    # z4j-scheduler gRPC service (docs/SCHEDULER.md §22)
+    # ------------------------------------------------------------------
+    # Off by default - operators opt in once they deploy a
+    # ``z4j-scheduler`` companion process. When disabled the brain
+    # behaves identically to pre-scheduler releases.
+    scheduler_grpc_enabled: bool = False
+    #: Bind interface for the gRPC server. Default ``0.0.0.0`` binds
+    #: every interface; production deployments behind a private
+    #: network may prefer a specific address.
+    scheduler_grpc_bind_host: str = "0.0.0.0"  # noqa: S104 - opt-in gRPC service
+    #: Bind port. Distinct from the FastAPI port so Prometheus,
+    #: dashboard, and scheduler don't collide. Port 0 is allowed as
+    #: the standard "ephemeral port" sentinel; integration tests
+    #: use it so they don't have to coordinate fixed ports.
+    scheduler_grpc_bind_port: int = Field(default=7701, ge=0, le=65535)
+    #: Path to the brain's gRPC server certificate (PEM).
+    scheduler_grpc_tls_cert: str | None = None
+    #: Path to the brain's gRPC server private key (PEM).
+    scheduler_grpc_tls_key: str | None = None
+    #: Path to the CA bundle used to validate scheduler client certs.
+    scheduler_grpc_tls_ca: str | None = None
+    #: Allow-list of CN/SAN values accepted from client certs.
+    #: Empty = trust any cert the CA bundle validates (operator
+    #: chose "trust the CA"). Populate to add an extra check.
+    scheduler_grpc_allowed_cns: list[str] = Field(default_factory=list)
+    #: Watch-stream poll cadence. Brain polls ``schedules.updated_at``
+    #: every N seconds and emits diff events. 2s gives sub-3s
+    #: cache-freshness end-to-end after the scheduler's tick budget.
+    scheduler_grpc_watch_poll_seconds: float = Field(
+        default=2.0, ge=0.5, le=60.0,
+    )
+    #: Graceful drain window on shutdown. In-flight RPCs get this
+    #: long to complete before the runtime is torn down.
+    scheduler_grpc_grace_seconds: float = Field(default=5.0, ge=0.1, le=60.0)
+    #: Retention window for buffered fires that have not been
+    #: replayed. After this many days the sweep worker drops the
+    #: row regardless of the schedule's ``catch_up`` policy. 7d is
+    #: the typical operator escalation timeline (a production agent
+    #: outage is normally caught within 24h; 7d gives margin for a
+    #: long weekend or holiday).
+    pending_fires_retention_days: int = Field(default=7, ge=1, le=365)
+    #: Cadence for :class:`PendingFiresReplayWorker`. Each tick
+    #: scans for buffered fires whose project has at least one
+    #: matching online agent and replays them through the existing
+    #: command dispatcher.
+    pending_fires_replay_interval_seconds: int = Field(
+        default=10, ge=1, le=300,
+    )
+
+    # ------------------------------------------------------------------
+    # TriggerSchedule client - brain calls scheduler.TriggerSchedule
+    # ------------------------------------------------------------------
+    #: When set, the dashboard's "fire now" route on a
+    #: z4j-scheduler-managed schedule routes through the scheduler
+    #: rather than dispatching directly. Format: ``host:port``,
+    #: typically ``scheduler:7802``. Leave unset to keep the v1
+    #: direct-dispatch path.
+    scheduler_trigger_url: str | None = None
+    #: Brain's client cert presented to the scheduler. Required when
+    #: ``scheduler_trigger_url`` is set.
+    scheduler_trigger_tls_cert: str | None = None
+    scheduler_trigger_tls_key: str | None = None
+    #: CA bundle used to validate the scheduler's server cert.
+    scheduler_trigger_tls_ca: str | None = None
 
     # ------------------------------------------------------------------
     # Validators

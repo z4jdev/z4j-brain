@@ -39,9 +39,15 @@ from z4j_brain.persistence.repositories.notifications import (
     UserNotificationRepository,
     UserSubscriptionRepository,
 )
+from z4j_brain.persistence.repositories.pending_fires import (
+    PendingFiresRepository,
+)
 from z4j_brain.persistence.repositories.projects import ProjectRepository
 from z4j_brain.persistence.repositories.queues import QueueRepository
-from z4j_brain.persistence.repositories.schedules import ScheduleRepository
+from z4j_brain.persistence.repositories.schedules import (
+    ScheduleRepository,
+    upsert_imported_schedule,
+)
 from z4j_brain.persistence.repositories.sessions import SessionRepository
 from z4j_brain.persistence.repositories.tasks import TaskRepository
 from z4j_brain.persistence.repositories.users import UserRepository
@@ -59,6 +65,7 @@ __all__ = [
     "MembershipRepository",
     "NotificationChannelRepository",
     "NotificationDeliveryRepository",
+    "PendingFiresRepository",
     "ProjectDefaultSubscriptionRepository",
     "ProjectRepository",
     "QueueRepository",
@@ -70,4 +77,5 @@ __all__ = [
     "UserRepository",
     "UserSubscriptionRepository",
     "WorkerRepository",
+    "upsert_imported_schedule",
 ]

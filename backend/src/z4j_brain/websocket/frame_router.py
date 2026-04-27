@@ -264,6 +264,18 @@ class FrameRouter:
                             engine = key.split(".")[0]
                             worker_repo = WorkerRepository(session)
                             queue_repo_w = QueueRepository(session)
+                            # Collect every hostname's update payload
+                            # into one list and emit ONE bulk upsert
+                            # at the end (v1.0.15 P-1). Replaces the
+                            # per-hostname savepointed upsert that was
+                            # the dominant cost in this hot path
+                            # (heartbeat fires every 10s per agent
+                            # connection - ~6 frontends × prefork=2
+                            # ≈ 6 concurrent heartbeats was where the
+                            # original PendingRollbackError cascade
+                            # was caught in audit pass 9 / 2026-04-21).
+                            bulk_rows: list[dict[str, Any]] = []
+                            queue_names_to_touch: list[str] = []
                             for hostname, data in details.items():
                                 if not isinstance(data, dict):
                                     continue
@@ -273,7 +285,10 @@ class FrameRouter:
                                 pool = stats.get("pool", {}) if isinstance(stats, dict) else {}
                                 rusage = stats.get("rusage", {}) if isinstance(stats, dict) else {}
 
-                                updates: dict[str, Any] = {
+                                row: dict[str, Any] = {
+                                    "project_id": self._project_id,
+                                    "engine": engine,
+                                    "name": hostname,
                                     "state": WorkerState.ONLINE,
                                     "last_heartbeat": frame.payload.last_flush_at or datetime.now(UTC),
                                     "hostname": hostname,
@@ -287,100 +302,111 @@ class FrameRouter:
                                 }
                                 # Pool info
                                 if isinstance(pool, dict):
-                                    updates["concurrency"] = pool.get(
+                                    row["concurrency"] = pool.get(
                                         "max-concurrency",
                                         pool.get("processes", None),
                                     )
-                                    updates["pid"] = stats.get("pid")
+                                    row["pid"] = stats.get("pid")
                                 # Active tasks
                                 active = data.get("active", [])
                                 if isinstance(active, list):
-                                    updates["active_tasks"] = len(active)
+                                    row["active_tasks"] = len(active)
                                 # Active queues
                                 aq = data.get("active_queues", [])
                                 if isinstance(aq, list):
-                                    updates["queues"] = [
+                                    queue_list = [
                                         q.get("name", "") for q in aq
                                         if isinstance(q, dict)
                                     ]
+                                    row["queues"] = queue_list
+                                    # Collect for separate queue touches
+                                    # below. Worker → queue is N:M; one
+                                    # worker can announce multiple
+                                    # queues, so this stays a flat list.
+                                    queue_names_to_touch.extend(
+                                        q for q in queue_list
+                                        if isinstance(q, str) and q
+                                    )
                                 # Load average
                                 if isinstance(rusage, dict):
                                     loadavg = stats.get("loadavg")
                                     if isinstance(loadavg, list):
-                                        updates["load_average"] = loadavg
+                                        row["load_average"] = loadavg
+                                bulk_rows.append(row)
 
-                                # Savepoint per worker upsert. Without
-                                # this, a concurrent-heartbeat deadlock
-                                # between two frontends both touching
-                                # the same (workers / queues) FK graph
-                                # bubbles ``DeadlockDetectedError`` out
-                                # of this statement, poisons the outer
-                                # transaction, and blows up the later
-                                # ``session.commit()`` with
-                                # ``PendingRollbackError`` - which in
-                                # turn drops ``touch_heartbeat`` (the
-                                # write that updates ``last_seen_at``
-                                # and keeps the agent state=online).
-                                # Audit pass 9 (2026-04-21) reproduced
-                                # this with 3 FastAPI workers ×
-                                # prefork=2 ≈ 6 concurrent heartbeats
-                                # every 10s.
-                                #
-                                # On deadlock we log+skip this worker's
-                                # detail for this heartbeat cycle; the
-                                # next heartbeat in 10s retries and
-                                # usually succeeds. Queue depth updates
-                                # below are already savepoint-wrapped;
-                                # this brings the worker path in line.
+                            if bulk_rows:
+                                # Bulk upsert in one statement, with
+                                # the same savepoint + per-row fallback
+                                # discipline used in EventIngestor.
+                                # Defense in depth: if the bulk path
+                                # raises (deadlock or otherwise), fall
+                                # back to the original per-row
+                                # savepointed loop for this batch only.
+                                from sqlalchemy.exc import OperationalError
                                 try:
                                     async with session.begin_nested():
-                                        await worker_repo.upsert_from_event(
+                                        await worker_repo.upsert_from_events_bulk(
+                                            bulk_rows,
+                                        )
+                                except OperationalError:
+                                    logger.warning(
+                                        "z4j frame_router: bulk worker "
+                                        "upsert hit OperationalError "
+                                        "(likely deadlock); falling back "
+                                        "per-row",
+                                        engine=engine,
+                                        worker_count=len(bulk_rows),
+                                    )
+                                    for row in bulk_rows:
+                                        try:
+                                            async with session.begin_nested():
+                                                await worker_repo.upsert_from_event(
+                                                    project_id=row["project_id"],
+                                                    engine=row["engine"],
+                                                    name=row["name"],
+                                                    updates={
+                                                        k: v for k, v in row.items()
+                                                        if k not in (
+                                                            "project_id", "engine", "name",
+                                                        )
+                                                    },
+                                                )
+                                        except Exception:  # noqa: BLE001
+                                            logger.debug(
+                                                "z4j frame_router: per-row "
+                                                "worker upsert fallback failed",
+                                                engine=row["engine"],
+                                                hostname=str(row["name"]),
+                                            )
+
+                            # Register each queue this worker is
+                            # consuming so the Queues page reflects
+                            # them even when task events don't carry
+                            # a ``queue`` field (Celery only emits
+                            # queue names for explicit routing;
+                            # default-queue tasks arrive with
+                            # queue=None, leaving the Queues page
+                            # empty otherwise). Dedupe so two workers
+                            # announcing the same queue don't emit
+                            # two touches.
+                            for qname in dict.fromkeys(queue_names_to_touch):
+                                # Each touch runs in its own savepoint.
+                                # Without this a single bad queue name
+                                # poisons the outer session on Postgres
+                                # (``InFailedSqlTransactionError``) and
+                                # silently rolls back the worker state
+                                # + heartbeats we just wrote.
+                                try:
+                                    async with session.begin_nested():
+                                        await queue_repo_w.touch(
                                             project_id=self._project_id,
                                             engine=engine,
-                                            name=hostname,
-                                            updates=updates,
+                                            name=qname,
                                         )
                                 except Exception:  # noqa: BLE001
-                                    logger.debug(
-                                        "z4j frame_router: worker upsert "
-                                        "failed (likely deadlock); skipping "
-                                        "this hostname for this heartbeat",
-                                        engine=engine,
-                                        hostname=str(hostname),
+                                    logger.exception(
+                                        "z4j frame_router: queue touch failed",
                                     )
-                                    continue
-
-                                # Register each queue this worker is
-                                # consuming so the Queues page reflects
-                                # them even when task events don't
-                                # carry a ``queue`` field (Celery only
-                                # emits queue names for explicit
-                                # routing; default-queue tasks arrive
-                                # with queue=None, leaving the Queues
-                                # page empty otherwise).
-                                queue_names = updates.get("queues") or []
-                                for qname in queue_names:
-                                    if not (isinstance(qname, str) and qname):
-                                        continue
-                                    # Each touch runs in its own
-                                    # savepoint. Without this a
-                                    # single bad queue name poisons
-                                    # the outer session on Postgres
-                                    # (``InFailedSqlTransactionError``)
-                                    # and silently rolls back the
-                                    # worker state + heartbeats we
-                                    # just wrote.
-                                    try:
-                                        async with session.begin_nested():
-                                            await queue_repo_w.touch(
-                                                project_id=self._project_id,
-                                                engine=engine,
-                                                name=qname,
-                                            )
-                                    except Exception:  # noqa: BLE001
-                                        logger.exception(
-                                            "z4j frame_router: queue touch failed",
-                                        )
                     except Exception:  # noqa: BLE001
                         logger.exception(
                             "z4j frame_router: failed to parse worker details",

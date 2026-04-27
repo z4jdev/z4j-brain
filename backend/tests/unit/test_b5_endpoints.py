@@ -51,6 +51,13 @@ def settings() -> Settings:
         argon2_memory_cost=8192,
         login_min_duration_ms=10,
         registry_backend="local",
+        # v1.0.13 fail-secure /metrics defaults to 401 without
+        # a bearer token. Tests that scrape /metrics need either
+        # ``metrics_public=True`` or a configured token.
+        metrics_public=True,
+        # SPA catch-all would shadow tests that ``include_router``
+        # extra endpoints after build time.
+        disable_spa_fallback=True,
     )
 
 
@@ -487,12 +494,86 @@ class TestMembershipsRouter:
 @pytest.mark.asyncio
 class TestMetricsEndpoint:
     async def test_metrics_returns_prometheus_text(self, client) -> None:
+        """Default unit-test fixture has metrics_public=True so the
+        scrape works without a bearer token. Mirrors a closed-network
+        deployment where Prometheus runs on the same host."""
         r = await client.get("/metrics")
         assert r.status_code == 200
         assert "text/plain" in r.headers.get("content-type", "")
         body = r.text
         assert "z4j_events_ingested_total" in body
         assert "z4j_agents_online" in body
+
+    async def test_metrics_returns_401_without_bearer_when_fail_secure(
+        self, brain_settings,
+    ) -> None:
+        """v1.0.13 fail-secure regression test.
+
+        Builds a brain with ``metrics_public=False`` and no
+        ``metrics_auth_token``: ``/metrics`` MUST return 401
+        unauthenticated. This is the gate the v1.0.13 hardening
+        added; this test catches any future regression that
+        accidentally re-opens the endpoint to anonymous scrapes.
+        """
+        from sqlalchemy.ext.asyncio import create_async_engine
+        from httpx import ASGITransport, AsyncClient
+
+        from z4j_brain.main import create_app
+
+        # Override: lock down /metrics for this one test.
+        secure_settings = brain_settings.model_copy(
+            update={"metrics_public": False, "metrics_auth_token": None},
+        )
+        engine = create_async_engine(secure_settings.database_url, future=True)
+        try:
+            app = create_app(secure_settings, engine=engine)
+            transport = ASGITransport(app=app)
+            async with AsyncClient(
+                transport=transport, base_url="http://testserver",
+            ) as ac:
+                r = await ac.get("/metrics")
+                assert r.status_code == 401
+                # And a wrong bearer also fails.
+                r2 = await ac.get(
+                    "/metrics",
+                    headers={"Authorization": "Bearer wrong-token"},
+                )
+                assert r2.status_code == 401
+        finally:
+            await engine.dispose()
+
+    async def test_metrics_accepts_correct_bearer_token(
+        self, brain_settings,
+    ) -> None:
+        """Operators with a configured token + matching bearer get 200."""
+        from pydantic import SecretStr
+        from sqlalchemy.ext.asyncio import create_async_engine
+        from httpx import ASGITransport, AsyncClient
+
+        from z4j_brain.main import create_app
+
+        token = "test-token-" + secrets.token_urlsafe(16)
+        secure_settings = brain_settings.model_copy(
+            update={
+                "metrics_public": False,
+                "metrics_auth_token": SecretStr(token),
+            },
+        )
+        engine = create_async_engine(secure_settings.database_url, future=True)
+        try:
+            app = create_app(secure_settings, engine=engine)
+            transport = ASGITransport(app=app)
+            async with AsyncClient(
+                transport=transport, base_url="http://testserver",
+            ) as ac:
+                r = await ac.get(
+                    "/metrics",
+                    headers={"Authorization": f"Bearer {token}"},
+                )
+                assert r.status_code == 200
+                assert "z4j_events_ingested_total" in r.text
+        finally:
+            await engine.dispose()
 
 
 # ---------------------------------------------------------------------------

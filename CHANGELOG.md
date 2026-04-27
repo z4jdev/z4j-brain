@@ -7,6 +7,135 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.15] - 2026-04-27
+
+### Security
+
+- **mTLS allow-list bypass closed in an internal opt-in gRPC
+  service.** The interceptor used `str.lstrip("DNS:")` to strip
+  a URI-style prefix that gRPC sometimes embeds in SAN entries.
+  `lstrip` takes a SET of characters - so any leading `D`, `N`,
+  `S`, or `:` got stripped from the CN itself. A legitimate
+  cert with CN `Scheduler-1` would become `cheduler-1` and
+  silently fail the allow-list match (locking out a legitimate
+  cert); conversely a hostile cert whose mangled CN happened to
+  coincide with an allow-list entry would have been accepted.
+  Switched to `str.removeprefix` so only the literal `DNS:`
+  prefix is stripped. The affected service is dormant by default
+  (gated behind an explicit opt-in flag) so no shipping
+  deployment is exposed unless the operator has explicitly
+  enabled it. Pinned by
+  `tests/unit/test_audit_phase2_fixes.py::TestInterceptorRemovePrefix`.
+
+### Performance
+
+- **Replay-worker N+1 batched** - the pending-fires replay
+  worker's catch-up logic used to call `schedules_repo.get(...)`
+  once per distinct schedule in a replay batch; replaced with a
+  single `WHERE id IN (...)` query. 5-schedule batch now issues
+  one SELECT instead of five. Pinned by
+  `tests/unit/test_audit_phase2_fixes.py::TestApplyCatchUpBatchedLookup`.
+- **P-1 batched heartbeat upsert** - replaces N+1 worker upsert
+  round-trips per event batch with a single
+  `INSERT...ON CONFLICT DO UPDATE`. The N+1 pattern was the
+  dominant cost on the hot WebSocket frame path
+  (`_handle_heartbeat` fires every 10s per agent connection;
+  ~6 concurrent heartbeats was where audit pass 9 / 2026-04-21
+  originally caught a `PendingRollbackError` cascade). The new
+  bulk path:
+  - dedupes `(engine, worker_name)` tuples in the
+    `EventIngestor.ingest_batch` accumulator and flushes them
+    as one statement;
+  - is dialect-aware (Postgres + SQLite ≥3.24 native
+    `ON CONFLICT DO UPDATE`; falls back to the original per-row
+    path for any other dialect);
+  - preserves "no key, no touch" semantics — a heartbeat-only
+    batch carrying just `last_heartbeat` + `state` does not
+    blank `hostname` / `concurrency` from an earlier
+    `worker_details` batch;
+  - runs inside a `begin_nested` savepoint so an
+    `OperationalError` (deadlock) falls back transparently to
+    the original per-row savepointed path. Fast happy path,
+    safe slow path, no regression in resilience.
+  - `AgentRepository.touch_heartbeat_at(agent_id, when=...)`
+    now carries the batch's `max(occurred_at)` so cross-replica
+    `now()` skew can't reorder agent liveness.
+  - 200-event batch now issues exactly **one** INSERT against
+    `workers` (was 200 SELECTs + up to 200 INSERTs/UPDATEs).
+    Verified end-to-end against a real WebSocket: 50 events
+    from 3 distinct workers collapse to 3 worker rows with
+    `last_heartbeat = max(occurred_at)` per worker (delta
+    0.000s). 13 new unit tests + 1 statement-count regression
+    guard.
+
+### Security
+
+- **SPA catch-all hardening** - any unmatched path under
+  `/api/`, `/ws/`, `/metrics`, `/auth/`, `/setup/`, `/healthz`,
+  `/.well-known/`, `/openapi.json`, `/docs`, `/redoc`, `/ready`,
+  `/live`, or `/assets/` now returns a clean 404 instead of
+  serving `index.html`. Pre-1.0.15 a typo'd API URL like
+  `/api/v1/typoo` returned the dashboard SPA HTML with a 200
+  status, and frontend code choked on `Unexpected token '<'`
+  trying to parse HTML as JSON. The catch-all denylist also
+  prevents test-time `include_router(...)` calls from being
+  shadowed by the SPA fallback.
+
+### Fixed
+
+- **Migration `2026_04_26_0004-scheduler_columns` downgrade is
+  now SQLite-safe.** SQLite's `ALTER TABLE DROP COLUMN` does a
+  full table rebuild and re-evaluates every remaining
+  constraint and default expression - dropping the
+  `catch_up` / `source` / `source_hash` / `last_fire_id`
+  columns one by one would fail with `no such column: catch_up`
+  on the rebuild because of constraint cross-references.
+  Wrapped the SQLite path in `op.batch_alter_table` so all
+  drops happen in a single coherent rebuild. Postgres path is
+  unchanged (native `ALTER TABLE DROP COLUMN` works fine).
+  Required for the test_migration downgrade-roundtrip suite
+  and any operator who deploys to SQLite for eval and needs to
+  roll back.
+- **`api/user_notifications.py` raised `ImportError` instead of
+  HTTP 403** on certain forbidden paths (the import was
+  `ForbiddenError` which doesn't exist in `z4j_brain.errors`).
+  Switched to `AuthorizationError` so the 403 envelope
+  actually fires. Latent since the personal-channel routes
+  shipped; surfaced during the v1.0.15 audit smoke pass.
+- **Trigger-schedule route no longer reaches into a private
+  attribute** of `CommandDispatcher` to find the brain's
+  `Settings` object. The route used
+  `getattr(dispatcher, "_settings", None)` - a fragile
+  private-API access that would silently break the moment
+  `CommandDispatcher.__slots__` or layout changes. Replaced
+  with a proper `Depends(get_settings)` injection plus a
+  process-wide singleton on `app.state` (cleanly torn down in
+  lifespan). Pinned by
+  `tests/unit/test_audit_phase2_fixes.py::TestTriggerRouteUsesProperDependency`.
+
+### Added
+
+- **`Settings.disable_spa_fallback`** (default `False`). When
+  `True`, `create_app` skips registering the SPA catch-all
+  route. Production never sets this; the unit-test fixture
+  sets it so tests can `include_router` extra API routes after
+  build time without the catch-all shadowing them.
+- **`/metrics` regression coverage** - new tests explicitly
+  verify 401 without bearer, 401 with wrong bearer, and 200
+  with the correct bearer token. Closes the gap that allowed
+  v1.0.13 to ship with a stale `metrics_returns_prometheus_text`
+  test that asserted 200 unconditionally.
+### Compatibility
+
+- Backwards compatible. The P-1 batched-upsert path is
+  internally transparent — same write semantics, fewer SQL
+  round-trips.
+- Schema additions auto-apply on `z4j-brain serve`; no
+  operator action required.
+- The new SPA catch-all denylist is a behavior CHANGE for
+  anyone who was relying on `/api/v1/typo` returning HTML
+  (you weren't, but worth noting).
+
 ## [1.0.14] - 2026-04-24
 
 ### Security (BREAKING)

@@ -157,7 +157,22 @@ def downgrade() -> None:
         op.execute(
             "ALTER TABLE schedules DROP CONSTRAINT IF EXISTS schedules_source_valid",
         )
-
-    for col in ("last_fire_id", "source_hash", "source", "catch_up"):
-        if _has_column(bind, "schedules", col):
-            op.drop_column("schedules", col)
+        for col in ("last_fire_id", "source_hash", "source", "catch_up"):
+            if _has_column(bind, "schedules", col):
+                op.drop_column("schedules", col)
+    else:
+        # SQLite: ``ALTER TABLE ... DROP COLUMN`` does a full table
+        # rebuild and re-evaluates every remaining constraint and
+        # default expression. If anything in the schedules table's
+        # generated/computed/check definitions still references one
+        # of the columns we're about to drop, the rebuild fails with
+        # ``no such column: <name>``. ``batch_alter_table`` performs
+        # all column drops in one rebuild so the engine sees the
+        # consistent target schema and never re-evaluates a
+        # half-mutated state. Required for the test_migration
+        # downgrade-roundtrip suite (and any operator who deploys to
+        # SQLite for eval and needs to roll back).
+        with op.batch_alter_table("schedules") as batch_op:
+            for col in ("last_fire_id", "source_hash", "source", "catch_up"):
+                if _has_column(bind, "schedules", col):
+                    batch_op.drop_column(col)

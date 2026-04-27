@@ -20,13 +20,24 @@ from z4j_brain.settings import Settings
 
 @pytest.fixture
 def brain_settings() -> Settings:
-    """A valid Settings instance backed by in-memory SQLite."""
+    """A valid Settings instance backed by in-memory SQLite.
+
+    Defaults to ``metrics_public=True`` so unit tests that hit
+    ``/metrics`` don't have to wire up the v1.0.13 bearer-token
+    flow. Tests that need to exercise the auth gate explicitly
+    should override via a tighter fixture.
+    """
     return Settings(
         database_url="sqlite+aiosqlite:///:memory:",
         secret=secrets.token_urlsafe(48),  # type: ignore[arg-type]
         session_secret=secrets.token_urlsafe(48),  # type: ignore[arg-type]
         log_json=False,
         environment="dev",
+        metrics_public=True,
+        # Tests register routes via ``brain_app.include_router``
+        # AFTER build time. The SPA catch-all (registered in
+        # ``create_app``) would otherwise shadow them.
+        disable_spa_fallback=True,
     )
 
 

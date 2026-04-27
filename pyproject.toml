@@ -1,6 +1,6 @@
 [project]
 name = "z4j-brain"
-version = "1.0.14"
+version = "1.0.15"
 description = "z4j brain - server, dashboard, and API (AGPL v3)"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -63,6 +63,15 @@ dependencies = [
 [project.optional-dependencies]
 postgres = [
     "asyncpg>=0.31",
+]
+# Brain-side z4j-scheduler gRPC service. Operators install with
+# ``pip install z4j[scheduler-grpc]`` once they decide to deploy a
+# scheduler companion process; the default install footprint stays
+# slim for everyone else.
+scheduler-grpc = [
+    "grpcio>=1.71",
+    "grpcio-tools>=1.71",
+    "cryptography>=44",
 ]
 test = [
     "pytest>=9.0.3",

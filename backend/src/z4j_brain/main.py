@@ -21,7 +21,7 @@ exercised independently in tests:
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
-from typing import TYPE_CHECKING, AsyncIterator
+from typing import TYPE_CHECKING, Any, AsyncIterator
 from uuid import UUID
 
 import httpx
@@ -70,6 +70,7 @@ from z4j_brain.domain.workers import (
 )
 from z4j_brain.domain.workers.agent_hygiene import AgentHygieneWorker
 from z4j_brain.domain.workers.partition_creator import PartitionCreatorWorker
+from z4j_brain.domain.workers.pending_fires import PendingFiresReplayWorker
 from z4j_brain.domain.workers.reconciliation import ReconciliationWorker
 from z4j_brain.logging_config import configure_logging
 from z4j_brain.middleware import (
@@ -214,6 +215,36 @@ def create_app(
         dashboard_hub=dashboard_hub,
     )
 
+    # ------------------------------------------------------------------
+    # Optional: z4j-scheduler gRPC service
+    # ------------------------------------------------------------------
+    # Constructed unconditionally so the .stop() in lifespan teardown
+    # is symmetric, but ``.start()`` short-circuits when
+    # ``scheduler_grpc_enabled=False`` so the gRPC runtime is never
+    # imported in installs that don't use it.
+    scheduler_grpc_server: Any = None  # type: ignore[assignment]
+    if settings.scheduler_grpc_enabled:
+        try:
+            from z4j_brain.scheduler_grpc.server import (  # noqa: PLC0415
+                SchedulerGrpcServer,
+            )
+
+            scheduler_grpc_server = SchedulerGrpcServer(
+                settings=settings,
+                db=db,
+                command_dispatcher=command_dispatcher,
+                audit_service=audit_service,
+            )
+        except ImportError:
+            # Optional extra not installed - log loudly and continue.
+            # Operator either installs `z4j[scheduler-grpc]` or
+            # unsets Z4J_SCHEDULER_GRPC_ENABLED.
+            logger.warning(
+                "z4j brain: Z4J_SCHEDULER_GRPC_ENABLED is set but the "
+                "scheduler-grpc extra is not installed. Run "
+                "`pip install z4j[scheduler-grpc]` to enable.",
+            )
+
     # Background workers
     supervisor = WorkerSupervisor(
         workers=[
@@ -249,6 +280,18 @@ def create_app(
                 name="partition_creator_worker",
                 tick=PartitionCreatorWorker(db=db, settings=settings).tick,
                 interval_seconds=3600.0,  # hourly
+            ),
+            # z4j-scheduler buffered-fire replay. Sweeps expired
+            # buffers + replays fires whose project just got an
+            # online agent for the right engine.
+            PeriodicWorker(
+                name="pending_fires_replay_worker",
+                tick=PendingFiresReplayWorker(
+                    db=db, dispatcher=command_dispatcher,
+                ).tick,
+                interval_seconds=float(
+                    settings.pending_fires_replay_interval_seconds,
+                ),
             ),
         ],
     )
@@ -338,9 +381,42 @@ def create_app(
                 "z4j brain worker supervisor start crashed; continuing",
             )
 
+        if scheduler_grpc_server is not None:
+            try:
+                await scheduler_grpc_server.start()
+            except Exception:  # noqa: BLE001
+                # Hard failure here means TLS material is missing or
+                # the bind port is taken. Brain still serves REST so
+                # operators can investigate, but the scheduler will
+                # be unable to connect. Log critical so the operator
+                # sees it without scrolling.
+                logger.critical(
+                    "z4j brain scheduler_grpc start failed; scheduler "
+                    "will be unable to connect",
+                    exc_info=True,
+                )
+
         try:
             yield
         finally:
+            # Close the singleton TriggerScheduleClient (lazy-built
+            # by the schedules trigger route). Failure here is non-
+            # fatal - the channel is going away anyway.
+            trig_client = getattr(
+                app.state, "scheduler_trigger_client", None,
+            )
+            if trig_client is not None:
+                try:
+                    await trig_client.close()
+                except Exception:  # noqa: BLE001
+                    logger.exception(
+                        "z4j brain scheduler_trigger_client close crashed",
+                    )
+            if scheduler_grpc_server is not None:
+                try:
+                    await scheduler_grpc_server.stop()
+                except Exception:  # noqa: BLE001
+                    logger.exception("z4j brain scheduler_grpc stop crashed")
             try:
                 await supervisor.stop()
             except Exception:  # noqa: BLE001
@@ -570,7 +646,7 @@ def create_app(
         pkg_dashboard = _Path(__file__).resolve().parent / "dashboard" / "dist"
         if pkg_dashboard.is_dir():
             dashboard_dir = pkg_dashboard
-    if dashboard_dir.is_dir():
+    if dashboard_dir.is_dir() and not settings.disable_spa_fallback:
         from fastapi import HTTPException
         from fastapi.responses import FileResponse
         from starlette.staticfiles import StaticFiles
@@ -587,14 +663,48 @@ def create_app(
                 name="dashboard-assets",
             )
 
+        # Path prefixes that belong to the backend, never the SPA.
+        # The catch-all explicitly 404s these so a typo'd
+        # ``/api/v1/typoo`` returns clean JSON (or a 404 the
+        # frontend can detect) instead of HTML masquerading as
+        # an API response. v1.0.15 hardening: previously the
+        # SPA fallback served ``index.html`` for any unmatched
+        # path, which caused frontend code to choke on
+        # ``Unexpected token '<'`` when an API URL was wrong.
+        _BACKEND_PREFIXES = (
+            "api/",
+            "ws/",
+            "metrics",
+            "assets/",
+            "auth/",
+            "setup",
+            "setup/",
+            "healthz",
+            "ready",
+            "live",
+            ".well-known/",
+            "openapi.json",
+            "docs",
+            "redoc",
+        )
+
         @app.get("/{full_path:path}", include_in_schema=False)
         async def spa_fallback(full_path: str) -> FileResponse:
             """Serve a real file under the dist or fall back to index.html.
 
             Path traversal is blocked by resolving the candidate
             against the dist root and rejecting any escape via
-            ``Path.relative_to``.
+            ``Path.relative_to``. Backend paths (``/api/``, ``/ws/``,
+            ``/metrics``, etc.) always 404 from this fallback so a
+            typo or a route registered after app build time gets a
+            real 404 instead of HTML.
             """
+            # Normalize: strip leading "/" if present (path:path
+            # captures "api/v1/x" without the leading slash).
+            normalized = full_path.lstrip("/")
+            for prefix in _BACKEND_PREFIXES:
+                if normalized == prefix.rstrip("/") or normalized.startswith(prefix):
+                    raise HTTPException(status_code=404)
             if full_path:
                 candidate = (dashboard_dir / full_path).resolve()
                 try:
