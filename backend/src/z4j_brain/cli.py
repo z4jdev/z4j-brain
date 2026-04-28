@@ -199,6 +199,37 @@ def main(argv: Sequence[str] | None = None) -> int:
         ),
     )
 
+    # audit fork-cleanup: quarantine duplicate prev_row_hmac rows
+    # so the v1.1.0+ partial UNIQUE index can apply. Shipped in
+    # 1.1.1 after the index migration crashed deployments that had
+    # pre-existing chain forks (real bugs in older z4j releases or
+    # replay artefacts during testing). Auto-backs up before any
+    # write; preserves every fork row in audit_log_legacy_forks.
+    audit_fork_cleanup = audit_sub.add_parser(
+        "fork-cleanup",
+        help=(
+            "quarantine duplicate prev_row_hmac rows so the UNIQUE "
+            "chain index can apply (v1.1.0+ migration prerequisite)"
+        ),
+    )
+    audit_fork_cleanup.add_argument(
+        "--apply",
+        action="store_true",
+        help=(
+            "skip the [y/N] prompt and apply the cleanup. Use in "
+            "scripts and CI; interactive use should omit this flag "
+            "to inspect the diff first."
+        ),
+    )
+    audit_fork_cleanup.add_argument(
+        "--no-backup",
+        action="store_true",
+        help=(
+            "skip the auto-backup step. Only set if you have your "
+            "own backup strategy; the default is safer."
+        ),
+    )
+
     # bootstrap-admin: imperative first-boot admin creation.
     # Complements the Z4J_BOOTSTRAP_ADMIN_* env var path so operators
     # who prefer a CLI step (or want to re-create an admin after
@@ -2029,6 +2060,8 @@ def _run_audit(args: argparse.Namespace) -> int:
     """Dispatch ``z4j-brain audit <subcommand>``."""
     if args.audit_command == "verify":
         return _run_audit_verify(args)
+    if args.audit_command == "fork-cleanup":
+        return _run_audit_fork_cleanup(args)
     print(  # noqa: T201
         f"z4j-brain audit: unknown subcommand {args.audit_command!r}",
         file=sys.stderr,
@@ -2094,6 +2127,230 @@ def _run_audit_verify(args: argparse.Namespace) -> int:
         return 0
 
     return asyncio.run(_run())
+
+
+def _run_audit_fork_cleanup(args: argparse.Namespace) -> int:
+    """Quarantine duplicate ``prev_row_hmac`` rows so the v1.1.0
+    UNIQUE chain index can apply.
+
+    Shipped in 1.1.1 after the migration ``2026_04_28_0012_audit_unique``
+    crashed live deployments that had pre-existing chain forks: rows
+    sharing a non-NULL prev_row_hmac, produced by older releases
+    (race in AuditService.record), test fixtures, or replay artefacts.
+
+    What it does, in order:
+
+    1. Connects to the configured DB via Settings.
+    2. SELECTs duplicate prev_row_hmac groups + the rows in them.
+    3. Prints the duplicate set so the operator can eyeball it.
+    4. Auto-backs up the DB (SQLite: file copy with timestamp suffix;
+       Postgres: warns to use ``pg_dump`` and refuses unless
+       ``--no-backup``).
+    5. Prompts ``[y/N]`` unless ``--apply``.
+    6. CREATE TABLE IF NOT EXISTS ``audit_log_legacy_forks`` with
+       the same shape as ``audit_log``, copies fork rows into it
+       (preserving every byte for forensic review), then DELETEs
+       them from ``audit_log``. The earliest row per group (by id
+       lexicographic order) is kept as the canonical chain link.
+    7. Verifies no remaining duplicates.
+    8. Returns 0 on clean state, 1 on residual duplicates, 2 on
+       configuration / connection failure.
+
+    Operator workflow after running this:
+       z4j serve         # migration applies cleanly, brain boots
+    """
+    import asyncio
+    import shutil
+    import sys
+    import time
+
+    _bootstrap_env_for_management_commands()
+
+    from sqlalchemy import text
+
+    from z4j_brain.persistence.database import (
+        DatabaseManager,
+        create_engine_from_settings,
+    )
+    from z4j_brain.settings import Settings
+
+    try:
+        settings = Settings()  # type: ignore[call-arg]
+    except Exception as exc:  # noqa: BLE001
+        print(  # noqa: T201
+            f"z4j-brain audit fork-cleanup: failed to load settings: "
+            f"{type(exc).__name__}",
+            file=sys.stderr,
+        )
+        return 2
+
+    db_url = settings.database_url
+    is_sqlite = "sqlite" in db_url
+
+    async def _scan() -> list[tuple[str, int]]:
+        engine = create_engine_from_settings(settings)
+        db = DatabaseManager(engine)
+        try:
+            async with db.session() as session:
+                result = await session.execute(
+                    text(
+                        "SELECT prev_row_hmac, COUNT(*) AS cnt "
+                        "FROM audit_log "
+                        "WHERE prev_row_hmac IS NOT NULL "
+                        "GROUP BY prev_row_hmac "
+                        "HAVING COUNT(*) > 1"
+                    )
+                )
+                return [(str(r[0]), int(r[1])) for r in result.fetchall()]
+        finally:
+            await db.dispose()
+
+    dups = asyncio.run(_scan())
+    if not dups:
+        print(  # noqa: T201
+            "z4j-brain audit fork-cleanup: no duplicate prev_row_hmac "
+            "rows found. Audit chain is fork-free; nothing to do."
+        )
+        return 0
+
+    fork_rows = sum(c for _, c in dups)
+    fork_groups = len(dups)
+    rows_to_quarantine = fork_rows - fork_groups
+
+    print(  # noqa: T201
+        f"\nFound {fork_rows} rows in {fork_groups} duplicate "
+        f"prev_row_hmac groups. The cleanup will:\n"
+        f"  - keep the earliest row in each group as the canonical chain link\n"
+        f"  - move the remaining {rows_to_quarantine} fork row(s) to "
+        f"`audit_log_legacy_forks` (every byte preserved for forensic review)\n"
+    )
+
+    print("Duplicate groups:")  # noqa: T201
+    for prev_hmac, count in dups:
+        prefix = prev_hmac[:16] if len(prev_hmac) > 16 else prev_hmac
+        print(f"  prev_row_hmac={prefix}... count={count}")  # noqa: T201
+    print()  # noqa: T201
+
+    if not args.apply:
+        try:
+            answer = input(
+                "Proceed with quarantine? [y/N] ",
+            ).strip().lower()
+        except EOFError:
+            answer = ""
+        if answer != "y":
+            print("Aborted; no changes made.")  # noqa: T201
+            return 0
+
+    # Backup before any write.
+    if not args.no_backup:
+        if is_sqlite:
+            sqlite_path = db_url.split("///", 1)[-1]
+            if sqlite_path.startswith("/"):
+                src_path = sqlite_path
+            else:
+                src_path = sqlite_path
+            backup_path = f"{src_path}.pre-fork-cleanup.{int(time.time())}"
+            try:
+                shutil.copy2(src_path, backup_path)
+                print(f"Backup written: {backup_path}")  # noqa: T201
+            except OSError as exc:
+                print(  # noqa: T201
+                    f"Backup failed: {exc}. Re-run with --no-backup if "
+                    "you have your own backup strategy.",
+                    file=sys.stderr,
+                )
+                return 2
+        else:
+            print(  # noqa: T201
+                "Postgres detected: this command does not run pg_dump "
+                "for you. Take a backup with `pg_dump` BEFORE re-running, "
+                "or pass --no-backup if you already have one.",
+                file=sys.stderr,
+            )
+            if not args.apply:
+                # Interactive: refuse without explicit confirmation
+                # of the backup path.
+                return 2
+
+    async def _cleanup() -> int:
+        engine = create_engine_from_settings(settings)
+        db = DatabaseManager(engine)
+        try:
+            async with db.session() as session:
+                # Create legacy table (CREATE TABLE AS / WHERE 0
+                # copies the schema without rows on both engines).
+                await session.execute(
+                    text(
+                        "CREATE TABLE IF NOT EXISTS audit_log_legacy_forks "
+                        "AS SELECT * FROM audit_log WHERE 1=0"
+                    )
+                )
+
+                # Identify fork rows: in a duplicate group, AND not
+                # the earliest by id.
+                ins = await session.execute(
+                    text(
+                        "INSERT INTO audit_log_legacy_forks "
+                        "SELECT * FROM audit_log "
+                        "WHERE prev_row_hmac IS NOT NULL "
+                        "  AND prev_row_hmac IN ("
+                        "    SELECT prev_row_hmac FROM audit_log "
+                        "    WHERE prev_row_hmac IS NOT NULL "
+                        "    GROUP BY prev_row_hmac "
+                        "    HAVING COUNT(*) > 1"
+                        "  )"
+                        "  AND id NOT IN ("
+                        "    SELECT MIN(id) FROM audit_log "
+                        "    WHERE prev_row_hmac IS NOT NULL "
+                        "    GROUP BY prev_row_hmac"
+                        "  )"
+                    )
+                )
+                quarantined = ins.rowcount or 0
+
+                deleted = await session.execute(
+                    text(
+                        "DELETE FROM audit_log "
+                        "WHERE id IN ("
+                        "  SELECT id FROM audit_log_legacy_forks"
+                        ")"
+                    )
+                )
+                deleted_count = deleted.rowcount or 0
+                await session.commit()
+
+                # Verify
+                check = await session.execute(
+                    text(
+                        "SELECT COUNT(*) FROM ("
+                        "  SELECT prev_row_hmac FROM audit_log "
+                        "  WHERE prev_row_hmac IS NOT NULL "
+                        "  GROUP BY prev_row_hmac "
+                        "  HAVING COUNT(*) > 1"
+                        ") AS dup"
+                    )
+                )
+                remaining = int(check.scalar() or 0)
+
+            print(  # noqa: T201
+                f"\nQuarantined {quarantined} row(s) to "
+                f"audit_log_legacy_forks; deleted {deleted_count} row(s) "
+                f"from audit_log."
+            )
+            if remaining > 0:
+                print(  # noqa: T201
+                    f"WARNING: {remaining} duplicate group(s) still present. "
+                    "Re-run, or inspect the data manually.",
+                    file=sys.stderr,
+                )
+                return 1
+            print("Audit chain is fork-free. Run `z4j serve` to apply the migration.")  # noqa: T201
+            return 0
+        finally:
+            await db.dispose()
+
+    return asyncio.run(_cleanup())
 
 
 def _run_reset_setup(args: argparse.Namespace) -> int:

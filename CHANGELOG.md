@@ -7,6 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.1.1] - 2026-04-28
+
+### Fixed
+
+- **Migration ``2026_04_28_0012_audit_unique`` no longer crashes
+  on populated DBs with pre-existing chain forks.** v1.1.0
+  shipped with a partial UNIQUE index migration that crashed
+  mid-flight (``sqlite3.IntegrityError: UNIQUE constraint failed:
+  audit_log.prev_row_hmac``) when applied to deployments that
+  had duplicate ``prev_row_hmac`` rows from older z4j releases or
+  testing artefacts. The migration now pre-flight-checks for
+  duplicates and refuses cleanly with a precise remediation
+  message pointing to the new ``z4j audit fork-cleanup`` CLI.
+  Operators upgrading from 1.0.x to 1.1.x with non-empty audit
+  data will see the clean error instead of an opaque crash.
+
+### Added
+
+- **``z4j audit fork-cleanup``** subcommand. Quarantines
+  duplicate ``prev_row_hmac`` rows to a sibling table
+  ``audit_log_legacy_forks`` so the v1.1.0 partial UNIQUE chain
+  index can apply.
+  - Auto-backs up the SQLite DB before any write
+    (``<db>.pre-fork-cleanup.<unix-ts>``); refuses on Postgres
+    unless ``--no-backup`` is set explicitly so operators can
+    take their own ``pg_dump``.
+  - Interactive ``[y/N]`` prompt by default; ``--apply`` for CI.
+  - Preserves every fork row in ``audit_log_legacy_forks`` (every
+    byte, for forensic review) and keeps the earliest row per
+    duplicate group as the canonical chain link.
+  - Exits 0 on clean state, 1 on residual duplicates, 2 on
+    config / connection failure.
+
+## [Pending features] (slated for 1.2.0)
+
 ### Added
 
 - **Schedule CRUD UI in the dashboard** (closes
