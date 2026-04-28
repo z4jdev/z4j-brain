@@ -123,6 +123,34 @@ class RetryTaskRequest(BaseModel):
     def _check_engine(cls, v: str) -> str:
         return _validate_engine_dispatch(v)
 
+    @field_validator("override_args", "override_kwargs")
+    @classmethod
+    def _cap_overrides(cls, v: object) -> object:
+        """Round-8 audit fix R8-Pyd-H3 (Apr 2026): cap override size.
+
+        Pre-fix a 50 MB ``override_kwargs`` was parsed, persisted
+        into ``commands.payload`` JSONB, HMAC-signed, and pushed
+        over the wire to the agent — a single retry request could
+        OOM the brain or wedge the WS frame cap downstream. The
+        64 KiB ceiling matches the ``_validate_args_kwargs_size``
+        cap already used on schedule create/update.
+        """
+        if v is None:
+            return v
+        import json as _json  # noqa: PLC0415
+
+        try:
+            size = len(_json.dumps(v).encode("utf-8"))
+        except Exception as exc:  # noqa: BLE001
+            raise ValueError(
+                f"override value is not JSON-serialisable: {exc}",
+            ) from exc
+        if size > 64 * 1024:
+            raise ValueError(
+                f"override payload {size} bytes exceeds 64 KiB cap",
+            )
+        return v
+
 
 class CancelTaskRequest(BaseModel):
     agent_id: uuid.UUID

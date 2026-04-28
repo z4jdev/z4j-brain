@@ -61,6 +61,46 @@ logger = logging.getLogger("z4j.brain.scheduler_grpc.handlers")
 # clicked trigger now".
 _FIRE_ACTION = "schedule.fire"
 
+# Hard caps applied to operator-facing string fields the scheduler
+# reports back via error responses. Keep error_message bounded so:
+#
+# - a chatty `str(exc)` (SQL fragments, file paths, tracebacks) does
+#   not leak internals to the wire, AND
+# - a hostile scheduler can't push a multi-MB string into our
+#   schedule_fires history table by repeatedly failing.
+#
+# Audit finding L-3 / M-3 (Apr 2026 security audit).
+_ERROR_MESSAGE_MAX_CHARS = 500
+_ERROR_CODE_MAX_CHARS = 64
+
+
+def _sanitize_error_message(raw: str | None, *, max_chars: int = _ERROR_MESSAGE_MAX_CHARS) -> str | None:
+    """Bound + sanitize a scheduler-reported error string.
+
+    Strips control characters (newlines, ANSI escapes) so a single
+    error can't break log-line parsing or smuggle log injection
+    payloads. Truncates to ``max_chars`` so error_message can't
+    OOM the schedule_fires column.
+
+    Returns ``None`` when input is empty so we don't store a
+    sentinel that suggests a real error.
+    """
+    if not raw:
+        return None
+    # Keep printable ASCII + common Latin-1; drop ESC, DEL, NUL,
+    # other control chars. Tab + space stay because real error
+    # text uses them.
+    cleaned = "".join(
+        c for c in raw
+        if c == "\t" or c == " " or (32 <= ord(c) < 127) or 160 <= ord(c) <= 255
+    )
+    cleaned = cleaned.strip()
+    if not cleaned:
+        return None
+    if len(cleaned) > max_chars:
+        cleaned = cleaned[:max_chars - 3] + "..."
+    return cleaned
+
 # Default page size when the scheduler does not specify one.
 _DEFAULT_LIST_PAGE_SIZE = 100
 
@@ -70,6 +110,29 @@ _DEFAULT_LIST_PAGE_SIZE = 100
 # returned to z4j-scheduler so the two scheduling surfaces don't
 # step on each other.
 _SCHEDULER_NAME = "z4j-scheduler"
+
+
+#: Round-8 audit fix R8-Async-H3 (Apr 2026): per-process bound on
+#: in-flight FireSchedule handlers. Each holds a DB session across
+#: with_for_update + agent lookup + dispatcher.issue + commit; an
+#: unbounded burst exhausts the pool and starves unrelated REST
+#: handlers. 8 leaves headroom in a typical 30-conn pool for
+#: workers + dashboard reads.
+_FIRE_SCHEDULE_BOUND = 8
+_fire_schedule_sem: asyncio.Semaphore | None = None
+
+
+def _get_fire_schedule_semaphore() -> asyncio.Semaphore:
+    """Lazy-init the FireSchedule semaphore on first call.
+
+    Lazy because module import predates the running event loop in
+    test fixtures; ``asyncio.Semaphore`` binds to the loop at
+    construction.
+    """
+    global _fire_schedule_sem
+    if _fire_schedule_sem is None:
+        _fire_schedule_sem = asyncio.Semaphore(_FIRE_SCHEDULE_BOUND)
+    return _fire_schedule_sem
 
 
 # =====================================================================
@@ -95,16 +158,57 @@ class SchedulerServiceImpl(pb_grpc.SchedulerServiceServicer):
         command_dispatcher: CommandDispatcher,
         audit_service: AuditService,
     ) -> None:
+        from collections import defaultdict  # noqa: PLC0415
+
+        from z4j_brain.domain.scheduler_rate_limiter import (  # noqa: PLC0415
+            SchedulerRateLimiter,
+        )
+
         self._settings = settings
         self._db = db
         self._dispatcher = command_dispatcher
         self._audit = audit_service
+        self._rate_limiter = SchedulerRateLimiter(db=db, settings=settings)
         # Used by Watch handler so multiple concurrent streams share
         # one polling loop's snapshot when load matters. Phase 1
         # implementation just keeps the lock to make the code shape
         # ready for that optimisation; each stream still polls
         # independently.
         self._watch_lock = asyncio.Lock()
+        # Audit fix (Apr 2026 follow-up): bounded WatchSchedules
+        # concurrency. Pre-fix every WatchSchedules RPC opened its
+        # own asyncpg LISTEN connection with no cap - a misbehaving
+        # scheduler that opened+dropped streams in a loop drained
+        # Postgres ``max_connections`` and killed brain's main pool.
+        # Two locks: a global semaphore caps total streams across
+        # the brain process; a per-CN counter caps any single cert
+        # from monopolising the global cap.
+        # Round-10 audit fix R10-Sched-H1 (Apr 2026): replace the
+        # ``asyncio.Semaphore`` + ``wait_for(..., timeout=0)`` pattern
+        # with a plain counter under a lock. The semaphore approach
+        # had two leak vectors:
+        #
+        # 1. ``asyncio.wait_for(sem.acquire(), 0)`` is documented as
+        #    racy when the awaitable completes synchronously: the
+        #    timer fires, ``wait_for`` cancels the task, but the
+        #    task already decremented ``_value`` — slot leaked,
+        #    caller sees TimeoutError. Triggered on every successful
+        #    acquire under load.
+        #
+        # 2. Acquire-then-cancel window between the acquire's own
+        #    try-block and the stream's try-block (different try
+        #    blocks): a gRPC ``context.cancel()`` in the gap left
+        #    the slot held with no finally registered to release it.
+        #
+        # The counter-under-lock pattern is atomic (single
+        # ``async with``), the release is shielded against cancel,
+        # and we expose ``_watch_global_count`` for the
+        # observability gauge below.
+        self._watch_global_cap = settings.scheduler_grpc_watch_max_concurrent
+        self._watch_global_count: int = 0
+        self._watch_global_lock = asyncio.Lock()
+        self._watch_per_cert_count: dict[str, int] = defaultdict(int)
+        self._watch_per_cert_lock = asyncio.Lock()
 
     # ------------------------------------------------------------------
     # ListSchedules - server streaming
@@ -118,6 +222,12 @@ class SchedulerServiceImpl(pb_grpc.SchedulerServiceServicer):
         from sqlalchemy import select
 
         from z4j_brain.persistence.models import Schedule
+        from z4j_brain.scheduler_grpc.binding import (  # noqa: PLC0415
+            enforce_cn_project_binding,
+            filter_project_ids_by_binding,
+        )
+
+        bindings = self._settings.scheduler_grpc_cn_project_bindings
 
         page_size = (
             request.page_size if request.page_size > 0 else _DEFAULT_LIST_PAGE_SIZE
@@ -136,7 +246,30 @@ class SchedulerServiceImpl(pb_grpc.SchedulerServiceServicer):
                         f"invalid project_id {request.project_id!r}",
                     )
                     return
+                # Audit fix M-5 (Apr 2026): enforce per-cert project
+                # binding. Bound CNs can only see schedules for their
+                # bound project list; no-op when bindings is empty or
+                # the peer's CN isn't in the map.
+                await enforce_cn_project_binding(
+                    context=context,
+                    project_id=pid,
+                    bindings=bindings,
+                    db=self._db,
+                )
                 stmt = stmt.where(Schedule.project_id == pid)
+            else:
+                # No project_id in request - if the peer is a bound
+                # CN, narrow the query to its allowed projects so a
+                # bound scheduler never sees rows it doesn't own.
+                bound_projects = await filter_project_ids_by_binding(
+                    context=context, bindings=bindings, db=self._db,
+                )
+                if bound_projects is not None:
+                    if not bound_projects:
+                        # Bound CN with no resolvable projects - empty
+                        # result set rather than a leaking error.
+                        return
+                    stmt = stmt.where(Schedule.project_id.in_(bound_projects))
             stmt = stmt.order_by(Schedule.id)
 
             offset = 0
@@ -191,32 +324,186 @@ class SchedulerServiceImpl(pb_grpc.SchedulerServiceServicer):
                 )
                 return
 
-        # Dispatch on dialect. The async engine carries the dialect
-        # name; we read it once at stream open. Falling back to the
-        # poll path on any dialect we don't recognise (defence in
-        # depth - a future Postgres replacement should not silently
-        # drop notifications because of a typo).
-        dialect = self._db.engine.dialect.name
-        if dialect == "postgresql":
-            async for event in self._watch_via_listen(
-                project_id=project_id,
-                resume_token=request.resume_token,
+        # Audit fix M-5 (Apr 2026): per-cert project binding. For an
+        # explicit project_id, enforce binding. For "all projects"
+        # mode (project_id=None), narrow to the peer's bound set.
+        from z4j_brain.scheduler_grpc.binding import (  # noqa: PLC0415
+            enforce_cn_project_binding,
+            filter_project_ids_by_binding,
+        )
+
+        bindings = self._settings.scheduler_grpc_cn_project_bindings
+        bound_project_ids: set[UUID] | None = None
+        if project_id is not None:
+            await enforce_cn_project_binding(
                 context=context,
-            ):
-                yield event
-            return
-        # SQLite + everything else → polling fallback.
-        async for event in self._watch_via_polling(
-            project_id=project_id,
-            resume_token=request.resume_token,
-            context=context,
-        ):
-            yield event
+                project_id=project_id,
+                bindings=bindings,
+                db=self._db,
+            )
+        else:
+            bound_project_ids = await filter_project_ids_by_binding(
+                context=context, bindings=bindings, db=self._db,
+            )
+            if bound_project_ids is not None and not bound_project_ids:
+                # Bound CN with no resolvable projects - close stream.
+                return
+
+        # Compute the effective project filter applied throughout the
+        # stream. Three cases:
+        #   - request.project_id set + binding allows  → single id
+        #   - request.project_id unset, bound CN      → set of ids
+        #   - request.project_id unset, unbound CN    → no filter
+        if project_id is not None:
+            project_filter: set[UUID] | None = {project_id}
+        else:
+            project_filter = bound_project_ids  # may be None
+
+        # Audit fix (Apr 2026 follow-up): bounded WatchSchedules
+        # concurrency. Acquire a global semaphore + bump the per-CN
+        # counter; release both on stream end. RESOURCE_EXHAUSTED on
+        # cap so the scheduler client retries with backoff (its
+        # ``_backoff_or_stop`` already handles this).
+        from z4j_brain.scheduler_grpc.binding import (  # noqa: PLC0415
+            extract_peer_cns as _peer_cns,
+        )
+
+        peer_cns = _peer_cns(context)
+        cert_cn = sorted(peer_cns)[0] if peer_cns else "_anon"
+        per_cert_cap = self._settings.scheduler_grpc_watch_max_per_cert
+        # Try to take the per-CN slot first; if denied, don't even
+        # touch the global semaphore (no point queuing).
+        async with self._watch_per_cert_lock:
+            current = self._watch_per_cert_count[cert_cn]
+            if current >= per_cert_cap:
+                logger.warning(
+                    "z4j.brain.scheduler_grpc: WatchSchedules per-cert "
+                    "cap reached for cert_cn=%r (cap=%d); rejecting",
+                    cert_cn, per_cert_cap,
+                )
+                await context.abort(
+                    grpc.StatusCode.RESOURCE_EXHAUSTED,
+                    "WatchSchedules per-cert concurrent stream cap reached",
+                )
+                return
+            self._watch_per_cert_count[cert_cn] = current + 1
+        # Acquire the global concurrency slot via the counter-under-
+        # lock pattern. Round-10 audit fix R10-Sched-H1 (Apr 2026):
+        # the prior implementation used
+        # ``asyncio.wait_for(self._watch_global_sem.acquire(), 0)``
+        # which has TWO leak vectors:
+        #
+        # 1. ``asyncio.wait_for(coro, 0)`` is documented as racy
+        #    when ``coro`` completes synchronously. ``Semaphore.
+        #    acquire()`` on an available slot decrements
+        #    ``_value`` and returns immediately; the timer fires
+        #    in the same tick and ``wait_for`` cancels the task
+        #    that just succeeded, raising TimeoutError. The slot
+        #    was DECREMENTED but the caller sees rejection — slot
+        #    leaked permanently. Triggers on every successful
+        #    acquire under load. Observed in production: a single
+        #    scheduler client with retry-loop reconnects exhausted
+        #    a default-64 cap within hours.
+        #
+        # 2. Acquire-then-cancel window between the
+        #    ``except (TimeoutError, asyncio.TimeoutError):``
+        #    block returning and the stream's own ``try:`` block
+        #    registering its finally. A gRPC ``context.cancel()``
+        #    landing in that gap left the slot acquired with no
+        #    finally to release it.
+        #
+        # The new shape uses a plain integer + ``asyncio.Lock``:
+        # the increment is atomic under one ``async with``, the
+        # decrement is shielded against cancellation, and the
+        # full lifecycle lives inside a single try/finally so
+        # there's no acquire-then-cancel gap.
+        async with self._watch_global_lock:
+            if self._watch_global_count >= self._watch_global_cap:
+                # Reject. Decrement the per-cert slot we already
+                # took above. NOTE: this decrement is OK to do
+                # outside a shield because we haven't crossed any
+                # await that the caller could cancel; the lock is
+                # purely synchronous after the await above.
+                async with self._watch_per_cert_lock:
+                    self._watch_per_cert_count[cert_cn] -= 1
+                    if self._watch_per_cert_count[cert_cn] <= 0:
+                        self._watch_per_cert_count.pop(cert_cn, None)
+                logger.warning(
+                    "z4j.brain.scheduler_grpc: WatchSchedules global "
+                    "cap reached (current=%d max=%d); rejecting new "
+                    "stream from cert_cn=%r",
+                    self._watch_global_count,
+                    self._watch_global_cap,
+                    cert_cn,
+                )
+                await context.abort(
+                    grpc.StatusCode.RESOURCE_EXHAUSTED,
+                    "WatchSchedules concurrent stream cap reached",
+                )
+                return
+            self._watch_global_count += 1
+        try:
+            # Dispatch on dialect. The async engine carries the
+            # dialect name; we read it once at stream open. Falling
+            # back to the poll path on any dialect we don't
+            # recognise (defence in depth - a future Postgres
+            # replacement should not silently drop notifications
+            # because of a typo).
+            dialect = self._db.engine.dialect.name
+            if dialect == "postgresql":
+                async for event in self._watch_via_listen(
+                    project_filter=project_filter,
+                    resume_token=request.resume_token,
+                    context=context,
+                ):
+                    yield event
+            else:
+                # SQLite + everything else → polling fallback.
+                async for event in self._watch_via_polling(
+                    project_filter=project_filter,
+                    resume_token=request.resume_token,
+                    context=context,
+                ):
+                    yield event
+        finally:
+            # R10-Sched-H1: shield BOTH decrements so a
+            # cancellation landing on the lock-acquire await
+            # doesn't strand the slot. The shielded coroutine
+            # below holds two locks back-to-back; on cancel the
+            # inner work runs to completion, the cancellation
+            # then propagates to whatever was awaiting us.
+            await asyncio.shield(
+                self._release_watch_slot(cert_cn),
+            )
+
+    async def _release_watch_slot(self, cert_cn: str) -> None:
+        """Round-10 audit fix R10-Sched-H1 (Apr 2026): symmetric
+        decrement of both the global counter and the per-cert
+        counter. Wrapped in ``asyncio.shield`` by the caller so a
+        cancel landing on the lock-acquire await can't strand
+        either slot. Both locks are short-held (no I/O), so the
+        shielded window is bounded to microseconds.
+        """
+        async with self._watch_global_lock:
+            self._watch_global_count -= 1
+            if self._watch_global_count < 0:
+                # Defensive: never let the counter go negative.
+                # If it does, log loud — that's a code bug.
+                logger.error(
+                    "z4j.brain.scheduler_grpc: watch_global_count "
+                    "went negative (%d); resetting to 0",
+                    self._watch_global_count,
+                )
+                self._watch_global_count = 0
+        async with self._watch_per_cert_lock:
+            self._watch_per_cert_count[cert_cn] -= 1
+            if self._watch_per_cert_count[cert_cn] <= 0:
+                self._watch_per_cert_count.pop(cert_cn, None)
 
     async def _watch_via_listen(
         self,
         *,
-        project_id: UUID | None,
+        project_filter: set[UUID] | None,
         resume_token: str,
         context: grpc.aio.ServicerContext,
     ) -> AsyncIterator[pb.ScheduleEvent]:
@@ -246,7 +533,7 @@ class SchedulerServiceImpl(pb_grpc.SchedulerServiceServicer):
                 "back to polling for WatchSchedules",
             )
             async for event in self._watch_via_polling(
-                project_id=project_id,
+                project_filter=project_filter,
                 resume_token=resume_token,
                 context=context,
             ):
@@ -268,7 +555,7 @@ class SchedulerServiceImpl(pb_grpc.SchedulerServiceServicer):
                 )
         if last_seen_at is not None:
             catchup_events, _ = await self._compute_watch_diff(
-                project_id=project_id,
+                project_filter=project_filter,
                 last_seen_at=last_seen_at,
                 snapshot={},
                 first_cycle=True,
@@ -277,18 +564,23 @@ class SchedulerServiceImpl(pb_grpc.SchedulerServiceServicer):
                 yield event
 
         # Open a dedicated asyncpg connection on the same DSN as the
-        # SQLAlchemy engine. Translate the SQLAlchemy URL to the
-        # asyncpg DSN form (asyncpg doesn't understand the
-        # ``postgresql+asyncpg://`` driver suffix). Use
-        # ``render_as_string(hide_password=False)`` because the
-        # default ``str(url)`` masks the password as ``***`` -
-        # asyncpg would then fail with InvalidPasswordError. The
-        # rendered string never leaves this function.
-        dsn = self._db.engine.url.render_as_string(
-            hide_password=False,
-        ).replace("postgresql+asyncpg://", "postgresql://")
+        # SQLAlchemy engine. Audit fix L-1 (Apr 2026): pass connection
+        # parameters as kwargs (host/port/user/password/database)
+        # instead of materializing a plain-text URL string with the
+        # password in it. The string-based path leaves the password
+        # in heap until GC and would surface in any future log line
+        # / core dump / exception traceback inside this function.
+        # ``URL.translate_connect_args`` is the canonical SQLAlchemy
+        # accessor for the libpq-style connection dict.
+        connect_kwargs = self._db.engine.url.translate_connect_args(
+            username="user",
+        )
         conn = await asyncpg.connect(
-            dsn,
+            host=connect_kwargs.get("host"),
+            port=connect_kwargs.get("port"),
+            user=connect_kwargs.get("user"),
+            password=connect_kwargs.get("password"),
+            database=connect_kwargs.get("database"),
             server_settings={"application_name": "z4j-brain-watch-stream"},
         )
         notification_queue: asyncio.Queue = asyncio.Queue()
@@ -317,7 +609,7 @@ class SchedulerServiceImpl(pb_grpc.SchedulerServiceServicer):
                     return
 
                 event = await self._notification_to_event(
-                    payload=payload, project_id=project_id,
+                    payload=payload, project_filter=project_filter,
                 )
                 if event is not None:
                     yield event
@@ -336,7 +628,7 @@ class SchedulerServiceImpl(pb_grpc.SchedulerServiceServicer):
     async def _watch_via_polling(
         self,
         *,
-        project_id: UUID | None,
+        project_filter: set[UUID] | None,
         resume_token: str,
         context: grpc.aio.ServicerContext,
     ) -> AsyncIterator[pb.ScheduleEvent]:
@@ -365,7 +657,7 @@ class SchedulerServiceImpl(pb_grpc.SchedulerServiceServicer):
         while not context.cancelled():
             try:
                 events, snapshot = await self._compute_watch_diff(
-                    project_id=project_id,
+                    project_filter=project_filter,
                     last_seen_at=last_seen_at,
                     snapshot=snapshot,
                     first_cycle=first_cycle,
@@ -397,7 +689,7 @@ class SchedulerServiceImpl(pb_grpc.SchedulerServiceServicer):
         self,
         *,
         payload: str,
-        project_id: UUID | None,
+        project_filter: set[UUID] | None,
     ) -> pb.ScheduleEvent | None:
         """Convert one NOTIFY payload to a ScheduleEvent.
 
@@ -422,17 +714,31 @@ class SchedulerServiceImpl(pb_grpc.SchedulerServiceServicer):
             )
             return None
 
+        # Audit fix L-2 (Apr 2026): trust ONLY ``data["id"]`` from the
+        # NOTIFY payload. Pre-fix the project_id filter ran against
+        # the payload's own project_id field, which a Postgres role
+        # with NOTIFY privilege on z4j_schedules_changed could
+        # forge. We still load the row by id and read its REAL
+        # project_id below; using the payload value as a pre-filter
+        # is fine for performance but the authoritative check has
+        # to be on the row, not on the wire.
         try:
             row_id = UUID(str(data["id"]))
-            row_project_id = UUID(str(data["project_id"]))
         except (KeyError, ValueError):
-            return None
-
-        if project_id is not None and row_project_id != project_id:
             return None
 
         op_kind = data.get("op")
         if op_kind == "delete":
+            # DELETE has no row to load - can't verify project_id at
+            # this point. Drop the event when the payload's project_id
+            # is missing or doesn't match (best-effort filter; the
+            # authoritative full-resync sweep catches misses).
+            try:
+                row_project_id = UUID(str(data["project_id"]))
+            except (KeyError, ValueError):
+                return None
+            if project_filter is not None and row_project_id not in project_filter:
+                return None
             return pb.ScheduleEvent(
                 kind=pb.ScheduleEvent.Kind.DELETED,
                 deleted_id=str(row_id),
@@ -457,6 +763,8 @@ class SchedulerServiceImpl(pb_grpc.SchedulerServiceServicer):
             row = result.scalar_one_or_none()
         if row is None:
             return None
+        if project_filter is not None and row.project_id not in project_filter:
+            return None
 
         kind = (
             pb.ScheduleEvent.Kind.CREATED
@@ -472,7 +780,7 @@ class SchedulerServiceImpl(pb_grpc.SchedulerServiceServicer):
     async def _compute_watch_diff(
         self,
         *,
-        project_id: UUID | None,
+        project_filter: set[UUID] | None,
         last_seen_at: datetime | None,
         snapshot: dict[UUID, datetime],
         first_cycle: bool,
@@ -489,8 +797,8 @@ class SchedulerServiceImpl(pb_grpc.SchedulerServiceServicer):
             stmt = select(Schedule).where(
                 Schedule.scheduler == _SCHEDULER_NAME,
             )
-            if project_id is not None:
-                stmt = stmt.where(Schedule.project_id == project_id)
+            if project_filter is not None:
+                stmt = stmt.where(Schedule.project_id.in_(project_filter))
             result = await session.execute(stmt)
             rows = list(result.scalars().all())
 
@@ -558,6 +866,33 @@ class SchedulerServiceImpl(pb_grpc.SchedulerServiceServicer):
                 error_message=str(exc),
             )
 
+        # Audit fix (Apr 2026 follow-up): per-cert FireSchedule rate
+        # limit. Bucket is keyed by the peer's primary CN; an empty
+        # bucket -> RESOURCE_EXHAUSTED (gRPC standard for rate
+        # limiting). The limiter is a no-op when
+        # scheduler_grpc_fire_rate_limit_enabled is False.
+        from z4j_brain.scheduler_grpc.binding import (  # noqa: PLC0415
+            extract_peer_cns,
+        )
+
+        peer_cns = extract_peer_cns(context)
+        # Pick a single deterministic CN for bucket keying. Sorted +
+        # first-element so multi-SAN certs always map to the same
+        # bucket regardless of dict iteration order.
+        cert_cn = sorted(peer_cns)[0] if peer_cns else ""
+        allowed = await self._rate_limiter.consume(cert_cn=cert_cn)
+        if not allowed:
+            logger.warning(
+                "z4j.brain.scheduler_grpc: FireSchedule rate-limited "
+                "for cert_cn=%r (schedule_id=%s)",
+                cert_cn, schedule_id,
+            )
+            await context.abort(
+                grpc.StatusCode.RESOURCE_EXHAUSTED,
+                "FireSchedule rate limit exceeded for this scheduler",
+            )
+            return pb.FireScheduleResponse()  # unreachable; abort raises
+
         from z4j_brain.persistence.repositories import (
             AuditLogRepository,
             CommandRepository,
@@ -578,19 +913,97 @@ class SchedulerServiceImpl(pb_grpc.SchedulerServiceServicer):
             else datetime.now(UTC)
         )
 
-        async with self._db.session() as session:
+        # Round-8 audit fix R8-Async-H3 (Apr 2026): bound the number
+        # of in-flight FireSchedule handlers that hold a DB session.
+        # The handler holds one session across with_for_update +
+        # agent lookup + dispatcher.issue + commit; a 100-fire
+        # burst with slow agent lookup wedges every connection in
+        # the pool and starves unrelated request paths. The
+        # semaphore caps concurrent fires to a fraction of the pool
+        # so REST handlers and workers always have headroom; excess
+        # fires queue here (callers are the scheduler subprocess,
+        # which already retries on the GRPC client side).
+        sem = _get_fire_schedule_semaphore()
+        async with sem, self._db.session() as session:
+            # Audit-fix H-2 (Apr 2026): take a row-level lock on the
+            # schedule from the moment we read ``is_enabled`` until
+            # commit. Without it, a concurrent dashboard
+            # ``disable``/``delete`` between this SELECT and the
+            # ``commands`` insert would cause the brain to dispatch a
+            # fire after the row says "off" - an operator who clicks
+            # disable to halt a runaway schedule still sees one more
+            # fire land. SQLite ignores ``with_for_update`` (single
+            # writer) so dev/test paths are unaffected; Postgres
+            # holds the row exclusively for the duration of this
+            # transaction.
+            from sqlalchemy import select  # noqa: PLC0415
+
+            from z4j_brain.persistence.models import Schedule  # noqa: PLC0415
+
             schedules = ScheduleRepository(session)
-            schedule = await schedules.get(schedule_id)
+            # Round-3 audit fix (Apr 2026): mirror the
+            # ``scheduler == _SCHEDULER_NAME`` filter that List/
+            # Watch already apply. Pre-fix, a z4j-scheduler peer
+            # could call FireSchedule against a schedule_id that
+            # belonged to a different scheduling surface (e.g.
+            # ``celery-beat`` rows the operator manages
+            # separately). Brain's dispatcher does not check the
+            # schedule's ``scheduler`` field before minting a
+            # Command, so a cross-scheduler fire would silently
+            # land an extra dispatch outside celery-beat's
+            # scheduling surface. The fix returns
+            # ``schedule_not_found`` (same code as a missing row)
+            # so a hostile peer can't enumerate "is this UUID a
+            # celery-beat row?" via the error-code split.
+            result = await session.execute(
+                select(Schedule)
+                .where(
+                    Schedule.id == schedule_id,
+                    Schedule.scheduler == _SCHEDULER_NAME,
+                )
+                .with_for_update(),
+            )
+            schedule = result.scalar_one_or_none()
             if schedule is None:
+                # Round-4 audit fix (Apr 2026): refund the
+                # rate-limit token we already charged. The fire
+                # never landed; counting it would over-charge the
+                # cert's bucket and could cause spurious 429s
+                # during operational events (e.g. a schedule
+                # mass-delete + scheduler still ticking the
+                # in-flight slots).
+                if cert_cn:
+                    await self._rate_limiter.refund(cert_cn=cert_cn)
                 return pb.FireScheduleResponse(
                     error_code="schedule_not_found",
                     error_message=(
                         f"schedule {schedule_id} not in brain"
                     ),
                 )
+            # Audit fix M-5 (Apr 2026): per-cert project binding.
+            # Bound CNs cannot fire schedules for projects outside
+            # their binding list - even if the row exists. Run the
+            # check before the is_enabled gate so a bound peer that
+            # tries to enumerate "does schedule X exist" via the
+            # error-code split (schedule_not_found vs
+            # schedule_disabled vs PERMISSION_DENIED) gets the same
+            # answer regardless of the row's enabled state.
+            from z4j_brain.scheduler_grpc.binding import (  # noqa: PLC0415
+                enforce_cn_project_binding,
+            )
+
+            await enforce_cn_project_binding(
+                context=context,
+                project_id=schedule.project_id,
+                bindings=self._settings.scheduler_grpc_cn_project_bindings,
+                db=self._db,
+            )
             if not schedule.is_enabled:
                 # Scheduler should have skipped this on its side, but
                 # defend against a race between disable + tick.
+                # Round-4 audit fix (Apr 2026): refund the token.
+                if cert_cn:
+                    await self._rate_limiter.refund(cert_cn=cert_cn)
                 return pb.FireScheduleResponse(
                     error_code="schedule_disabled",
                     error_message="schedule is disabled",
@@ -703,6 +1116,10 @@ class SchedulerServiceImpl(pb_grpc.SchedulerServiceServicer):
                 # fire-history row so the dashboard shows "we tried
                 # and failed" instead of silence. status="failed"
                 # means brain didn't even reach an agent.
+                # Audit fix L-3 (Apr 2026): sanitize the exception
+                # text before persisting / returning to the wire so
+                # SQL fragments / file paths / tracebacks don't leak.
+                safe_error = _sanitize_error_message(str(exc))
                 try:
                     await ScheduleFireRepository(session).record(
                         fire_id=fire_id,
@@ -712,7 +1129,7 @@ class SchedulerServiceImpl(pb_grpc.SchedulerServiceServicer):
                         status="failed",
                         scheduled_for=scheduled_for_dt,
                         error_code="brain_error",
-                        error_message=str(exc),
+                        error_message=safe_error,
                     )
                     await session.commit()
                 except Exception:  # noqa: BLE001
@@ -724,7 +1141,7 @@ class SchedulerServiceImpl(pb_grpc.SchedulerServiceServicer):
                     )
                 return pb.FireScheduleResponse(
                     error_code="brain_error",
-                    error_message=str(exc),
+                    error_message=safe_error or "brain dispatcher failure",
                 )
 
             # Stash the fire_id on the schedule row so
@@ -782,40 +1199,93 @@ class SchedulerServiceImpl(pb_grpc.SchedulerServiceServicer):
 
         from sqlalchemy import select, update
 
-        from z4j_brain.persistence.models import Schedule
+        from z4j_brain.persistence.models import Schedule, ScheduleFire
 
         async with self._db.session() as session:
-            # Find the schedule by last_fire_id - the scheduler stamps
-            # this when it issues FireSchedule. If we can't find it
-            # the fire predates a brain restart or the scheduler is
-            # acking a fire from a different scheduler instance; ack
-            # is still accepted (scheduler treats ack as best-effort
-            # but expects success) but we don't update any row.
+            # Audit fix I-1 (Apr 2026): authoritative correlation by
+            # ``schedule_fires.fire_id`` (which is UNIQUE) instead
+            # of ``Schedule.last_fire_id`` (which is a moving target
+            # overwritten on every fire). Pre-fix, two back-to-back
+            # fires in flight raced: the second fire's FireSchedule
+            # would overwrite ``last_fire_id`` BEFORE the first
+            # fire's ack landed - the first ack then either
+            # silently no-op'd (lookup miss) or, worse, updated the
+            # WRONG schedule's last_run_at + total_runs. Joining via
+            # schedule_fires makes the lookup unambiguous and
+            # idempotent across concurrent fires.
             result = await session.execute(
-                select(Schedule).where(Schedule.last_fire_id == fire_id),
+                select(Schedule)
+                .join(
+                    ScheduleFire,
+                    ScheduleFire.schedule_id == Schedule.id,
+                )
+                .where(ScheduleFire.fire_id == fire_id),
             )
             schedule = result.scalar_one_or_none()
             if schedule is None:
                 logger.info(
                     "z4j.brain.scheduler_grpc: ack for unknown fire_id %s "
-                    "(probably a fire from a previous brain process)",
+                    "(no schedule_fires row; either pre-restart fire "
+                    "or different brain instance)",
                     fire_id,
                 )
                 return pb.AcknowledgeFireResultResponse()
 
+            # Audit fix M-5 (Apr 2026): per-cert project binding.
+            # A bound CN cannot ack fires belonging to projects
+            # outside its binding list. Critical because ack writes
+            # ``last_run_at`` + ``total_runs`` AND triggers
+            # notifications, so a rogue bound cert could otherwise
+            # forge "fire failed" alerts on cross-project schedules.
+            from z4j_brain.scheduler_grpc.binding import (  # noqa: PLC0415
+                enforce_cn_project_binding,
+            )
+
+            await enforce_cn_project_binding(
+                context=context,
+                project_id=schedule.project_id,
+                bindings=self._settings.scheduler_grpc_cn_project_bindings,
+                db=self._db,
+            )
+
             now = datetime.now(UTC)
+            # Round-4 audit fix (Apr 2026): atomic SQL-side
+            # increment for ``total_runs``. Pre-fix:
+            #     updates["total_runs"] = (schedule.total_runs or 0) + 1
+            # was a Python-side read-modify-write. Two concurrent
+            # acks for two distinct fires of the same schedule both
+            # read ``total_runs=5``, both compute 6, both wrote 6
+            # → silent lost increment. At enterprise scale (100s
+            # of fires/sec across many schedules) the lifetime
+            # counter drifted low. Using a SQL expression
+            # ``Schedule.total_runs + 1`` makes the increment
+            # atomic in Postgres without needing FOR UPDATE on the
+            # schedule row.
             updates: dict[str, Any] = {
                 "last_run_at": now,
                 "updated_at": now,
-                "last_fire_id": None,
             }
             if request.status == "success":
-                updates["total_runs"] = (schedule.total_runs or 0) + 1
+                updates["total_runs"] = Schedule.total_runs + 1
 
+            # Audit fix I-1 (Apr 2026): conditionally clear
+            # ``last_fire_id`` only if it still points at THIS
+            # fire. Concurrently-in-flight fires would otherwise
+            # have their pointer wiped by a late ack of an earlier
+            # fire. Use the WHERE clause to make the clear atomic
+            # without a separate read.
             await session.execute(
                 update(Schedule)
                 .where(Schedule.id == schedule.id)
                 .values(**updates),
+            )
+            await session.execute(
+                update(Schedule)
+                .where(
+                    Schedule.id == schedule.id,
+                    Schedule.last_fire_id == fire_id,
+                )
+                .values(last_fire_id=None),
             )
 
             # Phase 4: also update the schedule_fires row with the
@@ -831,12 +1301,82 @@ class SchedulerServiceImpl(pb_grpc.SchedulerServiceServicer):
                 if request.status == "success"
                 else "acked_failed"
             )
-            await ScheduleFireRepository(session).acknowledge(
+            # Audit fix M-3 (Apr 2026): sanitize scheduler-supplied
+            # error text before persisting + dispatching downstream.
+            # The scheduler is a trusted peer but its error string
+            # ultimately came from the agent → engine → task path
+            # (untrusted user code), so a malformed return value or
+            # log-injection payload could otherwise propagate to the
+            # notification template + dashboard rendering.
+            safe_error = _sanitize_error_message(request.error)
+            safe_error_code = _sanitize_error_message(
+                request.error, max_chars=_ERROR_CODE_MAX_CHARS,
+            )
+            # Round-4 audit fix (Apr 2026): capture
+            # ``was_first_ack`` so we only fan out notifications
+            # for the FIRST ack of a given fire_id. Duplicate acks
+            # (HA scheduler retry, network duplicate) skip the
+            # notification dispatch to avoid two pages for one
+            # failure.
+            _row, was_first_ack = await ScheduleFireRepository(
+                session,
+            ).acknowledge(
                 fire_id=fire_id,
                 status=ack_status,
-                error_code=request.error or None,
-                error_message=request.error or None,
+                error_code=safe_error_code,
+                error_message=safe_error,
             )
+
+            # Audit fix M-2 (Apr 2026): write an audit row for every
+            # ack. Pre-fix the AcknowledgeFireResult handler mutated
+            # ``schedules.last_run_at`` + ``total_runs`` and dispatched
+            # notifications without leaving an audit breadcrumb. Any
+            # alert-injection attempt (a rogue scheduler ACKing as
+            # ``failed`` to trigger pages) was forensically invisible.
+            from z4j_brain.persistence.repositories import (  # noqa: PLC0415
+                AuditLogRepository,
+            )
+            from z4j_brain.domain.audit_service import (  # noqa: PLC0415
+                AuditService as _AuditService,
+            )
+
+            try:
+                audit_log_repo = AuditLogRepository(session)
+                audit_service = _AuditService(self._settings)
+                await audit_service.record(
+                    audit_log_repo,
+                    action=(
+                        "schedule.ack.success"
+                        if request.status == "success"
+                        else "schedule.ack.failed"
+                    ),
+                    target_type="schedule",
+                    target_id=str(schedule.id),
+                    result="success",
+                    outcome="allow",
+                    user_id=None,
+                    project_id=schedule.project_id,
+                    source_ip=None,
+                    metadata={
+                        "fire_id": str(fire_id),
+                        "ack_status": request.status,
+                        # Surface the (sanitised) error so the audit
+                        # trail names the failure - without it an
+                        # operator investigating an alert flood has
+                        # no way to correlate ack-failed audit rows
+                        # with the underlying task error.
+                        "error": safe_error,
+                    },
+                )
+            except Exception:  # noqa: BLE001
+                # Audit failure must not block the ack from
+                # committing; the schedule row update + notification
+                # dispatch are the load-bearing operations.
+                logger.exception(
+                    "z4j.brain.scheduler_grpc: failed to record ack "
+                    "audit row for fire_id=%s (non-fatal)", fire_id,
+                )
+
             await session.commit()
 
         # Phase 4 + 5: dispatch notifications matching the spec's
@@ -860,6 +1400,18 @@ class SchedulerServiceImpl(pb_grpc.SchedulerServiceServicer):
         # should block for. Best-effort - failures here must NOT
         # bubble up (the ack succeeded; missed notification is a
         # secondary concern).
+        # Round-4 audit fix (Apr 2026): skip notification fan-out
+        # for duplicate acks. Two acks for the same fire_id (HA
+        # scheduler retry, network duplicate) would otherwise
+        # produce two pages for the same fire.
+        if not was_first_ack:
+            logger.info(
+                "z4j.brain.scheduler_grpc: duplicate ack for "
+                "fire_id=%s; skipping notification fan-out",
+                fire_id,
+            )
+            return pb.AcknowledgeFireResultResponse()
+
         try:
             from z4j_brain.domain.notifications.service import (  # noqa: PLC0415
                 NotificationService,
@@ -883,7 +1435,13 @@ class SchedulerServiceImpl(pb_grpc.SchedulerServiceServicer):
                         engine=schedule.engine,
                         state=request.status,
                         queue=schedule.queue,
-                        exception=request.error or None,
+                        # Audit fix M-3 (Apr 2026): sanitised error,
+                        # not the raw scheduler-supplied string. The
+                        # notification template + delivery channels
+                        # render this verbatim into emails / Slack /
+                        # webhook payloads, so log-injection or
+                        # template-shape attacks land here otherwise.
+                        exception=safe_error,
                     )
                 await notify_session.commit()
         except Exception:  # noqa: BLE001

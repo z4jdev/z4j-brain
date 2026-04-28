@@ -54,6 +54,30 @@ logger = structlog.get_logger("z4j.brain.frame_router")
 #: subscription fanout.
 _MAX_PENDING_NOTIFICATION_TASKS = 256
 
+#: Round-8 audit fix R8-Async-H4 (Apr 2026): hard cap on the number
+#: of notification dispatch tasks that can hold an OPEN DB session
+#: at once. Each ``_dispatch_notification`` call opens its own
+#: ``db.session()`` inside the task body. Without this bound, the
+#: 256-task ceiling above lets ~256 sessions drain the brain's pool
+#: (default ~30 sync-equivalent connections) well before the task
+#: cap kicks in. Setting the semaphore at half the typical pool
+#: size keeps headroom for concurrent REST handlers + workers.
+_NOTIFY_DB_SESSION_BOUND = 16
+_notify_db_session_sem: asyncio.Semaphore | None = None
+
+
+def _get_notify_db_session_semaphore() -> asyncio.Semaphore:
+    """Lazy-init the per-process semaphore on first use.
+
+    Created lazily because module import predates the running event
+    loop in the unit-test fixtures; ``asyncio.Semaphore`` binds to
+    the loop at construction.
+    """
+    global _notify_db_session_sem
+    if _notify_db_session_sem is None:
+        _notify_db_session_sem = asyncio.Semaphore(_NOTIFY_DB_SESSION_BOUND)
+    return _notify_db_session_sem
+
 
 def _log_notify_task_exception(task: asyncio.Task[object]) -> None:
     """Done-callback for fire-and-forget notification dispatch tasks.
@@ -150,9 +174,29 @@ class FrameRouter:
             WorkerRepository,
         )
 
+        # Round-6 audit fix WS-MED (Apr 2026): cap the per-frame
+        # event count. The wire-frame validator already enforces
+        # ``max_ws_frame_bytes`` (1 MiB by default), but events are
+        # small JSON dicts so a single 1 MiB frame can carry
+        # ~5_000-10_000 events. Cap to a defensive ceiling so the
+        # downstream notification-evaluation loop (one query per
+        # event) cannot be amplified by a malicious or buggy agent.
+        # The agent's own batcher tops out near 500.
+        _EVENT_BATCH_CAP = 1_000
+        events = list(frame.payload.events)
+        if len(events) > _EVENT_BATCH_CAP:
+            logger.warning(
+                "z4j frame_router: event_batch over cap; trimming",
+                project_id=str(self._project_id),
+                agent_id=str(self._agent_id),
+                received=len(events),
+                cap=_EVENT_BATCH_CAP,
+            )
+            events = events[:_EVENT_BATCH_CAP]
+
         async with self._db.session() as session:
             await self._ingestor.ingest_batch(
-                events=[e for e in frame.payload.events],
+                events=events,
                 project_id=self._project_id,
                 agent_id=self._agent_id,
                 agents=AgentRepository(session),
@@ -173,8 +217,9 @@ class FrameRouter:
         # triggers. Each event may match one or more user subscriptions
         # (in-app, Slack, email, ...). We run this AFTER the commit so
         # the delivery log and any side-effect queries see the
-        # committed data.
-        await self._evaluate_notifications(frame.payload.events)
+        # committed data. Pass the trimmed list (not
+        # ``frame.payload.events``) so the cap propagates here too.
+        await self._evaluate_notifications(events)
 
     # ------------------------------------------------------------------
     # heartbeat
@@ -193,6 +238,26 @@ class FrameRouter:
             # The agent sends keys like "celery.queue_depths" with
             # a dict of {queue_name: depth}.
             adapter_health = frame.payload.adapter_health or {}
+            # Round-6 audit fix WS-MED (Apr 2026): cap the number of
+            # adapter_health top-level keys we'll iterate. Nominal
+            # production load is single-digit (one per engine + a
+            # few well-known suffixes); a malicious or buggy agent
+            # supplying 100k keys would otherwise force 100k key
+            # ``str.endswith`` checks per heartbeat, fired every 10s
+            # per connection. 256 leaves room for new suffixes
+            # without ever becoming a meaningful work amplifier.
+            _ADAPTER_HEALTH_KEYS_CAP = 256
+            if len(adapter_health) > _ADAPTER_HEALTH_KEYS_CAP:
+                logger.warning(
+                    "z4j frame_router: adapter_health key cap exceeded; "
+                    "trimming",
+                    project_id=str(self._project_id),
+                    received=len(adapter_health),
+                    cap=_ADAPTER_HEALTH_KEYS_CAP,
+                )
+                adapter_health = dict(
+                    list(adapter_health.items())[:_ADAPTER_HEALTH_KEYS_CAP],
+                )
             for key, value in adapter_health.items():
                 if key.endswith(".queue_depths") and isinstance(value, str):
                     try:
@@ -200,6 +265,23 @@ class FrameRouter:
 
                         depths = _json.loads(value)
                         if isinstance(depths, dict):
+                            # Round-6 audit fix WS-MED (Apr 2026):
+                            # cap inner queue_depths dict size to
+                            # prevent a malicious agent from
+                            # triggering thousands of upserts per
+                            # heartbeat tick.
+                            _QUEUE_DEPTHS_CAP = 1024
+                            if len(depths) > _QUEUE_DEPTHS_CAP:
+                                logger.warning(
+                                    "z4j frame_router: queue_depths cap "
+                                    "exceeded; trimming",
+                                    key=key,
+                                    received=len(depths),
+                                    cap=_QUEUE_DEPTHS_CAP,
+                                )
+                                depths = dict(
+                                    list(depths.items())[:_QUEUE_DEPTHS_CAP],
+                                )
                             queue_repo = QueueRepository(session)
                             for queue_name, depth in depths.items():
                                 engine_name = key.split(".")[0]
@@ -573,20 +655,28 @@ class FrameRouter:
         tasks. Errors are logged in the done-callback, not raised.
         """
         try:
-            async with self._db.session() as session:
-                await svc.evaluate_and_dispatch(
-                    session=session,
-                    project_id=self._project_id,
-                    trigger=trigger,
-                    task_id=task_id,
-                    task_name=task_name,
-                    engine=engine,
-                    priority=priority,
-                    state=state,
-                    queue=queue,
-                    exception=exception,
-                    traceback=traceback,
-                )
+            # Round-8 audit fix R8-Async-H4 (Apr 2026): hold a
+            # semaphore slot before opening the DB session so the
+            # 256-task ceiling can't translate into 256 concurrent
+            # sessions. Excess tasks queue here; the
+            # ``_MAX_PENDING_NOTIFICATION_TASKS`` cap upstream is
+            # the global drop-policy for sustained overflow.
+            sem = _get_notify_db_session_semaphore()
+            async with sem:
+                async with self._db.session() as session:
+                    await svc.evaluate_and_dispatch(
+                        session=session,
+                        project_id=self._project_id,
+                        trigger=trigger,
+                        task_id=task_id,
+                        task_name=task_name,
+                        engine=engine,
+                        priority=priority,
+                        state=state,
+                        queue=queue,
+                        exception=exception,
+                        traceback=traceback,
+                    )
         except Exception:  # noqa: BLE001
             logger.exception(
                 "z4j frame_router: notification dispatch task failed",

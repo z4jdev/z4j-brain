@@ -129,6 +129,13 @@ class EventIngestor:
         # in this batch. We pick max so a stale event late in the
         # batch can't roll the worker's heartbeat backwards.
         worker_seen: dict[tuple[str, str], datetime] = {}
+        # Round-7 audit fix R7-HIGH (perf) (Apr 2026): same trick
+        # for queue touches. Pre-fix every event with a ``queue``
+        # field fired its own ``queue_repo.touch`` round-trip — a
+        # 1000-event batch all in one queue did 1000 upserts. Now
+        # we collect ``(engine, name)`` while iterating and emit
+        # one ``touch`` per unique pair after the loop.
+        queues_seen: set[tuple[str, str]] = set()
         # Track max(occurred_at) across the whole batch so the agent
         # heartbeat carries a real event timestamp instead of racing
         # with wall-clock now() (which would let a hostile clock
@@ -145,6 +152,7 @@ class EventIngestor:
                     task_repo=task_repo,
                     queue_repo=queue_repo,
                     worker_seen=worker_seen,
+                    queues_seen=queues_seen,
                 )
                 if event_max is None:
                     # Per-event ingest skipped (bad envelope, dup, etc.)
@@ -175,6 +183,25 @@ class EventIngestor:
                 project_id=project_id,
                 worker_seen=worker_seen,
             )
+
+        # Round-7 audit fix R7-HIGH (perf): one queue.touch per
+        # unique (engine, queue) pair seen in the batch. Each
+        # ``touch`` is wrapped to make a single failure non-fatal
+        # for the whole batch, matching the prior per-event
+        # try/except.
+        for engine_name, queue_name in queues_seen:
+            try:
+                await queue_repo.touch(
+                    project_id=project_id,
+                    engine=engine_name,
+                    name=queue_name,
+                )
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "z4j event_ingestor: batched queue touch failed",
+                    queue=queue_name,
+                    engine=engine_name,
+                )
 
         # Heartbeat: any event traffic counts as the agent being
         # alive. Carries the batch's max occurred_at when available
@@ -254,6 +281,7 @@ class EventIngestor:
         task_repo: "TaskRepository",
         queue_repo: "QueueRepository",
         worker_seen: dict[tuple[str, str], datetime],
+        queues_seen: set[tuple[str, str]] | None = None,
     ) -> tuple[bool, datetime] | None:
         """Ingest one event.
 
@@ -351,16 +379,24 @@ class EventIngestor:
         )
 
         # 2) Touch the queue if mentioned.
+        # Round-7 audit fix R7-HIGH (perf) (Apr 2026): defer the
+        # touch when a batch-level dedup set was supplied; the
+        # caller (``ingest_batch``) flushes one touch per unique
+        # ``(engine, queue)`` pair after the loop. Keeps the legacy
+        # eager path for any caller that doesn't batch.
         queue_name = data.get("queue") if isinstance(data, dict) else None
         if isinstance(queue_name, str) and queue_name:
-            try:
-                await queue_repo.touch(
-                    project_id=project_id,
-                    engine=engine,
-                    name=queue_name,
-                )
-            except Exception:  # noqa: BLE001
-                logger.exception("z4j event_ingestor: queue touch failed")
+            if queues_seen is not None:
+                queues_seen.add((engine, queue_name))
+            else:
+                try:
+                    await queue_repo.touch(
+                        project_id=project_id,
+                        engine=engine,
+                        name=queue_name,
+                    )
+                except Exception:  # noqa: BLE001
+                    logger.exception("z4j event_ingestor: queue touch failed")
 
         # 3) Record the worker into the batch-level accumulator.
         # The bulk upsert runs once after the whole batch is in;
@@ -598,12 +634,17 @@ class EventIngestor:
 
             record_swallowed("event_ingestor", "task_metrics")
 
+        # Round-7 audit fix R7-HIGH (perf) (Apr 2026): pass the
+        # ``existing_task`` we already loaded above so
+        # ``upsert_from_event`` skips its own redundant SELECT.
         await task_repo.upsert_from_event(
             project_id=project_id,
             engine=engine,
             task_id=task_id,
             defaults=defaults,
             updates=updates,
+            existing=existing_task,
+            existing_loaded=True,
         )
 
     async def _sanitize_canvas_ref(

@@ -55,9 +55,11 @@ class PendingFiresRepository:
     ) -> PendingFire:
         """Insert a buffered fire. Idempotent on ``fire_id``.
 
-        Returns the inserted (or existing) row. A re-insert of the
-        same ``fire_id`` after a network-retry of FireSchedule is a
-        no-op - the buffer never duplicates.
+        Round-4 audit fix (Apr 2026): use a SAVEPOINT
+        (``begin_nested``) on IntegrityError so the failed INSERT
+        rolls back without wiping the caller's outer transaction.
+        Pre-fix the ``session.rollback()`` released FOR UPDATE
+        locks the FireSchedule handler held on the schedule row.
         """
         row = PendingFire(
             fire_id=fire_id,
@@ -69,13 +71,11 @@ class PendingFiresRepository:
             enqueued_at=datetime.now(UTC),
             expires_at=expires_at,
         )
-        self.session.add(row)
         try:
-            await self.session.flush()
+            async with self.session.begin_nested():
+                self.session.add(row)
+                await self.session.flush()
         except IntegrityError:
-            # Duplicate fire_id - already buffered. Roll back the
-            # session's pending insert and return the existing row.
-            await self.session.rollback()
             existing = await self._get_by_fire_id(fire_id)
             if existing is None:
                 raise  # the IntegrityError came from somewhere else
@@ -91,20 +91,37 @@ class PendingFiresRepository:
     ) -> list[PendingFire]:
         """Return buffered fires for one (project, engine), oldest first.
 
+        Round-4 audit fix (Apr 2026): on Postgres we use ``SELECT
+        ... FOR UPDATE SKIP LOCKED`` so multi-replica brain
+        workers cannot pick the same row. Pre-fix two replay
+        workers running in parallel both fetched the same fire_id,
+        both called ``dispatcher.issue`` (which now dedupes via
+        commands.idempotency_key but still costs a round-trip),
+        and one of them left the buffer row stuck because the
+        ``IntegrityError`` was previously swallowed.
+
+        SQLite doesn't support ``SKIP LOCKED`` and only one writer
+        runs at a time anyway, so the lock falls through harmlessly.
+
         ``limit`` caps the batch so the replay worker doesn't
         materialise an unbounded list when an agent comes online
         after a long outage. The worker calls again on the next
         tick to drain the rest.
         """
-        result = await self.session.execute(
+        stmt = (
             select(PendingFire)
             .where(
                 PendingFire.project_id == project_id,
                 PendingFire.engine == engine,
             )
             .order_by(PendingFire.scheduled_for)
-            .limit(limit),
+            .limit(limit)
         )
+        # Postgres-only: row-level lock + skip rows already locked
+        # by a sibling worker. No-op on SQLite (driver ignores).
+        if self.session.bind.dialect.name == "postgresql":
+            stmt = stmt.with_for_update(skip_locked=True)
+        result = await self.session.execute(stmt)
         return list(result.scalars().all())
 
     async def delete_by_fire_id(self, fire_id: UUID) -> bool:

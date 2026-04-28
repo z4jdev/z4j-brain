@@ -65,30 +65,38 @@ class ScheduleCircuitBreakerWorker:
             ScheduleFireRepository,
         )
 
-        # Find every enabled schedule. We could narrow to "schedules
-        # with at least N recent fires" via a window query, but that's
-        # premature optimization for v1 - the schedule count is
-        # small (<10k typical) and the per-schedule recent-failures
-        # query is index-bound (ix_schedule_fires_circuit_breaker).
+        # Round-7 audit fix R7-HIGH (perf) (Apr 2026): the prior
+        # version opened ONE fresh session per enabled schedule and
+        # ran ``recent_failures`` per-schedule. At 10k enabled
+        # schedules (the comment below admitted this was the design
+        # ceiling) that was 10k sessions + 10k SELECTs per breaker
+        # tick — burning a connection-pool slot per tick second and
+        # blocking unrelated request paths on enterprise installs.
+        #
+        # New shape: ONE session, ONE listing of enabled schedules,
+        # ONE window query that returns the latest ``threshold``
+        # fires per schedule id, then evaluation in-process. Brings
+        # tick cost to 2 round-trips regardless of fleet size.
         async with self._db.session() as session:
             result = await session.execute(
                 select(Schedule).where(Schedule.is_enabled.is_(True)),
             )
             enabled_schedules = list(result.scalars().all())
 
-        if not enabled_schedules:
-            return
+            if not enabled_schedules:
+                return
+
+            schedule_ids = [s.id for s in enabled_schedules]
+            fires_by_schedule = await ScheduleFireRepository(
+                session,
+            ).recent_failures_for_many(
+                schedule_ids=schedule_ids,
+                per_schedule_limit=self._threshold,
+            )
 
         tripped: list[tuple[object, int]] = []  # (schedule, streak)
-
         for schedule in enabled_schedules:
-            async with self._db.session() as session:
-                fires = await ScheduleFireRepository(
-                    session,
-                ).recent_failures(
-                    schedule_id=schedule.id,
-                    limit=self._threshold,
-                )
+            fires = fires_by_schedule.get(schedule.id, [])
             # Need at least ``threshold`` rows to consider tripping.
             # A new schedule with 2 failures shouldn't trip a
             # threshold of 5.
@@ -123,6 +131,7 @@ class ScheduleCircuitBreakerWorker:
         from z4j_brain.persistence.models import Schedule  # noqa: PLC0415
         from z4j_brain.persistence.repositories import (  # noqa: PLC0415
             AuditLogRepository,
+            ScheduleFireRepository,
         )
 
         async with self._db.session() as session:
@@ -131,6 +140,34 @@ class ScheduleCircuitBreakerWorker:
             current = await session.get(Schedule, schedule.id)
             if current is None or not current.is_enabled:
                 return
+
+            # Round-4 audit fix (Apr 2026): re-read the failure
+            # streak inside this transaction. Pre-fix, ``tick()``
+            # opened session A, evaluated the streak, closed it,
+            # then ``_disable_and_audit`` opened session B with
+            # only an ``is_enabled`` re-check - a successful fire
+            # landing between A and B still tripped the breaker on
+            # a healthy schedule. The race was flagged in the
+            # round-2 audit and re-flagged in round-3 as still
+            # open. We now query ``recent_failures`` again under
+            # session B and bail if the streak no longer holds.
+            fires = await ScheduleFireRepository(
+                session,
+            ).recent_failures(
+                schedule_id=schedule.id,
+                limit=self._threshold,
+            )
+            if len(fires) < self._threshold:
+                return
+            if not all(f.status in _FAILURE_STATUSES for f in fires):
+                logger.info(
+                    "z4j.brain.workers.schedule_circuit_breaker: "
+                    "schedule_id=%s recovered between read and "
+                    "disable; not tripping",
+                    schedule.id,
+                )
+                return
+
             await session.execute(
                 update(Schedule)
                 .where(Schedule.id == schedule.id)

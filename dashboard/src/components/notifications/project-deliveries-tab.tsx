@@ -202,7 +202,19 @@ export function ProjectDeliveriesTab({ slug }: { slug: string }) {
                   <TableRow key={d.id}>
                     <TableCell>
                       {isTest ? (
-                        <Badge variant="secondary">test</Badge>
+                        <div className="flex flex-col gap-0.5">
+                          <Badge variant="secondary" className="self-start">
+                            test
+                          </Badge>
+                          {d.triggered_by_email && (
+                            <span
+                              className="text-[10px] text-muted-foreground"
+                              title={`Triggered by ${d.triggered_by_email}`}
+                            >
+                              by {d.triggered_by_email}
+                            </span>
+                          )}
+                        </div>
                       ) : (
                         <Badge variant="outline">{d.trigger}</Badge>
                       )}

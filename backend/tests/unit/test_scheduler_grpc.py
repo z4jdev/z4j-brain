@@ -566,3 +566,62 @@ class _NoopContext:
 
     def auth_context(self) -> dict:
         return {}
+
+
+# =====================================================================
+# CN normalisation regression guard (v1.1.0 audit finding 3)
+# =====================================================================
+
+
+class TestNormaliseCnDoesNotMangle:
+    """``_normalise_cn`` strips a URI-style ``DNS:`` prefix once.
+
+    Regression guard: a careless refactor to ``lstrip("DNS:")`` would
+    pass every existing CN-equality test (because production
+    deployments use names like ``scheduler-prod`` that don't start
+    with ``D`` / ``N`` / ``S`` / ``:``) but would silently corrupt
+    CNs that DO. These cases pin the correct behaviour explicitly
+    so the bug can't sneak back in.
+    """
+
+    def test_strips_uri_prefix_once(self) -> None:
+        from z4j_brain.scheduler_grpc.auth import _normalise_cn
+
+        assert _normalise_cn("DNS:scheduler-prod") == "scheduler-prod"
+
+    def test_does_not_strip_naked_cn(self) -> None:
+        from z4j_brain.scheduler_grpc.auth import _normalise_cn
+
+        assert _normalise_cn("scheduler-prod") == "scheduler-prod"
+
+    def test_preserves_cn_starting_with_dns_letters(self) -> None:
+        """``DNS-Scheduler-1`` looks like the prefix but isn't (it
+        contains a hyphen, not a colon). A ``lstrip("DNS:")``
+        regression would corrupt this to ``"-Scheduler-1"`` because
+        lstrip eats any combination of the chars in its argument
+        from the left. ``removeprefix`` only matches the exact full
+        prefix and leaves this name intact.
+        """
+        from z4j_brain.scheduler_grpc.auth import _normalise_cn
+
+        assert _normalise_cn("DNS-Scheduler-1") == "DNS-Scheduler-1"
+
+    def test_preserves_cn_with_individual_prefix_chars(self) -> None:
+        """Concrete cases: CNs starting with ``D``, ``N``, ``S``, or
+        ``:`` would be silently mangled by ``lstrip``. None start
+        with the literal substring ``"DNS:"`` so all must round-trip
+        unchanged.
+        """
+        from z4j_brain.scheduler_grpc.auth import _normalise_cn
+
+        for cn in ("Drone-1", "Node-A", "Scheduler-1", ":weird-cn"):
+            assert _normalise_cn(cn) == cn, (
+                f"{cn!r} corrupted to {_normalise_cn(cn)!r}; "
+                "regression to lstrip()?"
+            )
+
+    def test_strips_surrounding_whitespace(self) -> None:
+        from z4j_brain.scheduler_grpc.auth import _normalise_cn
+
+        assert _normalise_cn("  scheduler-prod  ") == "scheduler-prod"
+        assert _normalise_cn("DNS: scheduler-prod") == "scheduler-prod"

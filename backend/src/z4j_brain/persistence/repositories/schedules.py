@@ -19,12 +19,48 @@ class ScheduleRepository(BaseRepository[Schedule]):
     def __init__(self, session: AsyncSession) -> None:
         super().__init__(session, Schedule)
 
-    async def list_for_project(self, project_id: UUID) -> list[Schedule]:
-        result = await self.session.execute(
-            select(Schedule)
-            .where(Schedule.project_id == project_id)
-            .order_by(Schedule.name),
-        )
+    async def list_for_project(
+        self,
+        project_id: UUID,
+        *,
+        limit: int | None = None,
+        cursor_name: str | None = None,
+        cursor_id: UUID | None = None,
+    ) -> list[Schedule]:
+        """List schedules for a project, ordered by ``(name, id)``.
+
+        v1.1.0: gained keyset pagination params. Pre-1.1 the call
+        was unbounded and returned every row in one shot — fine at
+        small scale, but a project with 1000+ schedules pulled all
+        of them into memory on every dashboard refresh. Operators
+        on the new path pass ``limit + cursor`` for fixed-page
+        responses; legacy callers omitting both still get the full
+        unbounded list (back-compat — the endpoint layer enforces
+        the cap going forward).
+
+        The cursor is the ``(name, id)`` of the LAST row of the
+        previous page; the next page starts strictly after it. The
+        ``id`` tie-breaker prevents skips/dupes when multiple
+        schedules share the same name (rare but possible across
+        projects — within one project it's unique by constraint).
+        """
+        from sqlalchemy import and_, or_
+
+        stmt = select(Schedule).where(Schedule.project_id == project_id)
+        if cursor_name is not None and cursor_id is not None:
+            stmt = stmt.where(
+                or_(
+                    Schedule.name > cursor_name,
+                    and_(
+                        Schedule.name == cursor_name,
+                        Schedule.id > cursor_id,
+                    ),
+                ),
+            )
+        stmt = stmt.order_by(Schedule.name, Schedule.id)
+        if limit is not None:
+            stmt = stmt.limit(limit)
+        result = await self.session.execute(stmt)
         return list(result.scalars().all())
 
     async def get_for_project(

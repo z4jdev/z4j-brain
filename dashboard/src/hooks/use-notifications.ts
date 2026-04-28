@@ -234,6 +234,15 @@ export interface NotificationDelivery {
   // an unsaved-config preflight test (no channel exists yet).
   channel_name: string | null;
   channel_type: ChannelType | null;
+  // v1.1.0: who manually triggered this row (channel-test fires
+  // only). NULL for subscription-driven fires. Set to the calling
+  // user's id when they hit the project Channels "Test" button so
+  // the row surfaces in their Global Notification Log.
+  triggered_by_user_id: string | null;
+  // v1.1.0: email of the user identified by triggered_by_user_id,
+  // resolved via a single batch query at read time (no N+1). NULL
+  // when triggered_by_user_id is NULL or the user was deleted.
+  triggered_by_email: string | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -449,13 +458,28 @@ export function useTestUserChannel() {
 // ---------------------------------------------------------------------------
 
 export function useUserSubscriptions(projectId?: string) {
+  // v1.1.0: GET /user/subscriptions now returns
+  // ``{items, next_cursor}``. The hook flattens to the legacy
+  // array shape so existing call sites keep working; pagination
+  // is followed transparently by walking ``next_cursor``.
   return useQuery<UserSubscription[]>({
     queryKey: ["user-subscriptions", projectId ?? "all"],
-    queryFn: () => {
-      const url = projectId
-        ? `/user/subscriptions?project_id=${encodeURIComponent(projectId)}`
-        : `/user/subscriptions`;
-      return api.get<UserSubscription[]>(url);
+    queryFn: async () => {
+      const items: UserSubscription[] = [];
+      let cursor: string | null = null;
+      do {
+        const params = new URLSearchParams();
+        if (projectId) params.set("project_id", projectId);
+        params.set("limit", "500");
+        if (cursor) params.set("cursor", cursor);
+        const page = await api.get<{
+          items: UserSubscription[];
+          next_cursor: string | null;
+        }>(`/user/subscriptions?${params.toString()}`);
+        items.push(...page.items);
+        cursor = page.next_cursor;
+      } while (cursor);
+      return items;
     },
   });
 }

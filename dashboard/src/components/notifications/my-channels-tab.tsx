@@ -129,7 +129,7 @@ export function MyChannelsTab() {
       <PageHeader
         title={
           <>
-            My Channels
+            Global Channels
             {isFetching && !isLoading && (
               <RefreshCw className="ml-2 inline size-3 animate-spin text-muted-foreground" />
             )}

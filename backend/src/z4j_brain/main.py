@@ -49,6 +49,7 @@ from z4j_brain.api import notifications as notifications_api
 from z4j_brain.api import projects as projects_api
 from z4j_brain.api import queues as queues_api
 from z4j_brain.api import schedules as schedules_api
+from z4j_brain.api import schedulers_fleet as schedulers_fleet_api
 from z4j_brain.api import stats as stats_api
 from z4j_brain.api import tasks as tasks_api
 from z4j_brain.api import trends as trends_api
@@ -152,6 +153,16 @@ def create_app(
     # ``deliver_local`` is what the registry calls from the worker
     # that owns the WebSocket. It loads the command row, signs the
     # frame, pushes it to the WS, and marks the row dispatched.
+    #
+    # Round-6 audit fix WS-HIGH-1 (Apr 2026): claim FIRST, push
+    # second. ``mark_dispatched`` is a conditional UPDATE
+    # (``WHERE status=PENDING``) so two concurrent callers race
+    # for the claim - only the winner pushes. Pre-fix the push
+    # ran before the claim, so the WS gateway drain + the
+    # registry reconcile loop could each push the same command
+    # to the same agent. Agent's in-memory dedup catches this
+    # within 300s, but a process restart between the two pushes
+    # = duplicate execution for destructive commands.
     async def deliver_local(command_id: UUID, ws: WebSocket) -> bool:
         from z4j_brain.persistence.repositories import CommandRepository
 
@@ -160,20 +171,28 @@ def create_app(
             command = await commands.get_for_dispatch(command_id)
             if command is None:
                 return False
-            try:
-                await ws_gateway.deliver_command_frame(
-                    websocket=ws,
-                    settings=settings,
-                    command=command,
-                )
-            except Exception:  # noqa: BLE001
-                logger.exception(
-                    "z4j main: deliver_command_frame crashed",
-                    command_id=str(command_id),
-                )
+            # Claim before push. If another caller already
+            # claimed (rowcount=0), bail without pushing.
+            claimed = await commands.mark_dispatched(command_id)
+            if not claimed:
+                await session.commit()
                 return False
-            await commands.mark_dispatched(command_id)
             await session.commit()
+
+        try:
+            await ws_gateway.deliver_command_frame(
+                websocket=ws,
+                settings=settings,
+                command=command,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "z4j main: deliver_command_frame crashed AFTER claim - "
+                "command stuck in DISPATCHED state until "
+                "CommandTimeoutWorker expires it",
+                command_id=str(command_id),
+            )
+            return False
         return True
 
     registry: BrainRegistry
@@ -220,6 +239,54 @@ def create_app(
     )
 
     # ------------------------------------------------------------------
+    # Optional: embedded scheduler sidecar (docs/SCHEDULER.md §21.3)
+    # ------------------------------------------------------------------
+    # When Z4J_EMBEDDED_SCHEDULER=true, brain auto-mints loopback PKI,
+    # forces scheduler_grpc_enabled, and spawns ``z4j-scheduler serve``
+    # as a supervised subprocess in the lifespan. The minted PKI
+    # supersedes any operator-supplied scheduler_grpc_tls_* paths so
+    # embedded mode is fully self-contained.
+    embedded_supervisor: Any = None
+    if settings.embedded_scheduler:
+        from pathlib import Path as _PkiPath  # noqa: PLC0415
+
+        from z4j_brain.embedded_scheduler import (  # noqa: PLC0415
+            SCHEDULER_CLIENT_CN, mint_loopback_pki,
+        )
+
+        # v1.1.0: default PKI directory is persistent at
+        # ``~/.z4j/embedded-pki/`` so the scheduler's ``INSTANCE_ID``
+        # stays stable across brain restarts (audit-log forensics
+        # need a coherent trail across the embedded subprocess's
+        # lifetime). Pre-1.1 used a per-process tempdir which
+        # rotated the CA and the instance id on every restart,
+        # orphaning audit rows.
+        if settings.embedded_scheduler_pki_dir:
+            pki_dir = _PkiPath(settings.embedded_scheduler_pki_dir)
+        else:
+            pki_dir = _PkiPath.home() / ".z4j" / "embedded-pki"
+        embedded_pki = mint_loopback_pki(pki_dir)
+        # Derive a settings copy with the auto-minted PKI + forced
+        # scheduler_grpc_enabled. ``model_copy`` bypasses the frozen
+        # check (Pydantic v2 returns a new instance, doesn't mutate).
+        # The cross-field security validators don't re-run, which is
+        # desired: embedded mode never has secret values that vary
+        # from the parent settings.
+        settings = settings.model_copy(  # type: ignore[assignment]
+            update={
+                "scheduler_grpc_enabled": True,
+                "scheduler_grpc_tls_cert": str(embedded_pki.server_cert_pem),
+                "scheduler_grpc_tls_key": str(embedded_pki.server_key_pem),
+                "scheduler_grpc_tls_ca": str(embedded_pki.ca_pem),
+                "scheduler_grpc_allowed_cns": [SCHEDULER_CLIENT_CN],
+            },
+        )
+        # The replaced singleton must be observable on app.state for
+        # routes that use ``Depends(get_settings)`` later.
+        # (Bound to app.state in the same block where every other
+        # singleton lands, after FastAPI() construction.)
+
+    # ------------------------------------------------------------------
     # Optional: z4j-scheduler gRPC service
     # ------------------------------------------------------------------
     # Constructed unconditionally so the .stop() in lifespan teardown
@@ -249,13 +316,15 @@ def create_app(
                 "`pip install z4j[scheduler-grpc]` to enable.",
             )
 
-    # Background workers. Always-on workers are unconditional;
-    # z4j-scheduler-related workers are gated behind
-    # ``Z4J_SCHEDULER_GRPC_ENABLED`` so default installs don't pay
-    # connection-pool slots for a feature they're not using. v1.0.18
-    # shipped the three scheduler workers unconditionally and
-    # operators saw agents flap to "offline" because the heartbeat
-    # path couldn't get a slot. v1.0.19 gates them.
+    # Background workers
+    # v1.0.19: the three z4j-scheduler-related workers
+    # (pending_fires_replay, schedule_circuit_breaker,
+    # schedule_fires_prune) only make sense when the operator
+    # has the scheduler integration enabled. Pre-1.0.19 they
+    # ticked unconditionally on every brain - wasted work for
+    # 99% of users and a possible source of "scheduler worker
+    # broke something for non-scheduler users" failure modes.
+    # Now gated behind ``Z4J_SCHEDULER_GRPC_ENABLED``.
     _workers: list[PeriodicWorker] = [
         PeriodicWorker(
             name="command_timeout_worker",
@@ -292,27 +361,66 @@ def create_app(
         ),
     ]
     if settings.scheduler_grpc_enabled:
+        # Round-4 audit fix (Apr 2026): wrap each scheduler-grpc
+        # worker tick in a per-worker Postgres advisory lock so
+        # multi-replica brain deployments only run one tick per
+        # interval globally. Pre-fix every replica ran every tick
+        # → duplicate work, duplicate audit rows, duplicate
+        # dispatcher calls. The lock id is a stable hash of the
+        # worker name; the lock is xact-scoped (auto-released on
+        # tick end or crash). SQLite no-ops the lock - single-
+        # writer DB so no contention possible.
+        from z4j_brain.domain.workers._leader_lock import (
+            acquire_per_worker_lock,
+        )
+
+        def _ha_tick(worker_name: str, raw_tick):
+            async def _wrapped() -> None:
+                async with acquire_per_worker_lock(db, worker_name) as got:
+                    if not got:
+                        return
+                    await raw_tick()
+            return _wrapped
+
+        _pending_fires_replay = PendingFiresReplayWorker(
+            db=db, dispatcher=command_dispatcher,
+        )
+        _circuit_breaker = ScheduleCircuitBreakerWorker(
+            db=db, settings=settings, audit=audit_service,
+        )
+        _fires_prune = ScheduleFiresPruneWorker(
+            db=db, settings=settings,
+        )
+
         _workers.extend([
             # z4j-scheduler buffered-fire replay. Sweeps expired
             # buffers + replays fires whose project just got an
             # online agent for the right engine.
             PeriodicWorker(
                 name="pending_fires_replay_worker",
-                tick=PendingFiresReplayWorker(
-                    db=db, dispatcher=command_dispatcher,
-                ).tick,
+                tick=_ha_tick(
+                    "pending_fires_replay_worker",
+                    _pending_fires_replay.tick,
+                ),
                 interval_seconds=float(
                     settings.pending_fires_replay_interval_seconds,
                 ),
             ),
             # z4j-scheduler circuit breaker. Auto-disables a
-            # schedule after N consecutive failed fires so a
-            # broken schedule doesn't flood the dashboard.
+            # schedule after N consecutive failed fires (configurable
+            # via ``schedule_circuit_breaker_threshold``, default 5)
+            # so a persistently-broken schedule doesn't flood the
+            # dashboard with noise. The trip flips ``is_enabled =
+            # False`` and writes an audit row with
+            # ``action="schedule.auto_disabled.circuit_breaker"``.
+            # Operators re-enable from the dashboard once the
+            # underlying bug is fixed.
             PeriodicWorker(
                 name="schedule_circuit_breaker_worker",
-                tick=ScheduleCircuitBreakerWorker(
-                    db=db, settings=settings, audit=audit_service,
-                ).tick,
+                tick=_ha_tick(
+                    "schedule_circuit_breaker_worker",
+                    _circuit_breaker.tick,
+                ),
                 interval_seconds=float(
                     settings.schedule_circuit_breaker_interval_seconds,
                 ),
@@ -323,9 +431,10 @@ def create_app(
             # tight retention.
             PeriodicWorker(
                 name="schedule_fires_prune_worker",
-                tick=ScheduleFiresPruneWorker(
-                    db=db, settings=settings,
-                ).tick,
+                tick=_ha_tick(
+                    "schedule_fires_prune_worker",
+                    _fires_prune.tick,
+                ),
                 interval_seconds=3600.0,
             ),
         ])
@@ -397,6 +506,17 @@ def create_app(
         app.state.notification_http_client = notification_http_client
         _set_notification_http_client(notification_http_client)
 
+        # Round-4 audit fix (Apr 2026): start the denial-audit
+        # queue drain task. The error middleware enqueues
+        # denial-audit events fire-and-forget; this task drains
+        # them on its own session (avoiding the per-request
+        # double-session under attack).
+        from z4j_brain.middleware._audit_queue import AuditQueue
+
+        audit_queue = AuditQueue()
+        audit_queue.start(db=db, settings=settings)
+        app.state.audit_queue = audit_queue
+
         try:
             await registry.start()
         except Exception:  # noqa: BLE001
@@ -431,9 +551,69 @@ def create_app(
                     exc_info=True,
                 )
 
+        # Embedded scheduler sidecar - spawn AFTER the gRPC server
+        # is up so the subprocess's first connect attempt finds it
+        # bound. The supervisor's auto-restart handles the (rare)
+        # transient where the subprocess wins the race anyway.
+        nonlocal embedded_supervisor
+        if (
+            settings.embedded_scheduler
+            and scheduler_grpc_server is not None
+            and scheduler_grpc_server.bound_port > 0
+        ):
+            from z4j_brain.embedded_scheduler import (  # noqa: PLC0415
+                EmbeddedSchedulerSupervisor,
+            )
+
+            embedded_supervisor = EmbeddedSchedulerSupervisor(
+                settings=settings,
+                pki=embedded_pki,
+                # The subprocess always connects via loopback.
+                # ``bind_host=0.0.0.0`` on the brain side covers
+                # both loopback and external connects; we just hand
+                # the subprocess ``127.0.0.1`` because that's the
+                # only SAN on the auto-minted server cert.
+                brain_grpc_host="127.0.0.1",
+                brain_grpc_port=scheduler_grpc_server.bound_port,
+                brain_rest_url=f"http://127.0.0.1:{settings.bind_port}",
+            )
+            try:
+                await embedded_supervisor.start()
+            except Exception:  # noqa: BLE001
+                logger.critical(
+                    "z4j brain embedded scheduler supervisor start "
+                    "failed; brain will keep running but the embedded "
+                    "scheduler is down. Set Z4J_EMBEDDED_SCHEDULER=0 "
+                    "and run a separate scheduler container if this "
+                    "persists.",
+                    exc_info=True,
+                )
+                embedded_supervisor = None
+
+        # Round-8 audit fix R8-Bootstrap-MED (Apr 2026): mark the
+        # lifespan as ready AFTER all background subsystems
+        # (registry, worker supervisor, dashboard hub, embedded
+        # scheduler if enabled) are up. The /health/ready probe
+        # gates on this flag so k8s readiness doesn't flip "ready"
+        # until the brain is genuinely able to serve traffic.
+        app.state.lifespan_ready = True
         try:
             yield
         finally:
+            # Round-8 audit fix R8-Bootstrap-MED: clear ready flag
+            # the moment we begin shutdown so /health/ready returns
+            # 503 and load balancers stop sending new traffic.
+            app.state.lifespan_ready = False
+            # Stop the embedded scheduler subprocess FIRST so it can
+            # cleanly drain any in-flight RPC against the gRPC
+            # server before the gRPC server itself is torn down.
+            if embedded_supervisor is not None:
+                try:
+                    await embedded_supervisor.stop()
+                except Exception:  # noqa: BLE001
+                    logger.exception(
+                        "z4j brain embedded scheduler supervisor stop crashed",
+                    )
             # Close the singleton TriggerScheduleClient (lazy-built
             # by the schedules trigger route). Failure here is non-
             # fatal - the channel is going away anyway.
@@ -452,6 +632,12 @@ def create_app(
                     await scheduler_grpc_server.stop()
                 except Exception:  # noqa: BLE001
                     logger.exception("z4j brain scheduler_grpc stop crashed")
+            # v1.1.0: PKI bundle now lives at
+            # ``~/.z4j/embedded-pki/`` (or operator-pinned path) and
+            # is reused across restarts on purpose. Nothing to clean
+            # up here - leaving the bundle in place is what keeps
+            # the scheduler's INSTANCE_ID stable for audit-log
+            # forensics.
             try:
                 await supervisor.stop()
             except Exception:  # noqa: BLE001
@@ -464,6 +650,14 @@ def create_app(
                 await registry.stop()
             except Exception:  # noqa: BLE001
                 logger.exception("z4j brain registry stop crashed")
+            # Round-4 audit fix (Apr 2026): drain the denial-audit
+            # queue before tearing down the DB. Best-effort with a
+            # bounded wait so a clogged queue doesn't block
+            # shutdown indefinitely.
+            try:
+                await audit_queue.stop()
+            except Exception:  # noqa: BLE001
+                logger.exception("z4j brain audit_queue stop crashed")
             # Tear down the shared notification HTTP client AFTER the
             # workers have stopped so any in-flight delivery can drain.
             try:
@@ -545,6 +739,7 @@ def create_app(
     app.include_router(queues_api.router, prefix="/api/v1")
     app.include_router(commands_api.router, prefix="/api/v1")
     app.include_router(schedules_api.router, prefix="/api/v1")
+    app.include_router(schedulers_fleet_api.router, prefix="/api/v1")
     app.include_router(audit_api.router, prefix="/api/v1")
     app.include_router(stats_api.router, prefix="/api/v1")
     app.include_router(trends_api.router, prefix="/api/v1")
@@ -686,18 +881,6 @@ def create_app(
         from fastapi.responses import FileResponse
         from starlette.staticfiles import StaticFiles
 
-        # v1.0.19: SPA entry point must NOT be cached. Otherwise
-        # browsers hold a stale ``index.html`` after a brain upgrade
-        # that references hashed asset filenames which no longer
-        # exist, and the dashboard appears blank until the user
-        # hard-refreshes. Hashed assets under /assets/ keep their
-        # default long-lived caching via StaticFiles, by design.
-        _NO_CACHE_HEADERS = {
-            "Cache-Control": "no-cache, no-store, must-revalidate",
-            "Pragma": "no-cache",
-            "Expires": "0",
-        }
-
         index_html = dashboard_dir / "index.html"
         assets_dir = dashboard_dir / "assets"
         if assets_dir.is_dir():
@@ -735,6 +918,20 @@ def create_app(
             "redoc",
         )
 
+        # v1.0.19: Cache-Control headers prevent browsers from
+        # holding onto a stale SPA bundle across brain upgrades.
+        # ``index.html`` is the entry point that loads the hashed
+        # asset bundles, so it MUST be revalidated on every load
+        # to avoid the "I upgraded the brain but the dashboard
+        # still shows old features" footgun. Hashed assets under
+        # /assets/ keep the long-cache because their filename
+        # changes on every build (Vite content-hashing).
+        _NO_CACHE_HEADERS = {
+            "Cache-Control": "no-cache, no-store, must-revalidate",
+            "Pragma": "no-cache",
+            "Expires": "0",
+        }
+
         @app.get("/{full_path:path}", include_in_schema=False)
         async def spa_fallback(full_path: str) -> FileResponse:
             """Serve a real file under the dist or fall back to index.html.
@@ -745,6 +942,14 @@ def create_app(
             ``/metrics``, etc.) always 404 from this fallback so a
             typo or a route registered after app build time gets a
             real 404 instead of HTML.
+
+            ``index.html`` (and any non-asset top-level file like
+            ``favicon.svg``) ships with no-cache headers so a
+            browser fetches the freshest version after every
+            brain upgrade. The content-hashed assets under
+            ``/assets/`` are mounted via ``StaticFiles`` above
+            and use the default long-lived cache headers - safe
+            because their filenames change on every build.
             """
             # Normalize: strip leading "/" if present (path:path
             # captures "api/v1/x" without the leading slash).
@@ -759,7 +964,9 @@ def create_app(
                 except ValueError:
                     raise HTTPException(status_code=404) from None
                 if candidate.is_file():
-                    return FileResponse(candidate, headers=_NO_CACHE_HEADERS)
+                    return FileResponse(
+                        candidate, headers=_NO_CACHE_HEADERS,
+                    )
             return FileResponse(index_html, headers=_NO_CACHE_HEADERS)
 
     return app

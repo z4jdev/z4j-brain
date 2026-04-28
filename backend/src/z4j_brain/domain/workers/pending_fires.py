@@ -110,28 +110,37 @@ class PendingFiresReplayWorker:
             engines_by_project[project_id].append(engine)
 
         replayed_total = 0
+        # Round-4 audit fix (Apr 2026): per-fire transaction so a
+        # crash mid-replay doesn't leave the buffer row + the
+        # dispatcher state inconsistent. Pre-fix one outer session
+        # held the whole loop, but ``dispatcher.issue`` commits
+        # internally after each call - so each ``delete_by_fire_id``
+        # ran in a NEW unconfirmed transaction (the dispatcher's
+        # commit closed the previous one). A SIGKILL between two
+        # successful issues left some buffer rows committed-deleted
+        # and others queued-but-not-deleted, then re-dispatched on
+        # next tick. With per-fire commits, every successful
+        # issue+delete is atomic from the buffer's perspective.
         for project_id, engines in engines_by_project.items():
             async with self._db.session() as session:
                 agents = await AgentRepository(session).list_online_for_project(
                     project_id,
                 )
-                online_engines: set[str] = set()
-                for agent in agents:
-                    for adapter in agent.engine_adapters or ():
-                        online_engines.add(adapter)
+            online_engines: set[str] = set()
+            for agent in agents:
+                for adapter in agent.engine_adapters or ():
+                    online_engines.add(adapter)
+            replayable = [e for e in engines if e in online_engines]
+            if not replayable:
+                # Nothing to do - no online agents for these
+                # engines yet. Try again next tick.
+                continue
 
-                replayable = [e for e in engines if e in online_engines]
-                if not replayable:
-                    # Nothing to do - no online agents for these
-                    # engines yet. Try again next tick.
-                    continue
-
-                pending_repo = PendingFiresRepository(session)
-                schedules_repo = ScheduleRepository(session)
-                audit_log = AuditLogRepository(session)
-                commands = CommandRepository(session)
-
-                for engine in replayable:
+            for engine in replayable:
+                # Per-engine session for the list+catch-up read.
+                async with self._db.session() as read_session:
+                    pending_repo = PendingFiresRepository(read_session)
+                    schedules_repo = ScheduleRepository(read_session)
                     fires = await pending_repo.list_for_replay(
                         project_id=project_id,
                         engine=engine,
@@ -139,27 +148,32 @@ class PendingFiresReplayWorker:
                     )
                     if not fires:
                         continue
-
                     fires = await self._apply_catch_up(
                         fires=fires, schedules_repo=schedules_repo,
                     )
 
-                    for fire in fires:
-                        target_agent = next(
-                            (
-                                a for a in agents
-                                if engine in (a.engine_adapters or ())
-                            ),
-                            None,
-                        )
-                        if target_agent is None:
-                            # Lost the agent between the list and now.
-                            # Leave the buffer; next tick will retry.
-                            break
+                for fire in fires:
+                    target_agent = next(
+                        (
+                            a for a in agents
+                            if engine in (a.engine_adapters or ())
+                        ),
+                        None,
+                    )
+                    if target_agent is None:
+                        # Lost the agent between the list and now.
+                        # Leave the buffer; next tick will retry.
+                        break
+                    # NEW per-fire session: dispatcher.issue +
+                    # delete_by_fire_id commit together. If the
+                    # dispatch fails, the delete is rolled back
+                    # and the buffer row remains. If both succeed,
+                    # both are committed atomically.
+                    async with self._db.session() as fire_session:
                         try:
                             await self._dispatcher.issue(
-                                commands=commands,
-                                audit_log=audit_log,
+                                commands=CommandRepository(fire_session),
+                                audit_log=AuditLogRepository(fire_session),
                                 project_id=fire.project_id,
                                 agent_id=target_agent.id,
                                 action="schedule.fire",
@@ -173,19 +187,24 @@ class PendingFiresReplayWorker:
                                     f"schedule:{fire.schedule_id}:fire:{fire.fire_id}"
                                 ),
                             )
+                            await PendingFiresRepository(
+                                fire_session,
+                            ).delete_by_fire_id(fire.fire_id)
+                            await fire_session.commit()
+                            replayed_total += 1
                         except Exception:  # noqa: BLE001
-                            # The dispatcher already logged. Leave the
-                            # row in the buffer; the next tick retries.
+                            # The dispatcher already logged. Leave
+                            # the buffer row; next tick retries
+                            # (dedup is handled by
+                            # commands.idempotency_key + ScheduleFire
+                            # upgrade-on-conflict).
                             logger.exception(
                                 "z4j.brain.workers.pending_fires: replay "
                                 "failed for fire_id=%s",
                                 fire.fire_id,
                             )
+                            await fire_session.rollback()
                             continue
-                        await pending_repo.delete_by_fire_id(fire.fire_id)
-                        replayed_total += 1
-
-                await session.commit()
 
         if replayed_total:
             logger.info(

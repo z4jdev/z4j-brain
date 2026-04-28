@@ -89,12 +89,22 @@ class TestInterceptorRemovePrefix:
 
         # Pull the source of the interceptor module and confirm
         # ``lstrip("DNS:")`` no longer appears.
+        # Round-9 audit fix R9-Sched-MED (Apr 2026): the helper now
+        # iterates a tuple of prefixes (DNS:, IP:, URI:, email:)
+        # using ``removeprefix`` rather than a single literal call;
+        # we still assert the substring ``removeprefix`` is present
+        # and that ``lstrip`` is absent.
         import inspect
 
         source = inspect.getsource(brain_auth)
         assert "lstrip(\"DNS:\")" not in source
         assert "lstrip('DNS:')" not in source
-        assert "removeprefix(\"DNS:\")" in source or "removeprefix('DNS:')" in source
+        assert "removeprefix" in source
+        # And every general-name prefix is in the strip set.
+        for prefix in ("DNS:", "IP:", "URI:", "email:"):
+            assert prefix in source, (
+                f"_normalise_cn must strip {prefix} (R9-Sched-MED)"
+            )
 
 
 # =====================================================================

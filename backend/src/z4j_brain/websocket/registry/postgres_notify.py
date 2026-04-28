@@ -153,8 +153,29 @@ class PostgresNotifyRegistry:
             worker_id=self._worker_id,
         )
 
-    async def unregister(self, agent_id: UUID) -> None:
+    async def unregister(
+        self,
+        agent_id: UUID,
+        *,
+        ws: "WebSocket | None" = None,
+    ) -> None:
+        """Drop ``agent_id`` from the local map.
+
+        Round-7 audit fix R7-HIGH (race) (Apr 2026): identity-check
+        the WebSocket. Pre-fix sequence: agent reconnects on a
+        flaky link → ``register`` replaces the old WS with the new
+        and force-closes the old → the old gateway's ``finally``
+        calls ``unregister(agent_id)`` which unconditionally pops
+        the NEW connection from the local map. The freshly
+        connected agent then appears offline to subsequent
+        ``deliver`` calls and commands take the slow NOTIFY path
+        until the next reconcile sweep. Identity check fixes it.
+        """
         async with self._lock:
+            if ws is not None:
+                current = self._connections.get(agent_id)
+                if current is not ws:
+                    return
             self._connections.pop(agent_id, None)
             self._project_for_agent.pop(agent_id, None)
         logger.info(

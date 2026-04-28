@@ -67,11 +67,24 @@ class ProjectPublic(BaseModel):
     updated_at: datetime
 
 
+# Round-8 audit fix R8-Pyd-LOW (Apr 2026): tighten environment to
+# a known-good shape. We use a pattern instead of Literal so older
+# rows with values outside the canonical set (e.g. ``staging-eu``,
+# ``qa1``) can still be re-PATCHed without forcing the operator to
+# rename. The dashboard's audit-log filter knows the canonical
+# four; anything else still renders as a plain string.
+_ENVIRONMENT_PATTERN = r"^[a-z][a-z0-9_-]{0,39}$"
+
+
 class CreateProjectRequest(BaseModel):
     slug: str = Field(min_length=2, max_length=63)
     name: str = Field(min_length=1, max_length=200)
     description: str | None = Field(default=None, max_length=2000)
-    environment: str = Field(default="production", max_length=40)
+    environment: str = Field(
+        default="production",
+        max_length=40,
+        pattern=_ENVIRONMENT_PATTERN,
+    )
     timezone: str = Field(default="UTC", max_length=64)
     retention_days: int = Field(default=30, ge=1, le=3650)
 
@@ -80,7 +93,11 @@ class UpdateProjectRequest(BaseModel):
     slug: str | None = Field(default=None, min_length=2, max_length=63)
     name: str | None = Field(default=None, min_length=1, max_length=200)
     description: str | None = Field(default=None, max_length=2000)
-    environment: str | None = Field(default=None, max_length=40)
+    environment: str | None = Field(
+        default=None,
+        max_length=40,
+        pattern=_ENVIRONMENT_PATTERN,
+    )
     timezone: str | None = Field(default=None, max_length=64)
     retention_days: int | None = Field(default=None, ge=1, le=3650)
 

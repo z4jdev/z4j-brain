@@ -298,9 +298,18 @@ class TestImportSchedulesHappyPath:
 
 class TestImportPerRowErrors:
     @pytest.mark.asyncio
-    async def test_bad_kind_logged_other_rows_land(
+    async def test_bad_kind_rejects_whole_batch_at_schema(
         self, settings: Settings, brain_app,
     ) -> None:
+        # Audit fix REST H-2 (Apr 2026): the API now validates
+        # ``kind`` at the Pydantic schema layer instead of letting
+        # bad rows slip through to the repository's per-row check.
+        # That changes the failure mode from a partial-success 200
+        # with an error map to a fail-fast 422 - the operator's
+        # importer sees a clean schema error pointing at row 1
+        # rather than a confusing "1 of 2 inserted" result. Whole-
+        # batch rejection on schema errors is the more defensive
+        # default for the API surface.
         seed = await _make_seed(
             settings=settings, brain_app=brain_app, is_admin=True,
         )
@@ -317,12 +326,11 @@ class TestImportPerRowErrors:
                     ],
                 },
             )
-        assert r.status_code == 200
-        body = r.json()
-        assert body["inserted"] == 1
-        assert body["failed"] == 1
-        assert "1" in body["errors"]
-        assert "kind" in body["errors"]["1"]
+        # FastAPI returns 422 on schema-validation failure.
+        assert r.status_code == 422, r.text
+        # The error body names ``kind`` so the importer can
+        # surface the offending field.
+        assert "kind" in r.text
 
 
 # =====================================================================

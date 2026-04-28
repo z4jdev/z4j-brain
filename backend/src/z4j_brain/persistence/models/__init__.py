@@ -33,6 +33,7 @@ from z4j_brain.persistence.models.project import Project
 from z4j_brain.persistence.models.queue import Queue
 from z4j_brain.persistence.models.schedule import Schedule
 from z4j_brain.persistence.models.schedule_fire import ScheduleFire
+from z4j_brain.persistence.models.scheduler_rate_bucket import SchedulerRateBucket
 from z4j_brain.persistence.models.session import Session
 from z4j_brain.persistence.models.notification import (
     NotificationChannel,
@@ -73,6 +74,7 @@ __all__ = [
     "SavedView",
     "Schedule",
     "ScheduleFire",
+    "SchedulerRateBucket",
     "Session",
     "Task",
     "TaskAnnotation",

@@ -7,7 +7,7 @@ from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
 from fastapi import APIRouter, Depends, Query
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from z4j_brain.api._pagination import (
     clamp_limit,
@@ -378,7 +378,12 @@ class BulkDeleteRequest(BaseModel):
     # in the WHERE clause, so this is defence in depth).
     model_config = {"extra": "forbid"}
 
-    task_ids: list[uuid.UUID] | None = None
+    # Round-8 audit fix R8-Pyd-H4 (Apr 2026): cap the explicit list.
+    # The handler slices to :1000 below the validator, but Pydantic
+    # parses + UUID-validates the whole list first — a 10M-element
+    # list still OOM-walks the validator before the slice. The cap
+    # matches the handler's existing trim ceiling.
+    task_ids: list[uuid.UUID] | None = Field(default=None, max_length=1000)
     filter_state: str | None = None
     filter_name: str | None = None
     filter_queue: str | None = None

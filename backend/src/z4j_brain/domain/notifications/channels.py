@@ -104,15 +104,15 @@ async def resolve_and_pin(url: str) -> tuple[str | None, str | None]:
             ip = ipaddress.ip_address(raw_ip)
         except ValueError:
             continue
-        blocked = False
-        for network in _BLOCKED_NETWORKS:
-            if ip in network:
-                blocked = True
-                return (
-                    f"target IP {ip} is in blocked range {network}",
-                    None,
-                )
-        if not blocked and safe_ip is None:
+        # Round-7 audit fix R7-HIGH (Apr 2026): use the unified
+        # semantic-property check that catches IPv4-mapped IPv6,
+        # 6to4, NAT64, and CGNAT alongside the classic private/loopback
+        # ranges. Pre-fix this loop iterated only ``_BLOCKED_NETWORKS``
+        # and missed the v4-mapped-v6 bypass.
+        block_reason = _ip_is_blocked(ip)
+        if block_reason is not None:
+            return block_reason, None
+        if safe_ip is None:
             safe_ip = raw_ip
     if safe_ip is None:
         return f"no usable IP resolved for '{hostname}'", None
@@ -167,9 +167,15 @@ async def _post(
     if pin_ip is not None:
         pinned, original_host, _port = _pin_url_to_ip(url, pin_ip)
         request_url = str(pinned)
-        # Only set Host header if the caller hasn't already - otherwise
-        # we'd clobber an intentional override.
-        headers = {"Host": original_host, **headers}
+        # Round-7 audit fix R7-LOW (Apr 2026): the IP-pin's Host
+        # header MUST win over any caller-supplied value. Otherwise
+        # a future code path that bypassed ``validate_webhook_headers``
+        # could let an attacker re-route the pinned request to a
+        # different vhost on the resolved IP. The validator already
+        # bans ``Host`` from incoming config, but defense-in-depth:
+        # let the trailing dict of explicit pins override caller
+        # input rather than the other way around.
+        headers = {**headers, "Host": original_host}
         # Tell httpx/httpcore to use the original hostname for TLS
         # SNI AND for certificate hostname verification, even
         # though the socket connects to ``safe_ip``.
@@ -214,24 +220,98 @@ async def _post(
         return resp
     finally:
         if not using_shared:
-            await client_owner.aclose()
+            # Round-8 audit fix R8-Async-MED (Apr 2026): shield the
+            # ad-hoc client close so a request-cancel mid-aclose
+            # doesn't leak the client + its connection pool.
+            try:
+                await asyncio.shield(client_owner.aclose())
+            except Exception:  # noqa: BLE001
+                logger.debug(
+                    "z4j notifications._post: shielded aclose raised",
+                    exc_info=True,
+                )
 
 #: Allowed URL schemes for webhook targets.
 _ALLOWED_SCHEMES = frozenset({"https", "http"})
 
 #: Private/reserved IP ranges that must never be targeted by webhooks.
+#:
+#: Round-7 audit fix R7-HIGH (Apr 2026): the prior list was
+#: enumeration-based and missed IPv4-mapped IPv6 (``::ffff:127.0.0.1``,
+#: ``::ffff:169.254.169.254``) — those addresses do NOT match the
+#: ``127.0.0.0/8`` / ``169.254.0.0/16`` IPv4 networks, so an attacker
+#: who controlled a public AAAA record could resolve to a v6-mapped
+#: loopback / link-local and bypass the entire SSRF guard. Also
+#: missed CGNAT (RFC 6598, ``100.64.0.0/10``) which fronts a lot of
+#: home-router admin UIs, benchmark range (``198.18.0.0/15``), and
+#: 6to4 / NAT64 (``2002::/16`` and ``64:ff9b::/96``) which can route
+#: to private IPv4 destinations through a v6 tunnel.
+#:
+#: We keep the explicit network list for the few ranges that
+#: ``ipaddress`` doesn't classify as ``is_private`` (CGNAT, benchmark,
+#: 6to4, NAT64) and additionally check the semantic predicates below
+#: in :func:`_ip_is_blocked` so a single helper covers every shape.
 _BLOCKED_NETWORKS = [
     ipaddress.ip_network("0.0.0.0/8"),        # "this network" (RFC 1122)
     ipaddress.ip_network("10.0.0.0/8"),
+    ipaddress.ip_network("100.64.0.0/10"),    # R7-MED: CGNAT (RFC 6598)
     ipaddress.ip_network("172.16.0.0/12"),
     ipaddress.ip_network("192.168.0.0/16"),
+    ipaddress.ip_network("198.18.0.0/15"),    # R7-MED: benchmark (RFC 2544)
     ipaddress.ip_network("127.0.0.0/8"),
     ipaddress.ip_network("169.254.0.0/16"),  # link-local / AWS metadata
     ipaddress.ip_network("::/128"),           # IPv6 unspecified
     ipaddress.ip_network("::1/128"),
     ipaddress.ip_network("fc00::/7"),  # IPv6 private
     ipaddress.ip_network("fe80::/10"),  # IPv6 link-local
+    ipaddress.ip_network("2002::/16"),  # R7-MED: 6to4 (can wrap loopback)
+    ipaddress.ip_network("64:ff9b::/96"),  # R7-MED: NAT64
 ]
+
+
+def _ip_is_blocked(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> str | None:
+    """Return a human-readable block reason or None if ``ip`` is OK.
+
+    Round-7 audit fix R7-HIGH (Apr 2026): unifies the three SSRF
+    checks the codebase used to repeat per-callsite. Always:
+
+    1. Unwrap an IPv4-mapped IPv6 address (``::ffff:1.2.3.4``) into
+       its 4-byte twin and recurse — without this, ``::ffff:127.0.0.1``
+       passes every ``v4_address in v4_network`` check.
+    2. Reject anything ``is_loopback`` / ``is_private`` /
+       ``is_link_local`` / ``is_multicast`` / ``is_reserved`` /
+       ``is_unspecified``. These predicates evaluate the full
+       semantic class so future RFC additions don't silently slip
+       through.
+    3. Reject anything explicitly named in :data:`_BLOCKED_NETWORKS`
+       for the few ranges (CGNAT, benchmark, 6to4, NAT64) that the
+       semantic predicates don't classify as private but that an
+       SSRF attacker could pivot through.
+    """
+    if isinstance(ip, ipaddress.IPv6Address):
+        mapped = ip.ipv4_mapped
+        if mapped is not None:
+            inner = _ip_is_blocked(mapped)
+            if inner is not None:
+                return f"v4-mapped {inner}"
+    if ip.is_loopback:
+        return f"target IP {ip} is loopback"
+    if ip.is_private:
+        return f"target IP {ip} is in a private range"
+    if ip.is_link_local:
+        return f"target IP {ip} is link-local (cloud metadata reachable)"
+    if ip.is_multicast:
+        return f"target IP {ip} is multicast"
+    if ip.is_reserved:
+        return f"target IP {ip} is reserved"
+    if ip.is_unspecified:
+        return f"target IP {ip} is unspecified"
+    for network in _BLOCKED_NETWORKS:
+        if ip.version != network.version:
+            continue
+        if ip in network:
+            return f"target IP {ip} is in blocked range {network}"
+    return None
 
 
 def _static_url_checks(url: str) -> tuple[str | None, str | None]:
@@ -340,9 +420,10 @@ async def validate_webhook_url(url: str) -> str | None:
             ip = ipaddress.ip_address(raw_ip)
         except ValueError:
             continue
-        for network in _BLOCKED_NETWORKS:
-            if ip in network:
-                return f"target IP {ip} is in blocked range {network}"
+        # Round-7 audit fix R7-HIGH (Apr 2026): unified semantic check.
+        block_reason = _ip_is_blocked(ip)
+        if block_reason is not None:
+            return block_reason
 
     return None
 
@@ -432,9 +513,10 @@ async def validate_smtp_config(config: dict[str, Any]) -> str | None:
         except ValueError:
             ip = None
         if ip is not None:
-            for network in _BLOCKED_NETWORKS:
-                if ip in network:
-                    return f"smtp_host IP {ip} is in blocked range {network}"
+            # Round-7 audit fix R7-HIGH (Apr 2026): unified semantic check.
+            block_reason = _ip_is_blocked(ip)
+            if block_reason is not None:
+                return f"smtp_host {block_reason}"
         else:
             # Resolve + check every A/AAAA. Same pattern as
             # ``validate_webhook_url``.
@@ -446,12 +528,12 @@ async def validate_smtp_config(config: dict[str, Any]) -> str | None:
                     resolved = ipaddress.ip_address(raw_ip)
                 except ValueError:
                     continue
-                for network in _BLOCKED_NETWORKS:
-                    if resolved in network:
-                        return (
-                            f"smtp_host '{stripped}' resolves to {resolved} "
-                            f"in blocked range {network}"
-                        )
+                block_reason = _ip_is_blocked(resolved)
+                if block_reason is not None:
+                    return (
+                        f"smtp_host '{stripped}' resolves to a blocked "
+                        f"address: {block_reason}"
+                    )
     port_raw = config.get("smtp_port")
     if port_raw is not None:
         try:
@@ -483,9 +565,10 @@ def _validate_webhook_url(url: str) -> str | None:
             ip = ipaddress.ip_address(sockaddr[0])
         except ValueError:
             continue
-        for network in _BLOCKED_NETWORKS:
-            if ip in network:
-                return f"target IP {ip} is in blocked range {network}"
+        # Round-7 audit fix R7-HIGH (Apr 2026): unified semantic check.
+        block_reason = _ip_is_blocked(ip)
+        if block_reason is not None:
+            return block_reason
     return None
 
 
@@ -725,12 +808,15 @@ async def deliver_email(
                     parsed_ip = _ipaddress.ip_address(raw_ip)
                 except ValueError:
                     continue
-                if any(parsed_ip in net for net in _BLOCKED_NETWORKS):
+                # Round-7 audit fix R7-HIGH (Apr 2026): unified
+                # semantic check covers IPv4-mapped IPv6 etc.
+                block_reason = _ip_is_blocked(parsed_ip)
+                if block_reason is not None:
                     return DeliveryResult(
                         success=False,
                         error=(
-                            f"smtp_host '{host}' resolved to "
-                            f"blocked IP {parsed_ip} at dispatch"
+                            f"smtp_host '{host}' resolved to a blocked "
+                            f"address at dispatch: {block_reason}"
                         ),
                     )
     except Exception as exc:  # noqa: BLE001
@@ -741,10 +827,32 @@ async def deliver_email(
     subject = _build_email_subject(payload)
     body_text = _build_email_body(payload)
 
+    # Round-6 audit fix Notif-MED (Apr 2026): defensive header
+    # injection guard. The Subject / From / To values flow from a
+    # mix of operator config (``from_addr``, ``to_addrs``) and
+    # caller payload (``subject`` for transactional emails). A bare
+    # ``msg["Subject"] = subject`` with an attacker-controlled
+    # newline would let RFC 5322 header injection through (BCC
+    # smuggling, body forgery). Reject any value containing CR/LF
+    # before it reaches MIMEText, which itself accepts any string.
+    def _no_crlf(value: str, field: str) -> str:
+        if "\r" in value or "\n" in value:
+            raise ValueError(
+                f"email header {field} contains CR/LF; refusing to send",
+            )
+        return value
+
+    try:
+        safe_subject = _no_crlf(subject, "Subject")
+        safe_from = _no_crlf(str(from_addr), "From")
+        safe_to_list = [_no_crlf(str(addr), "To") for addr in to_addrs]
+    except ValueError as exc:
+        return DeliveryResult(success=False, error=str(exc))
+
     msg = MIMEText(body_text, "plain", "utf-8")
-    msg["Subject"] = subject
-    msg["From"] = from_addr
-    msg["To"] = ", ".join(to_addrs)
+    msg["Subject"] = safe_subject
+    msg["From"] = safe_from
+    msg["To"] = ", ".join(safe_to_list)
 
     # Dial the hostname directly (see the long comment above for
     # why we don't pin the IP). Use the low-level SMTP class so
@@ -849,6 +957,27 @@ async def deliver_slack(
     ssrf_error = await validate_webhook_url(webhook_url)
     if ssrf_error:
         return DeliveryResult(success=False, error=f"blocked: {ssrf_error}")
+
+    # Round-6 audit fix Notif-MED (Apr 2026): host-lock the Slack
+    # dispatcher to ``hooks.slack.com``. Without this, a tenant
+    # admin can register a "Slack" channel pointing at an arbitrary
+    # attacker-controlled HTTPS endpoint and use it as a generic
+    # data-exfil sink that LOOKS like Slack in the audit log. The
+    # SSRF check above only rejects PRIVATE addresses; a public
+    # attacker host passes it.
+    try:
+        slack_host = urlparse(webhook_url).hostname or ""
+    except Exception:  # noqa: BLE001
+        slack_host = ""
+    if slack_host.lower() != "hooks.slack.com":
+        return DeliveryResult(
+            success=False,
+            error=(
+                "slack webhook_url must point at hooks.slack.com "
+                "(host-lock enforced; configure a generic webhook "
+                "channel for arbitrary HTTPS targets)"
+            ),
+        )
 
     trigger = payload.get("trigger", "notification")
     task_name = payload.get("task_name", "")
@@ -1223,6 +1352,31 @@ async def deliver_discord(
         return DeliveryResult(
             success=False,
             error=f"blocked: {ssrf_error}",
+        )
+
+    # Round-6 audit fix Notif-MED (Apr 2026): host-lock the Discord
+    # dispatcher to discord.com / discordapp.com / canary.discord.com /
+    # ptb.discord.com (the four official webhook hosts). Same threat
+    # model as the Slack host-lock above.
+    _DISCORD_ALLOWED_HOSTS = frozenset({
+        "discord.com",
+        "discordapp.com",
+        "canary.discord.com",
+        "ptb.discord.com",
+    })
+    try:
+        discord_host = (urlparse(webhook_url).hostname or "").lower()
+    except Exception:  # noqa: BLE001
+        discord_host = ""
+    if discord_host not in _DISCORD_ALLOWED_HOSTS:
+        return DeliveryResult(
+            success=False,
+            error=(
+                "discord webhook_url must point at an official discord "
+                "host (discord.com, discordapp.com, canary.discord.com, "
+                "ptb.discord.com); use the generic webhook channel for "
+                "arbitrary HTTPS targets"
+            ),
         )
 
     # Discord's Slack-compat endpoint accepts the same Block Kit-ish

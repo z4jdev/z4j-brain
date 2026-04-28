@@ -240,6 +240,8 @@ export interface QueuePublic {
 
 export type ScheduleKind = "cron" | "interval" | "solar" | "clocked";
 
+export type ScheduleCatchUp = "skip" | "fire_one_missed" | "fire_all_missed";
+
 export interface SchedulePublic {
   id: string;
   project_id: string;
@@ -261,6 +263,105 @@ export interface SchedulePublic {
   external_id: string | null;
   created_at: string;
   updated_at: string;
+  // Phase 2 columns surfaced for the dashboard. ``source`` lets the
+  // dashboard render a "managed by" badge so operators see at a
+  // glance where a schedule came from. ``catch_up`` shows the
+  // missed-fire policy. ``source_hash`` is the declarative
+  // reconciler's content hash; null for dashboard-created rows.
+  catch_up: ScheduleCatchUp;
+  source: string;
+  source_hash: string | null;
+}
+
+// Status enum matches the schedule_fires table's status column.
+// Mirrors backend Phase 4 ScheduleFire.status values.
+export type ScheduleFireStatus =
+  | "pending"
+  | "delivered"
+  | "buffered"
+  | "acked_success"
+  | "acked_failed"
+  | "failed";
+
+export interface ScheduleFirePublic {
+  id: string;
+  fire_id: string;
+  schedule_id: string;
+  command_id: string | null;
+  status: ScheduleFireStatus;
+  scheduled_for: string;
+  fired_at: string;
+  acked_at: string | null;
+  latency_ms: number | null;
+  error_code: string | null;
+  error_message: string | null;
+}
+
+// Reconciliation diff (POST /projects/{slug}/schedules:diff). Mirrors
+// brain's DiffSchedulesResponse. Each entry carries the proposed +
+// current shape so the dashboard can render an inline before/after
+// comparison without a second round-trip.
+export interface ScheduleDiffEntry {
+  name: string;
+  scheduler: string;
+  proposed: Record<string, unknown>;
+  current: Record<string, unknown>;
+}
+
+export interface ScheduleDiffResponse {
+  inserted: ScheduleDiffEntry[];
+  updated: ScheduleDiffEntry[];
+  unchanged: ScheduleDiffEntry[];
+  deleted: ScheduleDiffEntry[];
+  summary: {
+    insert: number;
+    update: number;
+    unchanged: number;
+    delete: number;
+    total: number;
+  };
+}
+
+// Same body shape the CLI's `import --verify` flag posts. Operators
+// paste a JSON array of schedules into the dashboard textarea; we
+// wrap it with the mode + optional source_filter and POST as-is.
+export interface ScheduleDiffRequest {
+  mode: "upsert" | "replace_for_source";
+  source_filter?: string;
+  schedules: Array<Record<string, unknown>>;
+}
+
+// Fleet overview (GET /api/v1/schedulers). Brain fans out to each
+// configured scheduler /info URL and returns one entry per probe.
+// ``ok`` distinguishes the three observable states:
+//   true  - scheduler responded with parseable /info
+//   false - scheduler responded but the response was bad
+//   null  - scheduler did not respond (timeout / connection error)
+export interface FleetEntry {
+  url: string;
+  ok: boolean | null;
+  info: {
+    version?: string;
+    instance_id?: string;
+    uptime_seconds?: number;
+    started_at?: string;
+    brain_grpc_url?: string;
+    projects?: string;
+    ready?: boolean;
+    schedules_loaded?: number;
+    subsystems?: {
+      brain_client_connected?: boolean;
+      cache_initial_sync_complete?: boolean;
+      leader_gate_initialised?: boolean;
+    };
+  } | null;
+  error: string | null;
+}
+
+export interface FleetResponse {
+  schedulers: FleetEntry[];
+  total: number;
+  healthy: number;
 }
 
 // ---------------------------------------------------------------------------

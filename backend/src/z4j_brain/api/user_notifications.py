@@ -21,11 +21,13 @@ import uuid
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, Literal
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, Query, Request
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy.exc import IntegrityError
 
 from z4j_brain.api.deps import (
+    get_audit_log_repo,
+    get_audit_service,
     get_current_user,
     get_membership_repo,
     get_project_repo,
@@ -49,8 +51,10 @@ from z4j_brain.persistence.enums import ProjectRole
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
 
+    from z4j_brain.domain.audit_service import AuditService
     from z4j_brain.persistence.models import User
     from z4j_brain.persistence.repositories import (
+        AuditLogRepository,
         MembershipRepository,
         ProjectRepository,
     )
@@ -307,8 +311,13 @@ class UserSubscriptionCreate(BaseModel):
     trigger: str = Field(pattern=_TRIGGER_PATTERN)
     filters: SubscriptionFilters = Field(default_factory=SubscriptionFilters)
     in_app: bool = True
-    project_channel_ids: list[uuid.UUID] = Field(default_factory=list)
-    user_channel_ids: list[uuid.UUID] = Field(default_factory=list)
+    # Round-8 audit fix R8-Pyd-H5 (Apr 2026): cap channel_ids lists.
+    project_channel_ids: list[uuid.UUID] = Field(
+        default_factory=list, max_length=64,
+    )
+    user_channel_ids: list[uuid.UUID] = Field(
+        default_factory=list, max_length=64,
+    )
     cooldown_seconds: int = Field(default=0, ge=0, le=86400)
 
 
@@ -324,8 +333,13 @@ class UserSubscriptionUpdate(BaseModel):
     trigger: str | None = Field(default=None, pattern=_TRIGGER_PATTERN)
     filters: SubscriptionFilters | None = None
     in_app: bool | None = None
-    project_channel_ids: list[uuid.UUID] | None = None
-    user_channel_ids: list[uuid.UUID] | None = None
+    # Round-8 audit fix R8-Pyd-H5 (Apr 2026).
+    project_channel_ids: list[uuid.UUID] | None = Field(
+        default=None, max_length=64,
+    )
+    user_channel_ids: list[uuid.UUID] | None = Field(
+        default=None, max_length=64,
+    )
     cooldown_seconds: int | None = Field(default=None, ge=0, le=86400)
     muted_until: datetime | None = None
     is_active: bool | None = None
@@ -346,6 +360,46 @@ class UserSubscriptionPublic(BaseModel):
     is_active: bool
     created_at: datetime
     updated_at: datetime
+
+
+class UserSubscriptionsListPublic(BaseModel):
+    """Paged list of user subscriptions (v1.1.0 N+1 fix).
+
+    Pre-1.1 ``GET /user/subscriptions`` returned a bare
+    ``list[UserSubscriptionPublic]`` and would have linearly grown
+    with the user's per-project subscription count. We switch to a
+    cursor-paged envelope keyed on ``(project_id, trigger, id)``
+    to keep response time bounded as a power user accumulates
+    subscriptions across many projects.
+
+    Breaking change vs 1.0.x: clients that iterated the response
+    directly must now read ``response.items``.
+    """
+
+    items: list[UserSubscriptionPublic]
+    next_cursor: str | None
+
+
+def _encode_user_subscriptions_cursor(
+    project_id: uuid.UUID, trigger: str, sub_id: uuid.UUID,
+) -> str:
+    return f"{project_id.hex}|{trigger}|{sub_id.hex}"
+
+
+def _decode_user_subscriptions_cursor(
+    raw: str | None,
+) -> tuple[uuid.UUID | None, str | None, uuid.UUID | None]:
+    if not raw:
+        return None, None, None
+    parts = raw.split("|", 2)
+    if len(parts) != 3:
+        return None, None, None
+    try:
+        project_id = uuid.UUID(parts[0])
+        sub_id = uuid.UUID(parts[2])
+    except ValueError:
+        return None, None, None
+    return project_id, parts[1], sub_id
 
 
 # -- In-app notifications ---------------------------------------------------
@@ -713,7 +767,11 @@ async def _dispatch_user_test(
 )
 async def test_user_channel_config(
     body: ChannelTestRequest,
-    user: "User" = Depends(get_current_user),  # noqa: ARG001
+    request: Request,
+    user: "User" = Depends(get_current_user),
+    audit_log: "AuditLogRepository" = Depends(get_audit_log_repo),
+    audit: "AuditService" = Depends(get_audit_service),
+    db_session: "AsyncSession" = Depends(get_session),
 ) -> ChannelTestResult:
     """Dispatch a test notification against an UNSAVED user-channel config.
 
@@ -722,8 +780,36 @@ async def test_user_channel_config(
     credentials BEFORE persisting. Delivery is NOT logged to
     ``notification_deliveries`` - preflight semantics only. Runs the
     same SSRF / format guards as ``create_user_channel``.
+
+    Round-6 audit fix Notif-HIGH (Apr 2026): the project-channel test
+    endpoints already record a ``notifications.channel.test`` audit
+    row (data-exfil pivot via attacker-controlled webhook URL); the
+    user-scoped variant was missing it. Same threat model — a
+    compromised user account can dial out arbitrary HTTP / SMTP
+    payloads to attacker infrastructure carrying brain test content.
     """
-    return await _dispatch_user_test(body.type, body.config)
+    from z4j_brain.api.notifications import _destination_summary
+
+    result = await _dispatch_user_test(body.type, body.config)
+    await audit.record(
+        audit_log,
+        action="user_notifications.channel.test",
+        target_type="user_notification_channel",
+        target_id=None,
+        result="success" if result.success else "failed",
+        outcome="allow",
+        user_id=user.id,
+        project_id=None,
+        source_ip=request.client.host if request.client else None,
+        user_agent=request.headers.get("user-agent"),
+        metadata={
+            "type": body.type,
+            "destination_summary": _destination_summary(body.type, body.config),
+            "ok": result.success,
+        },
+    )
+    await db_session.commit()
+    return result
 
 
 @router.post(
@@ -736,7 +822,10 @@ async def test_user_channel_config(
 )
 async def test_saved_user_channel(
     channel_id: uuid.UUID,
+    request: Request,
     user: "User" = Depends(get_current_user),
+    audit_log: "AuditLogRepository" = Depends(get_audit_log_repo),
+    audit: "AuditService" = Depends(get_audit_service),
     db_session: "AsyncSession" = Depends(get_session),
 ) -> ChannelTestResult:
     """Dispatch a test notification against a SAVED user channel.
@@ -745,7 +834,12 @@ async def test_saved_user_channel(
     user can test their own channel - ``get_for_user`` scopes the
     lookup by ``user.id`` so a leaked UUID cannot cross-test another
     user's channel.
+
+    Round-6 audit fix Notif-HIGH (Apr 2026): also writes the
+    ``user_notifications.channel.test`` audit row that the project-
+    channel variant has had since 1.0.14.
     """
+    from z4j_brain.api.notifications import _destination_summary
     from z4j_brain.errors import NotFoundError
     from z4j_brain.persistence.repositories import UserChannelRepository
 
@@ -757,7 +851,28 @@ async def test_saved_user_channel(
             "channel not found",
             details={"channel_id": str(channel_id)},
         )
-    return await _dispatch_user_test(channel.type, channel.config or {})
+    result = await _dispatch_user_test(channel.type, channel.config or {})
+    await audit.record(
+        audit_log,
+        action="user_notifications.channel.test",
+        target_type="user_notification_channel",
+        target_id=str(channel.id),
+        result="success" if result.success else "failed",
+        outcome="allow",
+        user_id=user.id,
+        project_id=None,
+        source_ip=request.client.host if request.client else None,
+        user_agent=request.headers.get("user-agent"),
+        metadata={
+            "type": channel.type,
+            "destination_summary": _destination_summary(
+                channel.type, channel.config or {},
+            ),
+            "ok": result.success,
+        },
+    )
+    await db_session.commit()
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -767,14 +882,16 @@ async def test_saved_user_channel(
 
 @router.get(
     "/subscriptions",
-    response_model=list[UserSubscriptionPublic],
+    response_model=UserSubscriptionsListPublic,
 )
 async def list_user_subscriptions(
     project_id: uuid.UUID | None = Query(default=None),
+    limit: int = Query(default=50, ge=1, le=500),
+    cursor: str | None = Query(default=None),
     user: "User" = Depends(get_current_user),
     memberships: "MembershipRepository" = Depends(get_membership_repo),
     db_session: "AsyncSession" = Depends(get_session),
-) -> list[UserSubscriptionPublic]:
+) -> UserSubscriptionsListPublic:
     """List the caller's subscriptions, optionally filtered to one project.
 
     When ``project_id`` is supplied the caller must currently be a
@@ -782,6 +899,12 @@ async def list_user_subscriptions(
     query already scopes by ``user.id`` so a non-member sees only an
     empty list, but the explicit check documents intent and prevents
     a regression if ``list_for_user`` is ever widened to span users.
+
+    v1.1.0: keyset paginated on ``(project_id, trigger, id)``.
+    Cursor encoded as ``"<project_uuid_hex>|<trigger>|<sub_uuid_hex>"``.
+    Default page size 50, max 500. Response shape is the
+    ``UserSubscriptionsListPublic`` envelope; pre-1.1 clients that
+    iterated the bare list must read ``response.items``.
     """
     from z4j_brain.persistence.repositories import UserSubscriptionRepository
 
@@ -796,10 +919,31 @@ async def list_user_subscriptions(
                 "no membership on this project",
                 details={"project_id": str(project_id)},
             )
-    rows = await UserSubscriptionRepository(db_session).list_for_user(
-        user.id, project_id=project_id,
+
+    cursor_project_id, cursor_trigger, cursor_id = (
+        _decode_user_subscriptions_cursor(cursor)
     )
-    return [_subscription_payload(r) for r in rows]
+    # Fetch limit+1 so we can detect a next page without a second
+    # COUNT() round-trip. Mirrors the schedules / deliveries pattern.
+    rows = await UserSubscriptionRepository(db_session).list_for_user(
+        user.id,
+        project_id=project_id,
+        limit=limit + 1,
+        cursor_project_id=cursor_project_id,
+        cursor_trigger=cursor_trigger,
+        cursor_id=cursor_id,
+    )
+    next_cursor: str | None = None
+    if len(rows) > limit:
+        rows = rows[:limit]
+        last = rows[-1]
+        next_cursor = _encode_user_subscriptions_cursor(
+            last.project_id, last.trigger, last.id,
+        )
+    return UserSubscriptionsListPublic(
+        items=[_subscription_payload(r) for r in rows],
+        next_cursor=next_cursor,
+    )
 
 
 @router.post(
@@ -1079,8 +1223,30 @@ async def list_user_deliveries(
         rows = rows[:limit]
         last = rows[-1]
         next_cursor = _encode_cursor(last.sent_at, last.id)
+
+    # v1.1.0: batch-resolve triggered_by_user_id -> email so the
+    # personal Global Notification Log can render "channel test by
+    # alice@example.com" on test rows without a per-row fetch.
+    # Mirrors the project-side list_deliveries pattern.
+    from sqlalchemy import select
+
+    from z4j_brain.persistence.models import User
+
+    triggered_by_user_ids = list(
+        {r.triggered_by_user_id for r in rows if r.triggered_by_user_id is not None},
+    )
+    triggered_by_lookup: dict[uuid.UUID, str] = {}
+    if triggered_by_user_ids:
+        result = await db_session.execute(
+            select(User.id, User.email).where(User.id.in_(triggered_by_user_ids)),
+        )
+        triggered_by_lookup = {row.id: row.email for row in result.all()}
+
     return DeliveryListPublic(
-        items=[_delivery_payload(r) for r in rows],
+        items=[
+            _delivery_payload(r, triggered_by_lookup=triggered_by_lookup)
+            for r in rows
+        ],
         next_cursor=next_cursor,
     )
 

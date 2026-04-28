@@ -105,9 +105,36 @@ class Settings(BaseSettings):
         ...,
         description="Master HMAC signing key (>=32 bytes)",
     )
+    #: Round-6 audit fix SR-HIGH (Apr 2026): comma-separated list of
+    #: previously-active master HMAC secrets accepted DURING a rotation
+    #: window. The brain signs new tokens with ``secret`` only, but
+    #: accepts a verification match against ``secret`` OR any of these
+    #: previous values. This lets operators rotate ``Z4J_SECRET``
+    #: without invalidating every agent token + session cookie at
+    #: once: rotate, redeploy, wait for agents to re-mint, then drop
+    #: ``Z4J_PREVIOUS_SECRETS`` from the env. Empty (default) = no
+    #: rotation in progress.
+    previous_secrets: SecretStr | None = Field(
+        default=None,
+        description=(
+            "Comma-separated previous master secrets accepted during "
+            "rotation. Each entry must be >=32 bytes. Drop after agents "
+            "re-mint."
+        ),
+    )
     session_secret: SecretStr = Field(
         ...,
         description="Session cookie signing key (>=32 bytes)",
+    )
+    #: Round-6 audit fix SR-HIGH (Apr 2026): same multi-key acceptance
+    #: window for the session-cookie signing key. See
+    #: :attr:`previous_secrets` for rotation semantics.
+    previous_session_secrets: SecretStr | None = Field(
+        default=None,
+        description=(
+            "Comma-separated previous session secrets accepted during "
+            "rotation."
+        ),
     )
 
     # ------------------------------------------------------------------
@@ -297,6 +324,16 @@ class Settings(BaseSettings):
     #: ``environment="production"`` AND ``public_url`` starts with
     #: ``https://``.
     hsts_max_age_seconds: int = Field(default=31_536_000, ge=0)
+    #: ESCAPE HATCH FOR INTERNAL TEST FIXTURES ONLY. When True,
+    #: skips the production-mode "public_url must use https://"
+    #: validator. Set this only when the brain is provably not
+    #: reachable from anywhere a real user's browser would land
+    #: (closed docker network, CI runner, internal benchmark rig).
+    #: Logged loudly at startup so a real-deploy operator who
+    #: copies a test config sees the warning. The
+    #: ``docker-compose.scheduler-test.yml`` multi-framework e2e
+    #: relies on this for inter-container HTTP traffic.
+    allow_http_public_url: bool = Field(default=False)
     #: Whether to append ``includeSubDomains`` to the HSTS header.
     #: Defaults to True (the safer choice for a brain deployed at
     #: a dedicated subdomain), but operators serving HTTP siblings
@@ -408,6 +445,17 @@ class Settings(BaseSettings):
     # ``z4j-scheduler`` companion process. When disabled the brain
     # behaves identically to pre-scheduler releases.
     scheduler_grpc_enabled: bool = False
+    #: HTTP URLs of every scheduler instance the dashboard's
+    #: Schedulers fleet page should poll for ``/info``. Empty list
+    #: (default) means the page renders only the embedded sidecar
+    #: at ``http://127.0.0.1:7800/info`` if ``embedded_scheduler``
+    #: is on; otherwise an empty grid with a hint.
+    #:
+    #: Operators with multiple schedulers list them all, e.g.
+    #: ``["http://scheduler-1:7800", "http://scheduler-2:7800"]``.
+    #: The brain hits each URL on every dashboard refresh - keep
+    #: the list bounded (~10 entries max in v1).
+    scheduler_info_urls: list[str] = Field(default_factory=list)
     #: Bind interface for the gRPC server. Default ``0.0.0.0`` binds
     #: every interface; production deployments behind a private
     #: network may prefer a specific address.
@@ -427,6 +475,80 @@ class Settings(BaseSettings):
     #: Empty = trust any cert the CA bundle validates (operator
     #: chose "trust the CA"). Populate to add an extra check.
     scheduler_grpc_allowed_cns: list[str] = Field(default_factory=list)
+    #: Per-CN project binding. Maps a cert CN to the list of
+    #: project slugs that cert is permitted to act on (FireSchedule,
+    #: AcknowledgeFireResult, ListSchedules, WatchSchedules).
+    #:
+    #: Empty mapping (the default) preserves the legacy cross-project
+    #: authority - any allow-listed CN can drive RPCs for any project.
+    #: When a CN appears in this map, all of its RPCs are restricted
+    #: to the listed project slugs; a request whose project does not
+    #: appear in the binding list is rejected with PERMISSION_DENIED.
+    #: When a CN does NOT appear, the per-cert restriction does not
+    #: apply (mixed mode lets operators bind sensitive schedulers
+    #: while leaving fleet-wide schedulers unconstrained).
+    #:
+    #: Format is a JSON object via env:
+    #: ``Z4J_SCHEDULER_GRPC_CN_PROJECT_BINDINGS='{"scheduler-1":
+    #: ["acme", "globex"]}'``. Slugs (not UUIDs) so operators can
+    #: hand-edit the env var without pasting opaque ids.
+    #:
+    #: Audit fix M-5 (Apr 2026): closes the per-cert project-binding
+    #: gap raised in the spec-§22 deferral. Empty default keeps
+    #: existing single-tenant deployments unchanged.
+    scheduler_grpc_cn_project_bindings: dict[str, list[str]] = Field(
+        default_factory=dict,
+    )
+    #: Per-cert rate limit on FireSchedule. Defends against a
+    #: scheduler agent compromised at the cert layer (or simply a
+    #: misbehaving scheduler in a tight loop) DoS-ing the worker
+    #: fleet by hammering FireSchedule. mTLS bounds *who* can call;
+    #: this bounds *how much*. Token-bucket algorithm with state
+    #: persisted in ``scheduler_rate_buckets`` so the limit survives
+    #: brain restart and is shared across multi-replica brain
+    #: deployments.
+    #:
+    #: Disable with ``scheduler_grpc_fire_rate_limit_enabled=false``
+    #: when running behind an upstream rate-limiter (Envoy, NGINX
+    #: mod_security) that already covers this surface.
+    scheduler_grpc_fire_rate_limit_enabled: bool = True
+    #: Maximum burst size (tokens). Default 600 means a freshly
+    #: idle scheduler can fire 600 schedules instantly before the
+    #: refill cap kicks in. Sized for a fleet of ~100 schedules
+    #: triggering simultaneously at the top of an hour.
+    scheduler_grpc_fire_rate_capacity: float = Field(
+        default=600.0, ge=1.0, le=1_000_000.0,
+    )
+    #: Sustained refill rate (tokens/second). Default 10 fires/sec
+    #: per cert — well above any normal scheduler workload; the cap
+    #: only bites on runaway / hostile traffic. Operators with very
+    #: high-volume single-cert deployments raise this; operators with
+    #: a leaked-cert scenario in mind lower it.
+    scheduler_grpc_fire_rate_per_second: float = Field(
+        default=10.0, ge=0.01, le=10_000.0,
+    )
+    #: Hard cap on concurrent ``WatchSchedules`` streams per brain
+    #: process. Each stream holds a dedicated asyncpg connection for
+    #: LISTEN/NOTIFY (Postgres path), so unbounded streams = brain
+    #: starves its own connection pool. Audit fix (Apr 2026
+    #: follow-up) for the connection-exhaustion DoS surface where
+    #: a misbehaving scheduler that opens streams in a loop dies
+    #: brain.
+    #:
+    #: Default 64 covers the realistic ceiling (a fleet of 50
+    #: scheduler instances + headroom). Tune up for very large
+    #: fleets; tune down to be conservative on shared Postgres
+    #: deployments where ``max_connections`` is tight.
+    scheduler_grpc_watch_max_concurrent: int = Field(
+        default=64, ge=1, le=10_000,
+    )
+    #: Per-CN cap on concurrent ``WatchSchedules`` streams. One
+    #: scheduler should not need many streams at once - the cap
+    #: stops a single misbehaving / compromised cert from filling
+    #: the global limit and starving the rest of the fleet.
+    scheduler_grpc_watch_max_per_cert: int = Field(
+        default=4, ge=1, le=1_000,
+    )
     #: Watch-stream poll cadence. Brain polls ``schedules.updated_at``
     #: every N seconds and emits diff events. 2s gives sub-3s
     #: cache-freshness end-to-end after the scheduler's tick budget.
@@ -460,6 +582,17 @@ class Settings(BaseSettings):
     #: alert" threshold - one transient hiccup doesn't trip the
     #: breaker, but a persistent bug does. Set to 0 to disable the
     #: breaker entirely.
+    #:
+    #: **Operational note:** when the breaker fires, the schedule
+    #: row's ``is_enabled`` flips to ``False`` and an audit row with
+    #: ``action="schedule.auto_disabled.circuit_breaker"`` is written
+    #: with the failure count + last error in metadata. Operators
+    #: investigating "why did my schedule stop firing?" should look
+    #: in the audit log first; the brain dashboard's schedule detail
+    #: page surfaces the disable event in the fire-history panel.
+    #: Re-enable from the dashboard (or
+    #: ``PATCH /schedules/{id} {"is_enabled": true}``) once the
+    #: underlying bug is fixed.
     schedule_circuit_breaker_threshold: int = Field(
         default=5, ge=0, le=100,
     )
@@ -496,6 +629,69 @@ class Settings(BaseSettings):
     scheduler_trigger_tls_ca: str | None = None
 
     # ------------------------------------------------------------------
+    # Embedded scheduler sidecar (docs/SCHEDULER.md §21.3)
+    # ------------------------------------------------------------------
+    #: When True, brain spawns a ``z4j-scheduler serve`` subprocess
+    #: in its own lifespan and supervises it (auto-restart on crash,
+    #: graceful shutdown on brain exit). The subprocess talks to
+    #: brain's gRPC endpoint over the loopback interface using
+    #: PKI auto-minted at boot - no operator cert management
+    #: required. Intended for the single-container homelab deploy
+    #: where running a separate scheduler container would be
+    #: needlessly heavy.
+    #:
+    #: When True, ``scheduler_grpc_enabled`` is implicitly forced
+    #: True (the embedded subprocess needs the wire). The minted
+    #: PKI overrides any operator-supplied
+    #: ``scheduler_grpc_tls_*`` paths so embedded mode is
+    #: self-contained.
+    embedded_scheduler: bool = False
+    #: Persistent directory for the auto-minted PKI.
+    #:
+    #: - ``None`` (the default) → brain resolves to
+    #:   ``~/.z4j/embedded-pki/`` and writes the PEM bundle there.
+    #:   The CA + cert pair survives brain restarts so the
+    #:   scheduler's ``INSTANCE_ID`` stays stable across reboots and
+    #:   audit-log forensics keep a coherent trail.
+    #: - An explicit path → operator-managed location (e.g. a
+    #:   secrets volume).
+    #:
+    #: v1.1.0 changed the default from a per-process tempdir to
+    #: ``~/.z4j/embedded-pki/`` because audit rows for ``INSTANCE_ID
+    #: =<hostname>-embedded`` were getting orphaned across brain
+    #: restarts. The new default writes ~10 KB of PEMs per install
+    #: and the bundle is regenerated automatically if the directory
+    #: is wiped.
+    embedded_scheduler_pki_dir: str | None = None
+    #: Argv passed to the subprocess, after the implicit
+    #: ``[sys.executable, "-m", "z4j_scheduler"]`` prefix. The
+    #: default ``["serve"]`` runs the FastAPI + tick-engine. Tests
+    #: override this to point at a fake binary.
+    embedded_scheduler_argv: list[str] = Field(
+        default_factory=lambda: ["serve"],
+    )
+    #: Maximum auto-restart attempts before the supervisor gives
+    #: up and logs CRITICAL. ``0`` disables auto-restart entirely
+    #: (a single crash is permanent). Operators wanting
+    #: kubernetes-style "always restart" set this very high.
+    embedded_scheduler_restart_max_attempts: int = Field(
+        default=10, ge=0, le=10_000,
+    )
+    #: Backoff between auto-restart attempts. Doubles up to a
+    #: 60-second cap.
+    embedded_scheduler_restart_backoff_seconds: float = Field(
+        default=2.0, ge=0.1, le=60.0,
+    )
+    #: Grace window for SIGTERM before SIGKILL during shutdown.
+    #: The scheduler's own teardown takes a few seconds (cancel
+    #: tick engine, drain dispatcher, close gRPC client) - 10s
+    #: covers the slowest reasonable case while still bounding
+    #: brain's overall shutdown time.
+    embedded_scheduler_shutdown_grace_seconds: float = Field(
+        default=10.0, ge=0.5, le=60.0,
+    )
+
+    # ------------------------------------------------------------------
     # Validators
     # ------------------------------------------------------------------
 
@@ -526,6 +722,30 @@ class Settings(BaseSettings):
                 raise ValueError(
                     f"{field_name} must be at least 32 bytes long",
                 )
+        # Round-6 audit fix SR-HIGH (Apr 2026): each entry in the
+        # rotation lists must independently meet the 32-byte floor.
+        # An attacker who could slip in a short "previous" secret
+        # would otherwise downgrade the verification surface.
+        for field_name in ("previous_secrets", "previous_session_secrets"):
+            raw = data.get(field_name)
+            if raw is None:
+                continue
+            value = (
+                raw.get_secret_value()
+                if isinstance(raw, SecretStr)
+                else str(raw)
+            )
+            if not value.strip():
+                continue
+            for entry in value.split(","):
+                entry = entry.strip()
+                if not entry:
+                    continue
+                if len(entry.encode("utf-8")) < 32:
+                    raise ValueError(
+                        f"every entry in {field_name} must be at "
+                        f"least 32 bytes long",
+                    )
         return data
 
     @model_validator(mode="before")
@@ -586,9 +806,23 @@ class Settings(BaseSettings):
             )
 
         # Production: public_url should be https.
-        if not is_dev and not self.public_url.startswith("https://"):
+        # Escape hatch: ``allow_http_public_url=True`` bypasses the
+        # check. ONLY for closed environments (private docker
+        # network, CI fixtures, internal benchmarks) where the brain
+        # is provably not reachable from anywhere a real user's
+        # browser would land. Logged loudly at startup so an
+        # operator who copies a test config into a real deploy sees
+        # the warning.
+        if (
+            not is_dev
+            and not self.public_url.startswith("https://")
+            and not self.allow_http_public_url
+        ):
             raise ConfigError(
-                "public_url must use https:// in non-dev environments",
+                "public_url must use https:// in non-dev environments. "
+                "If this is an internal-network test environment, set "
+                "Z4J_ALLOW_HTTP_PUBLIC_URL=true to opt in (logged + "
+                "audited).",
             )
 
         # Audit A6: strict validation of public_url content. Newlines,
@@ -632,7 +866,96 @@ class Settings(BaseSettings):
                     "stricter) when require_db_ssl is True",
                 )
 
+    # ------------------------------------------------------------------
+    # Round-6 audit fix SR-HIGH (Apr 2026): rotation helpers.
+    # Callers that VERIFY a token signed by an unknown-but-historical
+    # secret use these helpers; callers that MINT new tokens always use
+    # ``self.secret`` / ``self.session_secret`` directly so a rotated-
+    # in secret is never re-introduced into the persistent store.
+    # ------------------------------------------------------------------
 
+    def all_secrets_for_verification(self) -> list[bytes]:
+        """Return the master signing key plus any rotation-window keys.
+
+        Order: current first, then previous (newest-first if the
+        operator listed them that way). Callers should HMAC-verify
+        against each in turn and accept the first match.
+        """
+        out: list[bytes] = [self.secret.get_secret_value().encode("utf-8")]
+        out.extend(self._parse_secret_list(self.previous_secrets))
+        return out
+
+    def all_session_secrets_for_verification(self) -> list[bytes]:
+        """Return the session key plus any rotation-window keys."""
+        out: list[bytes] = [
+            self.session_secret.get_secret_value().encode("utf-8"),
+        ]
+        out.extend(self._parse_secret_list(self.previous_session_secrets))
+        return out
+
+    @staticmethod
+    def _parse_secret_list(raw: SecretStr | None) -> list[bytes]:
+        if raw is None:
+            return []
+        text = raw.get_secret_value()
+        if not text.strip():
+            return []
+        out: list[bytes] = []
+        seen: set[str] = set()
+        for entry in text.split(","):
+            entry = entry.strip()
+            if not entry or entry in seen:
+                continue
+            seen.add(entry)
+            out.append(entry.encode("utf-8"))
+        return out
+
+
+
+    @field_validator("scheduler_grpc_cn_project_bindings", mode="before")
+    @classmethod
+    def _parse_cn_project_bindings(cls, v: Any) -> Any:
+        """Parse the env-var JSON form into ``dict[str, list[str]]``.
+
+        Operators set this via env (``Z4J_SCHEDULER_GRPC_CN_PROJECT_BINDINGS=
+        '{"scheduler-1": ["acme"]}'``); pydantic-settings forwards the
+        raw string here. We accept the parsed dict form too so the
+        in-process ``Settings(...)`` test path still works without
+        round-tripping through JSON.
+        """
+        if v is None or v == "":
+            return {}
+        if isinstance(v, str):
+            import json  # noqa: PLC0415
+
+            try:
+                parsed = json.loads(v)
+            except json.JSONDecodeError as exc:
+                raise ValueError(
+                    "scheduler_grpc_cn_project_bindings must be a JSON "
+                    f"object mapping CN -> list of slugs; got {exc}",
+                ) from exc
+            v = parsed
+        if not isinstance(v, dict):
+            raise ValueError(
+                "scheduler_grpc_cn_project_bindings must be a JSON "
+                "object mapping CN -> list of slugs",
+            )
+        # Final shape coercion: every value must be a list of strings.
+        for cn, slugs in v.items():
+            if not isinstance(cn, str) or not cn:
+                raise ValueError(
+                    "scheduler_grpc_cn_project_bindings keys must be "
+                    "non-empty strings (CNs)",
+                )
+            if not isinstance(slugs, list) or not all(
+                isinstance(s, str) and s for s in slugs
+            ):
+                raise ValueError(
+                    f"scheduler_grpc_cn_project_bindings[{cn!r}] must be "
+                    "a list of non-empty project slugs",
+                )
+        return v
 
     @field_validator("database_url")
     @classmethod

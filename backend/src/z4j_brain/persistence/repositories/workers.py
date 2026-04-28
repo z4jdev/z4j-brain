@@ -258,7 +258,10 @@ class WorkerRepository(BaseRepository[Worker]):
         return len(prepared)
 
     async def counts_for_project(
-        self, project_id: UUID,
+        self,
+        project_id: UUID,
+        *,
+        since: datetime | None = None,
     ) -> dict[str, dict[str, int]]:
         """Return per-worker task counts aggregated from the events table.
 
@@ -280,6 +283,14 @@ class WorkerRepository(BaseRepository[Worker]):
         since the task has not finished). We expose all four so
         the dashboard can render Total / Succeeded / Failed /
         Retried columns separately.
+
+        Round-7 audit fix R7-HIGH (perf) (Apr 2026): the prior
+        version had no ``since`` bound and no LIMIT, so every
+        Workers tab refresh did a full GROUP BY across the entire
+        partitioned ``events`` history. Defaults to a 24-hour
+        window now (matches dashboard intent: "what's each worker
+        done recently"). Callers wanting all-time totals must pass
+        ``since=datetime.min`` explicitly so the cost is opt-in.
         """
         worker_expr = Event.payload["worker"].astext.label("worker_name")
         succeeded_sum = func.sum(
@@ -291,10 +302,14 @@ class WorkerRepository(BaseRepository[Worker]):
         retried_sum = func.sum(
             case((Event.kind == _KIND_RETRIED, 1), else_=0),
         ).label("retried")
+        from datetime import UTC as _UTC, datetime as _dt, timedelta as _td  # noqa: PLC0415
+        if since is None:
+            since = _dt.now(_UTC) - _td(hours=24)
         stmt = (
             select(worker_expr, succeeded_sum, failed_sum, retried_sum)
             .where(
                 Event.project_id == project_id,
+                Event.occurred_at >= since,
                 Event.kind.in_(
                     (_KIND_SUCCEEDED, _KIND_FAILED, _KIND_RETRIED),
                 ),

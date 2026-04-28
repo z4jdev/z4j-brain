@@ -167,7 +167,7 @@ class TestAcknowledge:
             await s.commit()
 
         async with db.session() as s:
-            row = await ScheduleFireRepository(s).acknowledge(
+            row, was_first = await ScheduleFireRepository(s).acknowledge(
                 fire_id=fire_id,
                 status="acked_success",
             )
@@ -178,17 +178,21 @@ class TestAcknowledge:
         # Latency captured (~500ms; allow generous slack for test scheduling).
         assert row.latency_ms is not None
         assert row.latency_ms >= 400
+        # Round-4 audit fix (Apr 2026): acknowledge now returns
+        # ``(row, was_first_ack)``. First ack on an un-acked row.
+        assert was_first is True
 
     @pytest.mark.asyncio
     async def test_ack_unknown_fire_id_returns_none(
         self, db: DatabaseManager,
     ) -> None:
         async with db.session() as s:
-            row = await ScheduleFireRepository(s).acknowledge(
+            row, was_first = await ScheduleFireRepository(s).acknowledge(
                 fire_id=uuid.uuid4(),
                 status="acked_failed",
             )
         assert row is None
+        assert was_first is False
 
 
 class TestListRecent:

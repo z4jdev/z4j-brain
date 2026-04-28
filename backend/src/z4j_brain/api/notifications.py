@@ -223,7 +223,14 @@ class SubscriptionFilters(BaseModel):
     docs/MIGRATIONS.md.
     """
 
-    priority: list[Literal["critical", "high", "normal", "low"]] | None = None
+    # Round-8 audit fix R8-Pyd-MED (Apr 2026): cap the priority
+    # list. Pre-fix the list was unbounded; a 1M-element list of
+    # the same Literal value bloated the dispatcher's per-event
+    # match loop with no functional benefit (only 4 distinct
+    # priorities exist, so 8 covers the matrix).
+    priority: list[Literal["critical", "high", "normal", "low"]] | None = (
+        Field(default=None, max_length=8)
+    )
     task_name: str | None = Field(default=None, max_length=500)
     task_name_pattern: str | None = Field(default=None, max_length=200)
     queue: str | None = Field(default=None, max_length=200)
@@ -272,7 +279,13 @@ class DefaultSubscriptionCreate(BaseModel):
     trigger: str = Field(pattern=_TRIGGER_PATTERN)
     filters: SubscriptionFilters = Field(default_factory=SubscriptionFilters)
     in_app: bool = True
-    project_channel_ids: list[uuid.UUID] = Field(default_factory=list)
+    # Round-8 audit fix R8-Pyd-H5 (Apr 2026): cap channel_ids list.
+    # Pre-fix a 10M-UUID list forced ``get_many_for_project`` to
+    # build an enormous IN-clause. Real subscriptions hit at most
+    # a handful of channels.
+    project_channel_ids: list[uuid.UUID] = Field(
+        default_factory=list, max_length=64,
+    )
     cooldown_seconds: int = Field(default=0, ge=0, le=86400)
 
 
@@ -312,6 +325,17 @@ class DeliveryPublic(BaseModel):
     # endpoint resolves these via a single batch query per page.
     channel_name: str | None = None
     channel_type: str | None = None
+    # v1.1.0: who manually triggered this row. NULL for
+    # subscription-driven fires. Populated only on channel-test
+    # rows (``trigger == "test.dispatch"``) so the dashboard can
+    # render a "channel test" badge. See migration 2026_04_27_0009.
+    triggered_by_user_id: uuid.UUID | None = None
+    # v1.1.0: email of the user identified by triggered_by_user_id,
+    # resolved at read time via a single batch query per page (same
+    # pattern as channel_lookup). NULL when the user was deleted or
+    # the row had no triggered_by. Lets the dashboard render
+    # "channel test by alice@example.com" without a per-row fetch.
+    triggered_by_email: str | None = None
 
 
 class DeliveryListPublic(BaseModel):
@@ -531,6 +555,7 @@ def _delivery_payload(
     *,
     channel_lookup: dict[uuid.UUID, tuple[str, str]] | None = None,
     user_channel_lookup: dict[uuid.UUID, tuple[str, str]] | None = None,
+    triggered_by_lookup: dict[uuid.UUID, str] | None = None,
 ) -> DeliveryPublic:
     """Convert a NotificationDelivery row to its public payload.
 
@@ -561,6 +586,10 @@ def _delivery_payload(
             and d.user_channel_id in user_channel_lookup
         ):
             name, type_ = user_channel_lookup[d.user_channel_id]
+    triggered_by_user_id = getattr(d, "triggered_by_user_id", None)
+    triggered_by_email: str | None = None
+    if triggered_by_user_id is not None and triggered_by_lookup:
+        triggered_by_email = triggered_by_lookup.get(triggered_by_user_id)
     return DeliveryPublic(
         id=d.id,
         project_id=d.project_id,
@@ -576,6 +605,8 @@ def _delivery_payload(
         sent_at=d.sent_at,
         channel_name=name,
         channel_type=type_,
+        triggered_by_user_id=triggered_by_user_id,
+        triggered_by_email=triggered_by_email,
     )
 
 
@@ -1015,6 +1046,7 @@ async def _dispatch_test(
     project_id: uuid.UUID | None = None,
     channel_id: uuid.UUID | None = None,
     user_channel_id: uuid.UUID | None = None,
+    triggered_by_user_id: uuid.UUID | None = None,
     db_session: "AsyncSession | None" = None,
 ) -> ChannelTestResult:
     """Run the real dispatcher with a canned test payload.
@@ -1107,6 +1139,10 @@ async def _dispatch_test(
                 error=sanitized_error,
                 channel_name=snapshot_name,
                 channel_type=channel_type,
+                # v1.1.0: stamp the row with the user who triggered
+                # the test so it surfaces in their personal Global
+                # Notification Log alongside subscription-driven fires.
+                triggered_by_user_id=triggered_by_user_id,
             )
             db_session.add(row)
             await db_session.commit()
@@ -1173,6 +1209,7 @@ async def test_channel_config(
         body.config,
         project_id=project_id,
         channel_id=None,
+        triggered_by_user_id=user.id,
         db_session=db_session,
     )
     # Audit-Phase4-1: the test endpoint is a data-exfil vector
@@ -1251,6 +1288,7 @@ async def test_saved_channel(
         channel.config or {},
         project_id=project_id,
         channel_id=channel.id,
+        triggered_by_user_id=user.id,
         db_session=db_session,
     )
     # Audit-Phase4-1: same exfil concern as test_channel_config
@@ -1414,7 +1452,10 @@ class DefaultSubscriptionUpdate(BaseModel):
     trigger: str | None = Field(default=None, pattern=_TRIGGER_PATTERN)
     filters: SubscriptionFilters | None = None
     in_app: bool | None = None
-    project_channel_ids: list[uuid.UUID] | None = None
+    # Round-8 audit fix R8-Pyd-H5 (Apr 2026).
+    project_channel_ids: list[uuid.UUID] | None = Field(
+        default=None, max_length=64,
+    )
     cooldown_seconds: int | None = Field(default=None, ge=0, le=86400)
 
 
@@ -1757,12 +1798,29 @@ async def list_deliveries(
         )
         user_channel_lookup = {row.id: (row.name, row.type) for row in result.all()}
 
+    # v1.1.0: batch-resolve triggered_by_user_id -> email for the page
+    # so the dashboard can render "channel test by alice@example.com"
+    # without an N+1 fetch. Only test fires populate this field; on a
+    # page with zero test rows the lookup is skipped entirely.
+    triggered_by_user_ids = list(
+        {r.triggered_by_user_id for r in rows if r.triggered_by_user_id is not None},
+    )
+    triggered_by_lookup: dict[uuid.UUID, str] = {}
+    if triggered_by_user_ids:
+        from z4j_brain.persistence.models import User
+
+        result = await db_session.execute(
+            select(User.id, User.email).where(User.id.in_(triggered_by_user_ids)),
+        )
+        triggered_by_lookup = {row.id: row.email for row in result.all()}
+
     return DeliveryListPublic(
         items=[
             _delivery_payload(
                 r,
                 channel_lookup=channel_lookup,
                 user_channel_lookup=user_channel_lookup,
+                triggered_by_lookup=triggered_by_lookup,
             )
             for r in rows
         ],

@@ -139,7 +139,7 @@ export function ProjectChannelsTab({ slug }: { slug: string }) {
           <p className="text-xs text-muted-foreground">
             Shared delivery destinations for this project - any member can
             attach these to their personal subscriptions. For your own
-            private destinations, use Global Settings → My Channels.
+            private destinations, use Global Settings → Global Channels.
           </p>
         </div>
         <DropdownMenu>
@@ -163,7 +163,7 @@ export function ProjectChannelsTab({ slug }: { slug: string }) {
               onClick={() => setDialogState({ mode: "import" })}
               className="flex flex-col items-start gap-0.5"
             >
-              <span className="font-medium">Import from My Channels</span>
+              <span className="font-medium">Import from Global Channels</span>
               <span className="text-xs text-muted-foreground">
                 Copy one of your personal destinations into the project.
               </span>
@@ -462,7 +462,7 @@ function ImportFromUserDialog({ slug, onClose }: ImportFromUserDialogProps) {
   return (
     <>
       <DialogHeader>
-        <DialogTitle>Import from My Channels</DialogTitle>
+        <DialogTitle>Import from Global Channels</DialogTitle>
       </DialogHeader>
       <div className="mt-4 space-y-4">
         <p className="text-sm text-muted-foreground">
@@ -476,7 +476,7 @@ function ImportFromUserDialog({ slug, onClose }: ImportFromUserDialogProps) {
           <div className="rounded-md border border-border bg-muted/40 p-4 text-sm text-muted-foreground">
             You have no personal channels yet. Create one in{" "}
             <a href="/settings/channels" className="underline">
-              Settings → My Channels
+              Settings → Global Channels
             </a>{" "}
             first.
           </div>

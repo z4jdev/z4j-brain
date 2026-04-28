@@ -144,9 +144,11 @@ async def client(brain_app, settings: Settings, seeded):
 @pytest.mark.asyncio
 class TestSchedulesRouter:
     async def test_list_empty(self, client) -> None:
+        # v1.1.0: response is now ``{items, next_cursor}``.
         r = await client.get("/api/v1/projects/default/schedules")
         assert r.status_code == 200
-        assert r.json() == []
+        body = r.json()
+        assert body == {"items": [], "next_cursor": None}
 
     async def test_list_with_seeded_schedule(
         self, brain_app, client, seeded,
@@ -166,10 +168,12 @@ class TestSchedulesRouter:
             await s.commit()
         r = await client.get("/api/v1/projects/default/schedules")
         assert r.status_code == 200
-        items = r.json()
+        body = r.json()
+        items = body["items"]
         assert len(items) == 1
         assert items[0]["name"] == "nightly"
         assert items[0]["kind"] == "cron"
+        assert body["next_cursor"] is None
 
 
 # ---------------------------------------------------------------------------

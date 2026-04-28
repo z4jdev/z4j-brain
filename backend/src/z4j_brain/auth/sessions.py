@@ -79,13 +79,26 @@ class SessionCookieCodec:
     by the brain.
     """
 
-    __slots__ = ("_serializer",)
+    __slots__ = ("_serializer", "_verify_serializers")
 
     def __init__(self, settings: Settings) -> None:
+        # Encode-side: only the current secret. New cookies are
+        # always signed with the active key.
         self._serializer = URLSafeTimedSerializer(
             settings.session_secret.get_secret_value(),
             salt=_SESSION_SALT,
         )
+        # Round-6 audit fix SR-HIGH (Apr 2026): verify-side accepts
+        # any secret in the rotation window so a Z4J_SESSION_SECRET
+        # rotation does not log every active operator out at once.
+        self._verify_serializers: list[URLSafeTimedSerializer] = []
+        for raw in settings.all_session_secrets_for_verification():
+            self._verify_serializers.append(
+                URLSafeTimedSerializer(
+                    raw.decode("utf-8"),
+                    salt=_SESSION_SALT,
+                ),
+            )
 
     def encode(self, session_id: uuid.UUID) -> str:
         """Sign + serialize a session id into the cookie value."""
@@ -107,14 +120,22 @@ class SessionCookieCodec:
 
         Never raises. Callers treat None as "no session".
         """
-        try:
-            data = self._serializer.loads(
-                cookie_value,
-                max_age=max_age_seconds,
-            )
-        except SignatureExpired:
-            return None
-        except BadSignature:
+        data: object | None = None
+        for serializer in self._verify_serializers:
+            try:
+                data = serializer.loads(
+                    cookie_value,
+                    max_age=max_age_seconds,
+                )
+                break
+            except SignatureExpired:
+                # An expired-but-valid signature is conclusive: don't
+                # let a previous-secret retry create a longer effective
+                # lifetime than ``max_age_seconds`` allows.
+                return None
+            except BadSignature:
+                continue
+        if data is None:
             return None
         if not isinstance(data, dict):
             return None

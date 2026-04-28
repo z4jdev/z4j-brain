@@ -20,8 +20,8 @@ import uuid
 from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
-from fastapi import APIRouter, Depends, Request
-from pydantic import BaseModel
+from fastapi import APIRouter, Depends, Query, Request
+from pydantic import BaseModel, Field, field_validator
 
 from z4j_brain.api.deps import (
     get_audit_log_repo,
@@ -123,14 +123,63 @@ def _payload(schedule: "Schedule") -> SchedulePublic:
 # ---------------------------------------------------------------------------
 
 
-@router.get("", response_model=list[SchedulePublic])
+class SchedulesListPublic(BaseModel):
+    """Paged list of schedules (v1.1.0 N+1 fix).
+
+    Pre-1.1 ``GET /schedules`` returned a bare ``list[SchedulePublic]``
+    with no LIMIT — a project with 1000+ schedules pulled every row
+    on every dashboard refresh. v1.1.0 adds keyset pagination on
+    ``(name, id)``; the response envelope mirrors the existing
+    deliveries / audit / commands list shape.
+
+    Back-compat: when neither ``limit`` nor ``cursor`` is supplied
+    AND the result set fits inside the default page (50), the
+    response is structurally compatible with anything that just
+    iterates ``items``. A consumer that previously did
+    ``response.json()`` and got a list now gets a dict — bumping
+    the response_model is a v1.0 → v1.1 contract change documented
+    in the brain CHANGELOG.
+    """
+
+    items: list[SchedulePublic]
+    next_cursor: str | None
+
+
+def _encode_schedules_cursor(name: str, schedule_id: uuid.UUID) -> str:
+    return f"{name}|{schedule_id.hex}"
+
+
+def _decode_schedules_cursor(
+    raw: str | None,
+) -> tuple[str | None, uuid.UUID | None]:
+    if not raw or "|" not in raw:
+        return None, None
+    name, _, hex_id = raw.partition("|")
+    try:
+        sched_id = uuid.UUID(hex=hex_id)
+    except ValueError:
+        return None, None
+    return name, sched_id
+
+
+@router.get("", response_model=SchedulesListPublic)
 async def list_schedules(
     slug: str,
+    limit: int = Query(default=50, ge=1, le=500),
+    cursor: str | None = Query(default=None),
     user: "User" = Depends(get_current_user),
     memberships: "MembershipRepository" = Depends(get_membership_repo),
     projects: "ProjectRepository" = Depends(get_project_repo),
     db_session: "AsyncSession" = Depends(get_session),
-) -> list[SchedulePublic]:
+) -> SchedulesListPublic:
+    """List schedules in a project, paginated.
+
+    Keyset cursor encoded as ``"<name>|<uuid_hex>"``. Pages are
+    capped at 500 rows; default 50 mirrors the dashboard's typical
+    table page size. Order is ``(name, id)`` so the same row never
+    appears on two pages even when names collide cross-project
+    (within a project ``name`` is unique by DB constraint).
+    """
     from z4j_brain.domain.policy_engine import PolicyEngine
     from z4j_brain.persistence.repositories import ScheduleRepository
 
@@ -142,8 +191,24 @@ async def list_schedules(
         project_id=project.id,
         min_role=ProjectRole.VIEWER,
     )
-    rows = await ScheduleRepository(db_session).list_for_project(project.id)
-    return [_payload(s) for s in rows]
+    cursor_name, cursor_id = _decode_schedules_cursor(cursor)
+    # Fetch limit+1 so we can detect a next page without a second
+    # COUNT() round-trip. Mirrors the deliveries / audit pattern.
+    rows = await ScheduleRepository(db_session).list_for_project(
+        project.id,
+        limit=limit + 1,
+        cursor_name=cursor_name,
+        cursor_id=cursor_id,
+    )
+    next_cursor: str | None = None
+    if len(rows) > limit:
+        rows = rows[:limit]
+        last = rows[-1]
+        next_cursor = _encode_schedules_cursor(last.name, last.id)
+    return SchedulesListPublic(
+        items=[_payload(s) for s in rows],
+        next_cursor=next_cursor,
+    )
 
 
 class ScheduleFirePublic(BaseModel):
@@ -275,23 +340,182 @@ async def get_schedule(
 # ---------------------------------------------------------------------------
 
 
+# --- Audit-driven hardening (Apr 2026) ---
+#
+# Field caps + enum constraints applied to every operator-facing
+# schedule body. The API layer was previously schema-permissive
+# and relied on the repository's downstream validation, which
+# meant:
+#
+# 1. **DoS via unbounded args/kwargs**: an admin (or compromised
+#    admin token) could POST a 100MB JSON payload that OOM'd the
+#    brain on parse + bloated the JSONB column. Fixed via
+#    a serialised-size cap enforced at the boundary (audit H-1).
+# 2. **Unconstrained kind values**: ``kind: str`` accepted any
+#    string at the API; OpenAPI docs lied about allowed values
+#    and the wire was looser than the underlying enum (audit H-2).
+# 3. **Name corruption**: control characters in ``name`` flowed
+#    into audit metadata, dashboard, and gRPC payloads. Operators
+#    could break log-line parsing; the dashboard had to render
+#    arbitrary unicode (audit M-3 from REST audit).
+# 4. **Length cliffs**: ``expression``, ``task_name``, ``queue``,
+#    ``source`` could carry MB-scale strings (audit M-4 / L-3).
+
+_KIND_VOCAB = ("cron", "interval", "one_shot", "solar")
+_CATCH_UP_VOCAB = ("skip", "fire_one_missed", "fire_all_missed")
+
+
+def _validate_iana_timezone(value: str) -> str:
+    """Round-8 audit fix R8-Time-H2 (Apr 2026): reject bad IANA tz at API.
+
+    Pre-fix the only validation was ``max_length``. A typo like
+    ``"America/New York"`` (space) or a junk string like ``"Foo/Bar"``
+    was accepted at create time, watch-streamed to the scheduler,
+    and on first tick ``cron.next_fire`` raised ``CronExpressionError``
+    which the engine swallowed by disabling the schedule. Operators
+    saw a created-but-never-firing schedule and no API-side error.
+
+    Validates by attempting :class:`zoneinfo.ZoneInfo` construction.
+    Empty string and ``"UTC"`` always pass. Returns the trimmed
+    value.
+    """
+    if value is None:
+        return value
+    stripped = value.strip()
+    if stripped == "":
+        return "UTC"
+    try:
+        from zoneinfo import ZoneInfo, ZoneInfoNotFoundError  # noqa: PLC0415
+
+        ZoneInfo(stripped)
+    except ZoneInfoNotFoundError as exc:
+        raise ValueError(
+            f"timezone {stripped!r} is not a valid IANA timezone "
+            "(e.g. 'UTC', 'America/New_York', 'Europe/London')",
+        ) from exc
+    except Exception as exc:  # noqa: BLE001
+        # Any other parser failure (malformed bytes, encoding issues)
+        # is also a rejection; better an explicit 422 than silent
+        # downstream tick failure.
+        raise ValueError(
+            f"timezone {stripped!r} could not be resolved: {exc}",
+        ) from exc
+    return stripped
+
+# JSON-serialised byte cap per args/kwargs payload. 64KB is the
+# operator-friendly ceiling: covers every realistic schedule
+# (largest celery-beat configs in the wild are ~5KB) without
+# allowing the abuse case that motivated the cap.
+_ARGS_KWARGS_MAX_SERIALIZED_BYTES = 64 * 1024
+
+# Per-field length caps. Picked to comfortably cover legitimate
+# values + some padding, while bounding worst-case storage and
+# log-line cost.
+_NAME_MAX = 200
+_EXPRESSION_MAX = 1024  # six-field cron with comma-lists is still short
+_TASK_NAME_MAX = 500    # python.dotted.module.name with package depth
+_TIMEZONE_MAX = 64      # IANA tz names are < 50 chars in practice
+_QUEUE_MAX = 200        # broker queue name; RabbitMQ caps at 255
+_SOURCE_MAX = 64        # source label vocab is short by convention
+_SOURCE_HASH_MAX = 128  # SHA-256 hex = 64 chars; SHA-512 = 128
+
+# Pattern that rejects ASCII control chars (NUL through US, plus
+# DEL). Tab + newlines are explicitly disallowed because audit
+# log lines + cron output are line-oriented.
+_NO_CONTROL_CHARS = r"^[^\x00-\x1f\x7f]+$"
+
+
+def _validate_args_kwargs_size(value: Any, field_name: str) -> Any:
+    """Cap the JSON-serialised size of args/kwargs payloads.
+
+    Pydantic does not have a native "deep size" validator; we
+    serialise once here so the runtime is bounded. The check is
+    cheap (json.dumps over a small payload is fast); for the
+    abuse case (multi-MB payload) the serialise itself is the
+    rate-limit.
+    """
+    import json as _json  # noqa: PLC0415
+
+    if value is None:
+        return value
+    try:
+        serialized = _json.dumps(value, default=str)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"{field_name} is not JSON-serialisable: {exc}",
+        ) from exc
+    if len(serialized.encode("utf-8")) > _ARGS_KWARGS_MAX_SERIALIZED_BYTES:
+        raise ValueError(
+            f"{field_name} exceeds {_ARGS_KWARGS_MAX_SERIALIZED_BYTES} "
+            f"bytes when JSON-serialised; trim the payload",
+        )
+    return value
+
+
 class ScheduleCreateIn(BaseModel):
     """Body for ``POST /schedules`` - operator-defined schedule."""
 
-    name: str
-    engine: str
-    kind: str  # "cron" | "interval" | "one_shot"
-    expression: str
-    task_name: str
-    timezone: str = "UTC"
-    queue: str | None = None
+    name: str = Field(
+        ..., min_length=1, max_length=_NAME_MAX, pattern=_NO_CONTROL_CHARS,
+    )
+    engine: str = Field(..., min_length=1, max_length=40)
+    kind: str = Field(..., min_length=1, max_length=20)
+    expression: str = Field(
+        ..., min_length=1, max_length=_EXPRESSION_MAX,
+        pattern=_NO_CONTROL_CHARS,
+    )
+    # Round-3 audit fix (Apr 2026): reject control characters in
+    # ``task_name``. Pre-fix the cron exporter's DISABLED branch
+    # could be coerced into emitting an active crontab line by
+    # planting a newline in this field. Defense-in-depth at the
+    # API boundary so any future renderer / exporter that forgets
+    # to sanitize is still safe.
+    task_name: str = Field(
+        ..., min_length=1, max_length=_TASK_NAME_MAX,
+        pattern=_NO_CONTROL_CHARS,
+    )
+    timezone: str = Field(default="UTC", max_length=_TIMEZONE_MAX)
+    queue: str | None = Field(default=None, max_length=_QUEUE_MAX)
     args: list[Any] = []
     kwargs: dict[str, Any] = {}
-    catch_up: str = "skip"
+    catch_up: str = Field(default="skip", min_length=1, max_length=20)
     is_enabled: bool = True
-    scheduler: str = "z4j-scheduler"
-    source: str = "dashboard"
-    source_hash: str | None = None
+    scheduler: str = Field(default="z4j-scheduler", min_length=1, max_length=40)
+    source: str = Field(default="dashboard", min_length=1, max_length=_SOURCE_MAX)
+    source_hash: str | None = Field(default=None, max_length=_SOURCE_HASH_MAX)
+
+    @field_validator("kind")
+    @classmethod
+    def _validate_kind(cls, v: str) -> str:
+        if v not in _KIND_VOCAB:
+            raise ValueError(
+                f"kind must be one of {_KIND_VOCAB}; got {v!r}",
+            )
+        return v
+
+    @field_validator("catch_up")
+    @classmethod
+    def _validate_catch_up(cls, v: str) -> str:
+        if v not in _CATCH_UP_VOCAB:
+            raise ValueError(
+                f"catch_up must be one of {_CATCH_UP_VOCAB}; got {v!r}",
+            )
+        return v
+
+    @field_validator("timezone")
+    @classmethod
+    def _validate_timezone(cls, v: str) -> str:
+        return _validate_iana_timezone(v)
+
+    @field_validator("args")
+    @classmethod
+    def _cap_args(cls, v: list[Any]) -> list[Any]:
+        return _validate_args_kwargs_size(v, "args")
+
+    @field_validator("kwargs")
+    @classmethod
+    def _cap_kwargs(cls, v: dict[str, Any]) -> dict[str, Any]:
+        return _validate_args_kwargs_size(v, "kwargs")
 
 
 class ScheduleUpdateIn(BaseModel):
@@ -302,17 +526,65 @@ class ScheduleUpdateIn(BaseModel):
     re-sending the rest of the row.
     """
 
-    engine: str | None = None
-    kind: str | None = None
-    expression: str | None = None
-    task_name: str | None = None
-    timezone: str | None = None
-    queue: str | None = None
+    engine: str | None = Field(default=None, min_length=1, max_length=40)
+    kind: str | None = Field(default=None, min_length=1, max_length=20)
+    expression: str | None = Field(
+        default=None, min_length=1, max_length=_EXPRESSION_MAX,
+        pattern=_NO_CONTROL_CHARS,
+    )
+    # Round-3 audit fix (Apr 2026): see ScheduleCreateIn.task_name.
+    task_name: str | None = Field(
+        default=None, min_length=1, max_length=_TASK_NAME_MAX,
+        pattern=_NO_CONTROL_CHARS,
+    )
+    timezone: str | None = Field(default=None, max_length=_TIMEZONE_MAX)
+    queue: str | None = Field(default=None, max_length=_QUEUE_MAX)
     args: list[Any] | None = None
     kwargs: dict[str, Any] | None = None
-    catch_up: str | None = None
+    catch_up: str | None = Field(default=None, min_length=1, max_length=20)
     is_enabled: bool | None = None
-    source_hash: str | None = None
+    source_hash: str | None = Field(default=None, max_length=_SOURCE_HASH_MAX)
+
+    @field_validator("kind")
+    @classmethod
+    def _validate_kind(cls, v: str | None) -> str | None:
+        if v is None:
+            return v
+        if v not in _KIND_VOCAB:
+            raise ValueError(
+                f"kind must be one of {_KIND_VOCAB}; got {v!r}",
+            )
+        return v
+
+    @field_validator("timezone")
+    @classmethod
+    def _validate_timezone(cls, v: str | None) -> str | None:
+        if v is None:
+            return v
+        return _validate_iana_timezone(v)
+
+    @field_validator("catch_up")
+    @classmethod
+    def _validate_catch_up(cls, v: str | None) -> str | None:
+        if v is None:
+            return v
+        if v not in _CATCH_UP_VOCAB:
+            raise ValueError(
+                f"catch_up must be one of {_CATCH_UP_VOCAB}; got {v!r}",
+            )
+        return v
+
+    @field_validator("args")
+    @classmethod
+    def _cap_args(cls, v: list[Any] | None) -> list[Any] | None:
+        return _validate_args_kwargs_size(v, "args")
+
+    @field_validator("kwargs")
+    @classmethod
+    def _cap_kwargs(
+        cls, v: dict[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        return _validate_args_kwargs_size(v, "kwargs")
 
 
 @router.post(
@@ -791,6 +1063,39 @@ async def trigger_schedule_now(
             idempotency_key=f"trigger:{schedule_id}:{user.id}",
         )
         if response.error_code:
+            # Audit fix M-2 (Apr 2026): record the failed trigger
+            # attempt BEFORE raising. Pre-fix the brain had no
+            # record an operator attempted a trigger that the
+            # scheduler refused; an attacker probing for valid
+            # schedule_ids could brute-force without leaving a
+            # forensic trail.
+            try:
+                await audit.record(
+                    audit_log,
+                    action="schedule.trigger_now.via_scheduler",
+                    target_type="schedule",
+                    target_id=str(schedule_id),
+                    result="failure",
+                    outcome="deny",
+                    user_id=user.id,
+                    project_id=project.id,
+                    source_ip=ip,
+                    metadata={
+                        "error_code": response.error_code,
+                        "error_message": response.error_message,
+                        "scheduler_url": settings.scheduler_trigger_url,
+                    },
+                )
+                await db_session.commit()
+            except Exception:  # noqa: BLE001
+                # Audit failure should not mask the original
+                # scheduler error from the operator. Log + continue
+                # to the raise.
+                import logging  # noqa: PLC0415
+
+                logging.getLogger("z4j.brain.schedules").exception(
+                    "trigger audit (failure) write crashed",
+                )
             raise NotFoundError(
                 f"scheduler rejected trigger: {response.error_code}",
                 details={
@@ -913,26 +1218,134 @@ class ImportedScheduleIn(BaseModel):
     pins the project; we accept it if the importer still sends it
     (using ``model_config = ConfigDict(extra="ignore")``) but never
     use it.
+
+    Field caps mirror :class:`ScheduleCreateIn` (audit fix Apr 2026).
     """
 
-    name: str
-    engine: str
-    kind: str
-    expression: str
-    task_name: str
-    timezone: str = "UTC"
-    queue: str | None = None
+    name: str = Field(
+        ..., min_length=1, max_length=_NAME_MAX, pattern=_NO_CONTROL_CHARS,
+    )
+    engine: str = Field(..., min_length=1, max_length=40)
+    kind: str = Field(..., min_length=1, max_length=20)
+    expression: str = Field(
+        ..., min_length=1, max_length=_EXPRESSION_MAX,
+        pattern=_NO_CONTROL_CHARS,
+    )
+    # Round-3 audit fix (Apr 2026): see ScheduleCreateIn.task_name.
+    task_name: str = Field(
+        ..., min_length=1, max_length=_TASK_NAME_MAX,
+        pattern=_NO_CONTROL_CHARS,
+    )
+    timezone: str = Field(default="UTC", max_length=_TIMEZONE_MAX)
+    queue: str | None = Field(default=None, max_length=_QUEUE_MAX)
     args: list[Any] = []
     kwargs: dict[str, Any] = {}
-    catch_up: str = "skip"
+    catch_up: str = Field(default="skip", min_length=1, max_length=20)
     is_enabled: bool = True
-    scheduler: str = "z4j-scheduler"
-    source: str = "imported"
-    source_hash: str | None = None
+    scheduler: str = Field(
+        default="z4j-scheduler", min_length=1, max_length=40,
+    )
+    source: str = Field(
+        default="imported", min_length=1, max_length=_SOURCE_MAX,
+    )
+    source_hash: str | None = Field(default=None, max_length=_SOURCE_HASH_MAX)
 
     # Pydantic v2 - allow extra keys (project_slug from importer
     # client) without erroring. We only consume the fields above.
     model_config = {"extra": "ignore"}
+
+    @field_validator("kind")
+    @classmethod
+    def _validate_kind(cls, v: str) -> str:
+        if v not in _KIND_VOCAB:
+            raise ValueError(
+                f"kind must be one of {_KIND_VOCAB}; got {v!r}",
+            )
+        return v
+
+    @field_validator("timezone")
+    @classmethod
+    def _validate_timezone(cls, v: str) -> str:
+        return _validate_iana_timezone(v)
+
+    @field_validator("catch_up")
+    @classmethod
+    def _validate_catch_up(cls, v: str) -> str:
+        if v not in _CATCH_UP_VOCAB:
+            raise ValueError(
+                f"catch_up must be one of {_CATCH_UP_VOCAB}; got {v!r}",
+            )
+        return v
+
+    @field_validator("args")
+    @classmethod
+    def _cap_args(cls, v: list[Any]) -> list[Any]:
+        return _validate_args_kwargs_size(v, "args")
+
+    @field_validator("kwargs")
+    @classmethod
+    def _cap_kwargs(cls, v: dict[str, Any]) -> dict[str, Any]:
+        return _validate_args_kwargs_size(v, "kwargs")
+
+
+# Audit fix H-3 (Apr 2026): the ``replace_for_source`` mode deletes
+# every schedule sharing the source label that's NOT in the batch.
+# Without an allow-list, an admin (or compromised admin token) can
+# POST ``mode=replace_for_source, source_filter="dashboard",
+# schedules=[]`` and wipe every dashboard-managed schedule in one
+# request. We pin the legitimate replace-mode source values to the
+# declarative + importer vocabulary; "dashboard" is operator-edited
+# state and must NEVER be a replace target.
+_REPLACE_FOR_SOURCE_ALLOWLIST: frozenset[str] = frozenset({
+    # Declarative reconcilers - the legitimate use case for replace
+    # mode. Each framework adapter tags rows with this prefix.
+    # Both ``:`` and ``_`` separators are accepted because both
+    # forms appear in the wild (the recent docs use ``:``, the
+    # earlier integration tests + some adapter releases use ``_``).
+    "declarative:django",
+    "declarative:flask",
+    "declarative:fastapi",
+    "declarative_django",
+    "declarative_flask",
+    "declarative_fastapi",
+    "declarative",  # bare prefix used by some adapters
+    # Migration importers - operators occasionally re-run a
+    # celery-beat → z4j import to apply upstream changes; the
+    # replace mode is the right tool for that flow.
+    "imported_celerybeat",
+    "imported_celery",
+    "imported_django_celery_beat",
+    "imported_rq",
+    "imported_rqscheduler",
+    "imported_apscheduler",
+    "imported_cron",
+    "imported",  # generic importer label
+})
+
+
+def _validate_replace_for_source_label(label: str | None) -> str:
+    """Reject obviously-destructive replace-mode source labels.
+
+    The allow-list above names the legitimate sources where
+    "absence == removal" is the documented contract. Any other
+    label - notably ``"dashboard"``, the empty string, or an
+    operator typo - is rejected with 422 to prevent the
+    accidental-wipe class of incident.
+    """
+    if not label:
+        raise ValueError(
+            "replace_for_source requires a non-empty source_filter; "
+            "the label must come from the migration importer / "
+            "declarative reconciler vocabulary",
+        )
+    if label not in _REPLACE_FOR_SOURCE_ALLOWLIST:
+        raise ValueError(
+            f"replace_for_source source_filter {label!r} is not in "
+            f"the allow-list {sorted(_REPLACE_FOR_SOURCE_ALLOWLIST)}. "
+            "Dashboard-managed schedules must not be wiped via "
+            "replace mode - use upsert + per-row delete instead.",
+        )
+    return label
 
 
 class ImportSchedulesRequest(BaseModel):
@@ -949,7 +1362,8 @@ class ImportSchedulesRequest(BaseModel):
       reconciler - the framework adapter sends the COMPLETE set of
       schedules from one source label and absence means removal.
 
-    ``source_filter`` is required when ``mode="replace_for_source"``.
+    ``source_filter`` is required when ``mode="replace_for_source"``
+    and must come from the audited replace-source allow-list.
     Defaults to the source of the first row in the batch (the
     framework adapters always tag everything with one label).
     """
@@ -1024,10 +1438,39 @@ async def import_schedules(
     )
 
     if body.mode not in ("upsert", "replace_for_source"):
-        raise NotFoundError(
+        # Audit fix L-4 (Apr 2026): mode is a semantic input error,
+        # not a missing resource. Was raising NotFoundError → 404,
+        # which misled clients. Use ValidationError → 422 to match
+        # the diff endpoint's behavior + the rest of the API.
+        raise ValidationError(
             f"unsupported import mode {body.mode!r}",
             details={"mode": body.mode},
         )
+
+    # Audit fix H-3 (Apr 2026): pre-flight ``source_filter`` against
+    # the replace-mode allow-list BEFORE we take the advisory lock
+    # or do any per-row work. This is the check that prevents an
+    # admin (or compromised admin token) from posting
+    # ``mode=replace_for_source, source_filter="dashboard",
+    # schedules=[]`` and wiping every dashboard-managed schedule
+    # in one request. Reject early + with a clear 422.
+    if body.mode == "replace_for_source":
+        # Resolve the same way the actual replace pass does so the
+        # validation matches the eventual delete scope.
+        resolved_source = body.source_filter
+        if resolved_source is None and body.schedules:
+            resolved_source = body.schedules[0].source
+        try:
+            _validate_replace_for_source_label(resolved_source)
+        except ValueError as exc:
+            raise ValidationError(
+                str(exc),
+                details={
+                    "mode": body.mode,
+                    "source_filter": body.source_filter,
+                    "resolved_source": resolved_source,
+                },
+            ) from exc
 
     # Replace-for-source has a TOCTOU race: two admins calling
     # reconcile() concurrently with the same source label can each
@@ -1068,6 +1511,42 @@ async def import_schedules(
     summary = ImportSchedulesResponse(
         inserted=0, updated=0, unchanged=0, failed=0, deleted=0, errors={},
     )
+    # Audit fix N-2 (Apr 2026 follow-up): for replace_for_source
+    # mode, pre-load the entire (scheduler, name) -> id map for
+    # the batch in a SINGLE query, then look up failed-row ids
+    # in-memory. Pre-fix the failure-recovery path issued one
+    # SELECT per failed row inside the import loop - a 5000-row
+    # import with 5% failures was 250 sequential round-trips
+    # serialized inside the request. Operational scale + admin-
+    # driven imports made this a real tail-latency contributor.
+    existing_id_map: dict[tuple[str, str], uuid.UUID] = {}
+    if body.mode == "replace_for_source" and body.schedules:
+        from sqlalchemy import select, tuple_  # noqa: PLC0415
+
+        from z4j_brain.persistence.models import Schedule  # noqa: PLC0415
+
+        batch_keys = [
+            (row.scheduler or "z4j-scheduler", row.name)
+            for row in body.schedules
+        ]
+        # Postgres + SQLite both support row-value IN; SQLAlchemy
+        # emits the right SQL per dialect. For very large batches
+        # this is one query regardless of batch size.
+        existing_lookup = await db_session.execute(
+            select(
+                Schedule.scheduler,
+                Schedule.name,
+                Schedule.id,
+            ).where(
+                Schedule.project_id == project.id,
+                tuple_(Schedule.scheduler, Schedule.name).in_(
+                    batch_keys,
+                ),
+            ),
+        )
+        for sched_name, name, sid in existing_lookup.all():
+            existing_id_map[(sched_name, name)] = sid
+
     # Track which schedules survived the upsert pass so the
     # replace-for-source delete can target the absent ones.
     surviving_ids: set[uuid.UUID] = set()
@@ -1085,6 +1564,19 @@ async def import_schedules(
             # error map so they can fix the source and re-import.
             summary.failed += 1
             summary.errors[idx] = str(exc)
+            # Audit fix M-6 (Apr 2026): in replace_for_source mode,
+            # add the EXISTING brain row's id (if any) to
+            # surviving_ids when the upsert fails. Without this, a
+            # row with a syntax error was excluded from
+            # surviving_ids → the replace pass deleted the
+            # corresponding existing schedule. Re-importing 100
+            # rows where 1 has a typo would silently delete that
+            # schedule.
+            if body.mode == "replace_for_source":
+                key = (row.scheduler or "z4j-scheduler", row.name)
+                existing_id = existing_id_map.get(key)
+                if existing_id is not None:
+                    surviving_ids.add(existing_id)
             continue
         surviving_ids.add(schedule_row.id)
         if outcome == "inserted":
@@ -1154,7 +1646,274 @@ async def import_schedules(
     return summary
 
 
+# ---------------------------------------------------------------------------
+# :diff endpoint - dry-run preview of what :import would do
+# ---------------------------------------------------------------------------
+
+
+class DiffEntry(BaseModel):
+    """One row in the diff output.
+
+    The dashboard renders these as a 4-bucket panel; the CLI's
+    ``import --verify`` flag also renders them on stdout. ``current``
+    carries the brain's existing values for UPDATE rows so the
+    operator can see exactly what's about to change before they
+    re-run reconcile without ``--dry-run``.
+    """
+
+    name: str
+    scheduler: str
+    # Proposed shape from the incoming batch. Always populated for
+    # INSERT / UPDATE / UNCHANGED. Empty dict for DELETE because the
+    # source dropped the row (there is no "proposed" value).
+    proposed: dict
+    # Current brain shape. Populated for UPDATE / UNCHANGED / DELETE.
+    # Empty dict for INSERT because there is no current row yet.
+    current: dict
+
+
+class DiffSchedulesResponse(BaseModel):
+    """Per-bucket classification of what ``:import`` would do.
+
+    Mirrors the CLI ``import --verify`` helper's output. Counts in
+    ``summary`` match the inserted/updated/unchanged/deleted fields
+    that the real import would return so the operator can see at a
+    glance whether the diff is a no-op.
+    """
+
+    inserted: list[DiffEntry]
+    updated: list[DiffEntry]
+    unchanged: list[DiffEntry]
+    deleted: list[DiffEntry]
+    summary: dict[str, int]
+
+
+@router.post(
+    ":diff",
+    response_model=DiffSchedulesResponse,
+    status_code=200,
+    dependencies=[Depends(require_csrf)],
+)
+async def diff_schedules(
+    slug: str,
+    body: ImportSchedulesRequest,
+    user: "User" = Depends(get_current_user),
+    memberships: "MembershipRepository" = Depends(get_membership_repo),
+    projects: "ProjectRepository" = Depends(get_project_repo),
+    db_session: "AsyncSession" = Depends(get_session),
+) -> DiffSchedulesResponse:
+    """Preview what ``:import`` would do without applying it.
+
+    Same body as ``:import``. Returns four buckets:
+
+    - ``inserted`` - rows in the batch with no matching brain row.
+    - ``updated`` - rows with a matching brain row and a different
+      ``source_hash``. The ``current`` field carries the brain's
+      pre-update shape.
+    - ``unchanged`` - rows whose ``source_hash`` matches brain.
+    - ``deleted`` - only populated when ``mode="replace_for_source"``;
+      rows brain has under the resolved ``source_filter`` that the
+      batch dropped.
+
+    Authorization: project ADMIN. The diff itself is read-only but
+    surfaces the same data ``:import`` would mutate, so it inherits
+    the same role gate. (A separate "view diff as VIEWER" path could
+    be added later if operator UX demands it.)
+    """
+    from sqlalchemy import select
+
+    from z4j_brain.domain.policy_engine import PolicyEngine
+    from z4j_brain.persistence.models import Schedule
+
+    policy = PolicyEngine()
+    project = await policy.get_project_or_404(projects, slug)
+    await policy.require_member(
+        memberships,
+        user=user,
+        project_id=project.id,
+        min_role=ProjectRole.ADMIN,
+    )
+
+    if body.mode not in ("upsert", "replace_for_source"):
+        raise ValidationError(
+            f"unsupported import mode {body.mode!r}",
+            details={"mode": body.mode},
+        )
+
+    # Audit fix H-3 (Apr 2026): mirror the :import endpoint's
+    # source-label allow-list on :diff. Otherwise an admin could
+    # use the (read-only, unaudited) diff endpoint to enumerate
+    # which schedules they would wipe with a follow-up :import call,
+    # bypassing the audit-trail-on-destruction protection.
+    if body.mode == "replace_for_source":
+        resolved_source = body.source_filter
+        if resolved_source is None and body.schedules:
+            resolved_source = body.schedules[0].source
+        try:
+            _validate_replace_for_source_label(resolved_source)
+        except ValueError as exc:
+            raise ValidationError(
+                str(exc),
+                details={
+                    "mode": body.mode,
+                    "source_filter": body.source_filter,
+                    "resolved_source": resolved_source,
+                },
+            ) from exc
+
+    inserted: list[DiffEntry] = []
+    updated: list[DiffEntry] = []
+    unchanged: list[DiffEntry] = []
+
+    # Track (scheduler, name) tuples in the batch so we can compute
+    # the DELETE set for replace_for_source without a second pass.
+    batch_keys: set[tuple[str, str]] = set()
+
+    # Audit fix N-3 (Apr 2026 follow-up): batch the existing-row
+    # lookup. Pre-fix the diff endpoint issued one SELECT per row
+    # in the batch - a 5000-row reconciler dry-run was 5000
+    # sequential queries. Now: one batched SELECT per request.
+    # ``tuple_(...).in_(...)`` is portable across Postgres + SQLite.
+    from sqlalchemy import tuple_  # noqa: PLC0415
+
+    diff_batch_keys = [
+        (row.scheduler or "z4j-scheduler", row.name)
+        for row in body.schedules
+    ]
+    existing_rows: dict[tuple[str, str], Schedule] = {}
+    if diff_batch_keys:
+        result = await db_session.execute(
+            select(Schedule).where(
+                Schedule.project_id == project.id,
+                tuple_(Schedule.scheduler, Schedule.name).in_(
+                    diff_batch_keys,
+                ),
+            ),
+        )
+        for sched_row in result.scalars().all():
+            existing_rows[(sched_row.scheduler, sched_row.name)] = sched_row
+
+    for row in body.schedules:
+        scheduler = row.scheduler or "z4j-scheduler"
+        batch_keys.add((scheduler, row.name))
+        existing = existing_rows.get((scheduler, row.name))
+        proposed = {
+            "name": row.name,
+            "scheduler": scheduler,
+            "engine": row.engine,
+            "kind": row.kind,
+            "expression": row.expression,
+            "task_name": row.task_name,
+            "timezone": row.timezone,
+            "queue": row.queue,
+            "args": row.args,
+            "kwargs": row.kwargs,
+            "is_enabled": row.is_enabled,
+            "catch_up": row.catch_up,
+            "source": row.source,
+            "source_hash": row.source_hash,
+        }
+        if existing is None:
+            inserted.append(DiffEntry(
+                name=row.name, scheduler=scheduler,
+                proposed=proposed, current={},
+            ))
+            continue
+        current = {
+            "name": existing.name,
+            "scheduler": existing.scheduler,
+            "engine": existing.engine,
+            "kind": existing.kind.value if hasattr(existing.kind, "value") else str(existing.kind),
+            "expression": existing.expression,
+            "task_name": existing.task_name,
+            "timezone": existing.timezone,
+            "queue": existing.queue,
+            "args": existing.args,
+            "kwargs": existing.kwargs,
+            "is_enabled": existing.is_enabled,
+            "catch_up": getattr(existing, "catch_up", "skip") or "skip",
+            "source": getattr(existing, "source", "dashboard") or "dashboard",
+            "source_hash": getattr(existing, "source_hash", None),
+        }
+        # ``unchanged`` requires the operator's row to carry a hash
+        # AND brain's row to carry the same hash. Without a hash we
+        # treat the row as an UPDATE - same semantics the real
+        # import takes (it always rewrites when it can't compare).
+        if (
+            row.source_hash
+            and current["source_hash"]
+            and row.source_hash == current["source_hash"]
+        ):
+            unchanged.append(DiffEntry(
+                name=row.name, scheduler=scheduler,
+                proposed=proposed, current=current,
+            ))
+        else:
+            updated.append(DiffEntry(
+                name=row.name, scheduler=scheduler,
+                proposed=proposed, current=current,
+            ))
+
+    deleted: list[DiffEntry] = []
+    if body.mode == "replace_for_source":
+        source_label = body.source_filter
+        if source_label is None and body.schedules:
+            source_label = body.schedules[0].source
+        if source_label:
+            # Pull every schedule with this source and surface the
+            # ones the batch did not name. Mirrors what the real
+            # import's ``delete_by_source_except`` would remove.
+            result = await db_session.execute(
+                select(Schedule).where(
+                    Schedule.project_id == project.id,
+                    Schedule.source == source_label,
+                ),
+            )
+            for existing in result.scalars():
+                if (existing.scheduler, existing.name) in batch_keys:
+                    continue
+                deleted.append(DiffEntry(
+                    name=existing.name,
+                    scheduler=existing.scheduler,
+                    proposed={},
+                    current={
+                        "name": existing.name,
+                        "scheduler": existing.scheduler,
+                        "engine": existing.engine,
+                        "kind": (
+                            existing.kind.value
+                            if hasattr(existing.kind, "value")
+                            else str(existing.kind)
+                        ),
+                        "expression": existing.expression,
+                        "task_name": existing.task_name,
+                        "source": (
+                            getattr(existing, "source", "") or ""
+                        ),
+                        "source_hash": getattr(
+                            existing, "source_hash", None,
+                        ),
+                    },
+                ))
+
+    return DiffSchedulesResponse(
+        inserted=inserted,
+        updated=updated,
+        unchanged=unchanged,
+        deleted=deleted,
+        summary={
+            "insert": len(inserted),
+            "update": len(updated),
+            "unchanged": len(unchanged),
+            "delete": len(deleted),
+            "total": len(inserted) + len(updated) + len(unchanged) + len(deleted),
+        },
+    )
+
+
 __all__ = [
+    "DiffEntry",
+    "DiffSchedulesResponse",
     "ImportSchedulesRequest",
     "ImportSchedulesResponse",
     "ImportedScheduleIn",

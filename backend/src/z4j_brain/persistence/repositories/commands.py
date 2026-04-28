@@ -7,6 +7,7 @@ from typing import Any
 from uuid import UUID
 
 from sqlalchemy import and_, or_, select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from z4j_brain.persistence.enums import CommandStatus
@@ -38,6 +39,33 @@ class CommandRepository(BaseRepository[Command]):
         timeout_at: datetime,
         source_ip: str | None,
     ) -> Command:
+        """Insert a Command row. Idempotent on (project_id, idempotency_key).
+
+        Round-4 audit fix (Apr 2026): when ``idempotency_key`` is set
+        and a row with the same ``(project_id, idempotency_key)``
+        already exists, return the existing row instead of raising
+        ``IntegrityError``. Pre-fix, two scheduler instances ticking
+        the same schedule (HA failover, retry-after-timeout, or two
+        brain replicas behind a load balancer both serving a
+        retried FireSchedule) both minted the same deterministic
+        ``fire_id = uuid5(NAMESPACE, schedule_id + scheduled_for)``;
+        the second insert raised IntegrityError; the FireSchedule
+        handler reported ``brain_error`` to the scheduler; the
+        scheduler retried; the schedule wedged per-fire until
+        something else broke the cycle.
+
+        With idempotent insert, the second caller gets the same
+        Command back as if it had won the race, the dispatcher's
+        callers idempotency contract holds, and the wedge cycle is
+        broken. The same fix also closes the pending-fires replay
+        worker bug where a re-issue after a transient failure stuck
+        the buffer row forever.
+
+        Idempotency is opt-in: when ``idempotency_key`` is None we
+        always insert (callers without an idempotency contract -
+        e.g. the dashboard's ad-hoc command path - keep the original
+        no-dedup behavior).
+        """
         row = Command(
             project_id=project_id,
             agent_id=agent_id,
@@ -51,8 +79,35 @@ class CommandRepository(BaseRepository[Command]):
             timeout_at=timeout_at,
             source_ip=source_ip,
         )
-        self.session.add(row)
-        await self.session.flush()
+        # Use a SAVEPOINT (``begin_nested``) so a UNIQUE collision
+        # on (project_id, idempotency_key) only rolls the INSERT
+        # back - not the caller's outer transaction (which holds
+        # SELECT FOR UPDATE locks + audit writes that must survive).
+        # ``session.rollback()`` would wipe the entire session
+        # state, releasing locks and discarding queued-up writes;
+        # SAVEPOINT is the targeted rollback we want.
+        try:
+            async with self.session.begin_nested():
+                self.session.add(row)
+                await self.session.flush()
+        except IntegrityError:
+            if idempotency_key is None:
+                # No idempotency contract → caller did not opt into
+                # dedup; surface the error.
+                raise
+            result = await self.session.execute(
+                select(Command).where(
+                    Command.project_id == project_id,
+                    Command.idempotency_key == idempotency_key,
+                ),
+            )
+            existing = result.scalar_one_or_none()
+            if existing is None:
+                # Constraint fired but the row vanished - very
+                # unusual; surface so the caller knows something
+                # is wrong.
+                raise
+            return existing
         return row
 
     # ------------------------------------------------------------------

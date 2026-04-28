@@ -105,7 +105,7 @@ export function DefaultSubscriptionsTab({ slug }: { slug: string }) {
       <EmptyState
         icon={Lock}
         title="Admin only"
-        description="Default subscriptions can only be configured by project admins."
+        description="Project subscriptions can only be configured by project admins."
       />
     );
   }
@@ -116,7 +116,7 @@ export function DefaultSubscriptionsTab({ slug }: { slug: string }) {
       <div className="flex items-start justify-between gap-4">
         <div className="min-w-0 flex-1">
           <h3 className="text-sm font-semibold">
-            Default Subscriptions
+            Project Subscriptions
             {isFetching && !isLoading && (
               <RefreshCw className="ml-2 inline size-3 animate-spin text-muted-foreground" />
             )}
@@ -135,7 +135,7 @@ export function DefaultSubscriptionsTab({ slug }: { slug: string }) {
           <DialogTrigger asChild>
             <Button size="sm" onClick={openCreate}>
               <Plus className="size-4" />
-              Add default
+              New subscription
             </Button>
           </DialogTrigger>
           <DialogContent>
@@ -158,8 +158,8 @@ export function DefaultSubscriptionsTab({ slug }: { slug: string }) {
       {defaults && defaults.length === 0 && (
         <EmptyState
           icon={BellRing}
-          title="No defaults configured"
-          description="Add a default so new members automatically receive key notifications."
+          title="No project subscriptions configured"
+          description="Add a project subscription so new members automatically receive key notifications."
         />
       )}
       {defaults && defaults.length > 0 && (
@@ -207,7 +207,7 @@ export function DefaultSubscriptionsTab({ slug }: { slug: string }) {
                       <Button
                         variant="ghost"
                         size="icon"
-                        aria-label={`Edit ${triggerLabel(d.trigger)} default`}
+                        aria-label={`Edit ${triggerLabel(d.trigger)} project subscription`}
                         className="text-muted-foreground hover:text-foreground"
                         onClick={() => openEdit(d)}
                       >
@@ -216,11 +216,11 @@ export function DefaultSubscriptionsTab({ slug }: { slug: string }) {
                       <Button
                         variant="ghost"
                         size="icon"
-                        aria-label={`Delete ${triggerLabel(d.trigger)} default`}
+                        aria-label={`Delete ${triggerLabel(d.trigger)} project subscription`}
                         className="text-muted-foreground hover:text-destructive"
                         onClick={() =>
                           confirm({
-                            title: "Delete default",
+                            title: "Delete project subscription",
                             description: (
                               <>
                                 Stop auto-subscribing new members to the{" "}
@@ -367,7 +367,7 @@ function DefaultSubscriptionDialog({
     <form onSubmit={handleSubmit}>
       <DialogHeader>
         <DialogTitle>
-          {isEdit ? "Edit Default Subscription" : "Add Default Subscription"}
+          {isEdit ? "Edit Project Subscription" : "New Project Subscription"}
         </DialogTitle>
       </DialogHeader>
       <div className="mt-4 space-y-4">

@@ -37,6 +37,35 @@ if TYPE_CHECKING:
 logger = structlog.get_logger("z4j.brain.startup")
 
 
+# Round-8 audit fix R8-HIGH-4 (Apr 2026): module-level holder for
+# the bootstrap password supplied via ``z4j-brain serve
+# --admin-password``. Stays in process memory only — never lands in
+# ``os.environ`` (where ``/proc/<pid>/environ`` would expose it to
+# other processes under the same UID, AND every subprocess we fork
+# would inherit it). Single-use: ``run_first_boot_check`` consumes
+# it and overwrites with None on first read.
+_CLI_BOOTSTRAP_PASSWORD: str | None = None
+
+
+def set_cli_bootstrap_password(password: str) -> None:
+    """Stash the cli-supplied admin password in process memory.
+
+    Called from ``z4j_brain.cli._run_serve`` when the operator
+    passes ``--admin-password``. ``run_first_boot_check`` consumes
+    via :func:`_consume_cli_bootstrap_password`. Never written
+    to disk, never copied into ``os.environ``.
+    """
+    global _CLI_BOOTSTRAP_PASSWORD
+    _CLI_BOOTSTRAP_PASSWORD = password
+
+
+def _consume_cli_bootstrap_password() -> str | None:
+    global _CLI_BOOTSTRAP_PASSWORD
+    value = _CLI_BOOTSTRAP_PASSWORD
+    _CLI_BOOTSTRAP_PASSWORD = None
+    return value
+
+
 async def run_first_boot_check(
     *,
     db: DatabaseManager,
@@ -73,6 +102,21 @@ async def run_first_boot_check(
     bootstrap_name = (
         os.environ.get("Z4J_BOOTSTRAP_ADMIN_DISPLAY_NAME", "").strip() or None
     )
+    # Round-8 audit fix R8-HIGH-4 (Apr 2026): consume the cli-supplied
+    # password from the in-process holder. cli.py never puts it into
+    # ``os.environ`` so /proc/<pid>/environ leakage and subprocess
+    # inheritance are both eliminated.
+    cli_password = _consume_cli_bootstrap_password()
+    if cli_password:
+        bootstrap_password = cli_password
+    # Round-8 audit fix R8-HIGH-5 (Apr 2026): pop the env-var
+    # variant of the password as soon as we've captured it locally.
+    # On Linux it was previously readable via /proc/<pid>/environ
+    # for the entire process lifetime AND propagated to every
+    # subprocess we fork. Email + display name are non-secret and
+    # left in place for diagnostic visibility.
+    if bootstrap_password:
+        os.environ.pop("Z4J_BOOTSTRAP_ADMIN_PASSWORD", None)
 
     # Env-var auto-bootstrap takes precedence. Wrapped in its own
     # session so a failure here has no cross-session rollback risk

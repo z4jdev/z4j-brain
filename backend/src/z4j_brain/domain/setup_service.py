@@ -395,7 +395,28 @@ class SetupService:
             source_ip=ip,
             since=cutoff,
         )
-        return existing < self._settings.first_boot_attempts_per_ip
+        if existing >= self._settings.first_boot_attempts_per_ip:
+            return False
+        # Round-8 audit fix R8-HIGH-6 (Apr 2026): also enforce a
+        # GLOBAL cap so an attacker who rotates source IPs (NAT
+        # botnet, X-Forwarded-For abuse if proxy chain is misconfigured,
+        # cloud function fan-out) can't multiply the per-IP budget by
+        # the IP space they control. The 256-bit token has astronomical
+        # entropy so the global cap can be loose; we set it at 8x the
+        # per-IP cap which still terminates the brute-force in seconds
+        # of attempts even at the most permissive setting.
+        global_cap = self._settings.first_boot_attempts_per_ip * 8
+        # Round-9 audit fix R9-Reaud-H1 (Apr 2026): exclude
+        # ``setup.completed`` from the count. On a brand-new install
+        # the success row would otherwise immediately consume one of
+        # the 8x retry budget, hurting the next legitimate
+        # operator-driven setup if the brain is reset for testing.
+        global_existing = await audit_log.count_recent_by_action(
+            action_prefix="setup.",
+            since=cutoff,
+            exclude_actions=("setup.completed",),
+        )
+        return global_existing < global_cap
 
     async def _record_setup_failure(
         self,

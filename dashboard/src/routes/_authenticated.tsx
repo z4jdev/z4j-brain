@@ -32,17 +32,24 @@ function AuthenticatedLayout() {
   const shortcuts = useKeyboardShortcuts();
 
   // Apply saved primary color on mount.
+  // Round-8 audit fix R8-Dash-LOW (Apr 2026): clamp hue to
+  // [0, 360]. The OKLCH parser silently drops out-of-range
+  // values so this is cosmetic, but bounding here keeps the
+  // CSS valid for any future hue-derived property + protects
+  // against an attacker who can write to localStorage on a
+  // shared kiosk machine.
   useEffect(() => {
-    const hue = localStorage.getItem("z4j-primary-hue");
-    if (hue) {
-      const h = parseInt(hue, 10);
-      const root = document.documentElement;
-      root.style.setProperty("--primary", `oklch(0.55 0.18 ${h})`);
-      root.style.setProperty("--primary-foreground", `oklch(0.99 0.005 ${h})`);
-      root.style.setProperty("--ring", `oklch(0.55 0.18 ${h})`);
-      root.style.setProperty("--sidebar-primary", `oklch(0.55 0.18 ${h})`);
-      root.style.setProperty("--sidebar-primary-foreground", `oklch(0.99 0.005 ${h})`);
-    }
+    const raw = localStorage.getItem("z4j-primary-hue");
+    if (raw === null) return;
+    const parsed = parseInt(raw, 10);
+    if (!Number.isFinite(parsed) || parsed < 0 || parsed > 360) return;
+    const h = parsed;
+    const root = document.documentElement;
+    root.style.setProperty("--primary", `oklch(0.55 0.18 ${h})`);
+    root.style.setProperty("--primary-foreground", `oklch(0.99 0.005 ${h})`);
+    root.style.setProperty("--ring", `oklch(0.55 0.18 ${h})`);
+    root.style.setProperty("--sidebar-primary", `oklch(0.55 0.18 ${h})`);
+    root.style.setProperty("--sidebar-primary-foreground", `oklch(0.99 0.005 ${h})`);
   }, []);
 
   return (

@@ -48,6 +48,13 @@ async def resolve_agent_by_bearer(
 
     Returns ``None`` for missing/malformed/unknown tokens. Never
     raises. Caller (the gateway) maps ``None`` to a 4401 close.
+
+    Round-6 audit fix SR-HIGH (Apr 2026): if the operator is mid-
+    rotation (``Z4J_PREVIOUS_SECRETS`` set), try every accepted
+    secret. The token row in the DB was hashed with whatever was the
+    master secret at mint time; without this loop a rotation would
+    immediately invalidate every live agent token until each agent
+    re-mints one — which itself requires a working bearer.
     """
     if not bearer:
         return None
@@ -57,9 +64,12 @@ async def resolve_agent_by_bearer(
     plaintext = parts[1].strip()
     if not plaintext:
         return None
-    secret = settings.secret.get_secret_value().encode("utf-8")
-    expected_hash = hash_agent_token(plaintext=plaintext, secret=secret)
-    return await agents.get_by_token_hash(expected_hash)
+    for secret in settings.all_secrets_for_verification():
+        expected_hash = hash_agent_token(plaintext=plaintext, secret=secret)
+        agent = await agents.get_by_token_hash(expected_hash)
+        if agent is not None:
+            return agent
+    return None
 
 
 __all__ = ["hash_agent_token", "resolve_agent_by_bearer"]

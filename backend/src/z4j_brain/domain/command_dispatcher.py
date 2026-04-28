@@ -281,7 +281,13 @@ class CommandDispatcher:
                 project_id=project_id,
                 agent_id=agent_id,
             )
-            outcome = "deny"
+            # v1.1.0: was ``outcome="deny"`` pre-1.1, which conflated
+            # real authorization-denied audit rows with mere
+            # execution failures. ``deny`` is now reserved for
+            # actual policy rejections; ``failure`` flags an
+            # authorised-but-failed command so security dashboards
+            # don't flag routine task crashes as access denials.
+            outcome = "failure"
             audit_action = "command.failed"
 
         if not transitioned:

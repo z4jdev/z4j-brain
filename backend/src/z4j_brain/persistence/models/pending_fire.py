@@ -16,7 +16,7 @@ Per ``docs/SCHEDULER.md §11`` Phase 2.
 from __future__ import annotations
 
 import uuid
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from sqlalchemy import DateTime, ForeignKey, Index, String, UniqueConstraint
@@ -25,6 +25,19 @@ from sqlalchemy.types import Uuid
 
 from z4j_brain.persistence.base import Base
 from z4j_brain.persistence.types import jsonb
+
+#: Default TTL for buffered fires when the application path forgets
+#: to set ``expires_at`` explicitly. Matches the operator-tunable
+#: ``pending_fires_replay_buffer_ttl_seconds`` setting default
+#: (7 days). Migration 2026_04_27_0010 mirrors this on the DB
+#: side via ``server_default``; the Python default below is the
+#: client-side belt-and-suspenders. Per ``docs/MIGRATIONS.md`` rule
+#: #1: every NOT NULL column needs a ``server_default``.
+_DEFAULT_EXPIRES_DELTA = timedelta(days=7)
+
+
+def _default_expires_at() -> datetime:
+    return datetime.now(UTC) + _DEFAULT_EXPIRES_DELTA
 
 
 class PendingFire(Base):
@@ -84,7 +97,9 @@ class PendingFire(Base):
         DateTime(timezone=True), nullable=False,
     )
     expires_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False,
+        DateTime(timezone=True),
+        nullable=False,
+        default=_default_expires_at,
     )
 
     __table_args__ = (

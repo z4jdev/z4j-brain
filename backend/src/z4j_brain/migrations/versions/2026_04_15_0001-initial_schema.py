@@ -165,15 +165,26 @@ def _install_extensions() -> None:
 
 
 def _drop_extensions() -> None:
-    """Drop extensions installed by :func:`_install_extensions`.
+    """Intentionally a no-op.
 
-    We DROP these even though other databases on the cluster may
-    depend on them. The convention for downgrade is "reverse the
-    upgrade" - operators who share extensions across databases
-    should not run the brain's downgrade against a shared cluster.
+    Round-6 audit fix Mig-HIGH-3 (Apr 2026): the previous version of
+    this function ran ``DROP EXTENSION IF EXISTS`` for ``pg_trgm``,
+    ``citext`` and ``pgcrypto``. Postgres extensions are
+    *database-scoped*, but in shared-database tenancy patterns (e.g.
+    one Postgres database hosting both z4j-brain and another app's
+    schema, separated by ``search_path``) these extensions are
+    routinely depended on by the other tenant. A z4j downgrade would
+    silently break the co-tenant's queries — an operator running
+    ``z4j-brain migrate downgrade`` to roll back a bad release would
+    not expect cluster-wide collateral damage.
+
+    Extensions also cost effectively nothing to leave installed:
+    they're metadata + (in pg_trgm/citext's case) a few KB of shared
+    libraries. Leaving them in place is the safer default. Operators
+    who genuinely want to remove them can ``DROP EXTENSION`` manually
+    after confirming no other schema in the database references them.
     """
-    for ext in ("pg_trgm", "citext", "pgcrypto"):
-        op.execute(sa.text(f"DROP EXTENSION IF EXISTS {ext}"))
+    return
 
 
 def _install_postgres_only_features(bind: sa.engine.Connection) -> None:
@@ -280,7 +291,28 @@ def _install_events_partitioning() -> None:
 
     Then pre-create N daily partitions starting today.
     """
-    op.execute(sa.text("DROP TABLE events"))
+    # Round-6 audit fix Mig-HIGH-1 (Apr 2026): defensively guard the
+    # DROP. If ``create_all`` skipped ``events`` (e.g. user pre-applied
+    # an out-of-band schema patch) the unconditional DROP failed mid-
+    # migration. If the table somehow already holds rows, bail loudly
+    # rather than silently destroying audit data.
+    bind = op.get_bind()
+    exists_row = bind.execute(
+        sa.text(
+            "SELECT 1 FROM information_schema.tables "
+            "WHERE table_schema = current_schema() AND table_name = 'events'"
+        ),
+    ).first()
+    if exists_row is not None:
+        rows = bind.execute(sa.text("SELECT count(*) FROM events")).scalar()
+        if rows and rows > 0:
+            raise RuntimeError(
+                f"Refusing to drop 'events' table during partitioning "
+                f"install: table holds {rows} rows. This migration is "
+                f"only safe on an empty schema. Restore from backup or "
+                f"manually migrate rows before continuing.",
+            )
+        op.execute(sa.text("DROP TABLE IF EXISTS events"))
     op.execute(
         sa.text(
             "CREATE TABLE events ("

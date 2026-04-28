@@ -118,10 +118,19 @@ class AuditService:
     is the wrong outcome for both compliance and debugging.
     """
 
-    __slots__ = ("_secret",)
+    __slots__ = ("_secret", "_verify_secrets")
 
     def __init__(self, settings: Settings) -> None:
         self._secret: bytes = settings.secret.get_secret_value().encode("utf-8")
+        # Round-7 audit fix R7-MED (Apr 2026): mirror the
+        # bearer/session multi-key acceptance window for the audit
+        # log HMAC. Without this, a Z4J_SECRET rotation reports
+        # every pre-rotation audit row as "tampered" — operators
+        # avoid rotating, defeating the SR-HIGH fix from Round 6.
+        # Writes still bind to the current secret only.
+        self._verify_secrets: list[bytes] = list(
+            settings.all_secrets_for_verification(),
+        )
 
     async def record(
         self,
@@ -151,6 +160,16 @@ class AuditService:
         # undetectable duplicate. The id is unique per row so each
         # signature binds to exactly one persisted row.
         row_id = uuid.uuid4()
+        # Round-9 audit fix R9-Stor-H4 (Apr 2026): take the chain
+        # advisory lock IMMEDIATELY before the head read + insert,
+        # not at the start of ``record``. Pre-fix the lock was
+        # implicitly taken in ``get_latest_row_hmac`` and held
+        # across the rest of the method; if the caller's session
+        # then awaited any I/O before the outer commit, the lock
+        # serialised every subsequent ``record()`` for the duration.
+        # Now the lock window is just "head read → HMAC compute →
+        # INSERT" — microseconds.
+        await repo.acquire_chain_lock()
         # v3 chain: fetch the prior row's hmac so we can fold it
         # into this row's input. A subsequent DELETE of any row
         # then leaves the next row's ``prev_row_hmac`` referencing
@@ -219,12 +238,19 @@ class AuditService:
             occurred_at=row.occurred_at,
             prev_row_hmac=getattr(row, "prev_row_hmac", None),
         )
-        for version in (_HMAC_VERSION, 2, 1):
-            recomputed = self._compute_hmac(entry, version=version)
-            if len(recomputed) == len(stored) and hmac.compare_digest(
-                recomputed, stored,
-            ):
-                return True
+        # Round-7 audit fix R7-MED (Apr 2026): try every
+        # accepted-for-verification secret across every chain version.
+        # Pre-fix this iterated only the current ``self._secret`` so
+        # a rotation invalidated all pre-rotation audit row HMACs.
+        for secret in self._verify_secrets:
+            for version in (_HMAC_VERSION, 2, 1):
+                recomputed = self._compute_hmac(
+                    entry, version=version, secret=secret,
+                )
+                if len(recomputed) == len(stored) and hmac.compare_digest(
+                    recomputed, stored,
+                ):
+                    return True
         return False
 
     def verify_chain(
@@ -277,11 +303,22 @@ class AuditService:
     # internals
     # ------------------------------------------------------------------
 
-    def _compute_hmac(self, entry: AuditEntry, *, version: int) -> str:
-        """Canonical → HMAC-SHA256 hex digest for the requested version."""
+    def _compute_hmac(
+        self,
+        entry: AuditEntry,
+        *,
+        version: int,
+        secret: bytes | None = None,
+    ) -> str:
+        """Canonical → HMAC-SHA256 hex digest for the requested version.
+
+        Round-7 audit fix R7-MED (Apr 2026): ``secret`` defaults to
+        the current write-side key; ``verify_row`` passes each
+        rotation-window secret in turn.
+        """
         canonical = self._canonicalize(entry, version=version)
         digest = hmac.new(
-            self._secret,
+            secret if secret is not None else self._secret,
             canonical.encode("utf-8"),
             hashlib.sha256,
         ).hexdigest()
@@ -333,10 +370,30 @@ class AuditService:
 
     @staticmethod
     def _default_outcome(result: str) -> str:
+        """Map a free-form ``result`` string to the structured outcome.
+
+        Outcome semantics (v1.1.0+):
+
+        - ``"allow"``: action authorised AND succeeded.
+        - ``"deny"``: action REJECTED at policy time (auth / scope /
+          membership / CSRF / rate-limit). Reserved for actual
+          authorization decisions so security audits can grep
+          ``outcome=deny`` and find real access denials.
+        - ``"failure"``: action authorised but the execution failed
+          (task raised, command timed out, downstream error). Was
+          conflated with ``deny`` pre-1.1.0; split out so audit
+          dashboards stop flagging routine task failures as
+          security events.
+        - ``"error"``: internal panic / partial state / unknown.
+          Operators investigate.
+
+        Caller can always override via the ``outcome=`` kwarg —
+        this only fires when ``outcome`` is None.
+        """
         if result == "success":
             return "allow"
         if result == "failed":
-            return "deny"
+            return "failure"
         return "error"
 
 

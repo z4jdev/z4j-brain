@@ -25,7 +25,7 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
 from fastapi import APIRouter, Depends, status
-from pydantic import BaseModel, EmailStr, Field
+from pydantic import BaseModel, EmailStr, Field, field_validator
 from sqlalchemy import func, select
 
 from z4j_brain.api.deps import (
@@ -76,6 +76,32 @@ class UserAdminPublic(BaseModel):
     updated_at: datetime
 
 
+def _validate_user_timezone(value: str | None) -> str | None:
+    """Round-8 audit fix R8-Pyd-MED (Apr 2026): IANA tz validation.
+
+    Mirrors the schedule API's tz validator. Pre-fix any 64-char
+    string was accepted, so a typo like ``"America/New York"`` (with
+    a space) was persisted on the user row, breaking dashboard
+    renders that fed it to ``zoneinfo.ZoneInfo`` later.
+    """
+    if value is None or value == "":
+        return value
+    try:
+        from zoneinfo import ZoneInfo, ZoneInfoNotFoundError  # noqa: PLC0415
+
+        ZoneInfo(value)
+    except ZoneInfoNotFoundError as exc:
+        raise ValueError(
+            f"timezone {value!r} is not a valid IANA timezone "
+            "(e.g. 'UTC', 'America/New_York', 'Europe/London')",
+        ) from exc
+    except Exception as exc:  # noqa: BLE001
+        raise ValueError(
+            f"timezone {value!r} could not be resolved: {exc}",
+        ) from exc
+    return value
+
+
 class CreateUserRequest(BaseModel):
     email: EmailStr
     first_name: str | None = Field(default=None, max_length=100)
@@ -85,6 +111,11 @@ class CreateUserRequest(BaseModel):
     is_admin: bool = False
     timezone: str = Field(default="UTC", max_length=64)
 
+    @field_validator("timezone")
+    @classmethod
+    def _check_tz(cls, v: str) -> str:
+        return _validate_user_timezone(v) or "UTC"
+
 
 class UpdateUserRequest(BaseModel):
     first_name: str | None = Field(default=None, max_length=100)
@@ -93,6 +124,11 @@ class UpdateUserRequest(BaseModel):
     is_admin: bool | None = None
     is_active: bool | None = None
     timezone: str | None = Field(default=None, max_length=64)
+
+    @field_validator("timezone")
+    @classmethod
+    def _check_tz(cls, v: str | None) -> str | None:
+        return _validate_user_timezone(v)
 
 
 class PasswordResetRequest(BaseModel):

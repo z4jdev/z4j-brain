@@ -49,6 +49,14 @@ async def brain_app(brain_settings: Settings):
         future=True,
     )
     app = create_app(brain_settings, engine=engine)
+    # Round-9 audit fix R8-Bootstrap-MED test support (Apr 2026):
+    # the unit-test fixture uses ASGITransport directly without
+    # the lifespan wrapper, so ``app.state.lifespan_ready`` is
+    # never flipped by the production startup hook. Set it
+    # manually so the /health/ready test sees a "ready" brain.
+    # Production code goes through the lifespan and gets the
+    # ``False → True`` transition for free.
+    app.state.lifespan_ready = True
     yield app
     await engine.dispose()
 

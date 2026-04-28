@@ -9,11 +9,21 @@ summary that does NOT echo the offending input value.
 In production this middleware NEVER includes a stack trace in the
 response body. The full traceback is logged with the request id so
 operators can correlate.
+
+Audit fix AU-1/AU-2 (Apr 2026 follow-up): denials and validation
+failures on schedule endpoints leave an audit-log breadcrumb so
+brute-force IDOR enumeration attempts have a forensic trail. Pre-fix
+a 403/422 left zero evidence behind beyond a structured log line
+(non-tamper-evident, easily filtered out of an attacker-prepared
+log aggregator). Post-fix the row lands in the tamper-evident
+``audit_log`` table that is HMAC-chained.
 """
 
 from __future__ import annotations
 
+import re
 from typing import Any
+from uuid import UUID
 
 import structlog
 from pydantic import ValidationError as PydanticValidationError
@@ -21,9 +31,33 @@ from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoin
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 
-from z4j_brain.errors import Z4JError, http_status_for
+from z4j_brain.errors import (
+    AuthenticationError,
+    AuthorizationError,
+    NotFoundError,
+    ValidationError,
+    Z4JError,
+    http_status_for,
+)
 
 logger = structlog.get_logger("z4j.brain.errors")
+
+
+# Audit fix AU-1/AU-2 (Apr 2026 follow-up): match the path prefixes
+# we want to record denials for. Currently scheduler-adjacent
+# endpoints (the IDOR enumeration target identified by the audit).
+# Add additional prefixes here as new sensitive surfaces ship.
+_AUDITED_PATH_RE = re.compile(
+    r"^/api/v\d+/projects/(?P<slug>[a-z0-9_\-]+)/schedules",
+    re.IGNORECASE,
+)
+
+# Methods we audit denials/validation failures for. Read paths
+# (GET / HEAD) leave too much noise in the audit log without
+# operational value.
+_AUDITED_METHODS: frozenset[str] = frozenset({
+    "POST", "PUT", "PATCH", "DELETE",
+})
 
 
 class ErrorMiddleware(BaseHTTPMiddleware):
@@ -37,11 +71,98 @@ class ErrorMiddleware(BaseHTTPMiddleware):
         try:
             return await call_next(request)
         except Z4JError as exc:
+            await _record_denial_if_relevant(request, exc=exc)
             return _z4j_error_response(request, exc)
         except PydanticValidationError as exc:
+            await _record_denial_if_relevant(request, exc=exc)
             return _pydantic_validation_response(request, exc)
         except Exception as exc:  # noqa: BLE001
             return _unexpected_error_response(request, exc)
+
+
+async def _record_denial_if_relevant(
+    request: Request,
+    *,
+    exc: BaseException,
+) -> None:
+    """Best-effort denial-audit enqueue.
+
+    Audit fix AU-1/AU-2 (Apr 2026 follow-up). Catches:
+
+    - ``AuthorizationError`` (403)  → ``schedules.access.denied``
+    - ``AuthenticationError`` (401) → ``schedules.access.unauth``
+    - ``NotFoundError`` (404)       → ``schedules.access.not_found``
+    - ``ValidationError`` / Pydantic ValidationError (422)
+                                    → ``schedules.access.invalid``
+
+    Round-4 audit fix (Apr 2026): the previous implementation
+    opened a NEW DB session synchronously inside the request scope
+    to write the audit row. Under attack (IDOR enumeration), every
+    4xx doubled the per-request connection demand and could
+    starve the connection pool, turning the audit safety net into
+    a self-DoS amplifier. Now: enqueue a fire-and-forget event
+    on a bounded async queue; a single background drain task
+    persists the row using its own session at its own pace. The
+    queue drops the oldest event on overflow rather than blocking
+    the request handler.
+
+    Skipped silently when:
+
+    - The path doesn't match the audited prefix
+    - The method is GET/HEAD (read-only - no mutation intent)
+    - The audit queue isn't on app.state (unit-test harness,
+      embedded tooling)
+    """
+    if request.method not in _AUDITED_METHODS:
+        return
+    match = _AUDITED_PATH_RE.match(request.url.path)
+    if not match:
+        return
+
+    audit_queue = getattr(request.app.state, "audit_queue", None)
+    if audit_queue is None:
+        return
+
+    if isinstance(exc, AuthorizationError):
+        action = "schedules.access.denied"
+        outcome = "deny"
+    elif isinstance(exc, AuthenticationError):
+        action = "schedules.access.unauth"
+        outcome = "deny"
+    elif isinstance(exc, NotFoundError):
+        action = "schedules.access.not_found"
+        outcome = "deny"
+    elif isinstance(exc, (ValidationError, PydanticValidationError)):
+        action = "schedules.access.invalid"
+        outcome = "error"
+    else:
+        return
+
+    from datetime import UTC, datetime  # noqa: PLC0415
+
+    from z4j_brain.middleware._audit_queue import (  # noqa: PLC0415
+        DenialAuditEvent,
+    )
+
+    user = getattr(request.state, "current_user", None)
+    user_id: UUID | None = getattr(user, "id", None) if user else None
+
+    audit_queue.enqueue(
+        DenialAuditEvent(
+            action=action,
+            target_type="schedule_endpoint",
+            target_id=request.url.path[:200],
+            outcome=outcome,
+            user_id=user_id,
+            project_slug=match.group("slug"),
+            source_ip=getattr(request.state, "real_client_ip", None),
+            user_agent=request.headers.get("user-agent"),
+            method=request.method,
+            error_class=type(exc).__name__,
+            message=str(exc),
+            occurred_at=datetime.now(UTC),
+        ),
+    )
 
 
 def _z4j_error_response(request: Request, exc: Z4JError) -> JSONResponse:

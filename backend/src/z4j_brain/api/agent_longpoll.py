@@ -65,7 +65,9 @@ from typing import TYPE_CHECKING
 
 import structlog
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, Response
-from pydantic import BaseModel, Field
+
+from z4j_brain.domain.ip_rate_limit import require_agent_connect_throttle
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import select
 
 from z4j_core.errors import SignatureError
@@ -203,15 +205,31 @@ async def _get_or_create_session(
             _sessions.move_to_end(key)  # MRU
             return existing
         project_secret = derive_project_secret(master_secret, agent.project_id)
+        # Round-9 audit fix R9-Wire-H1+H2 (Apr 2026): bind the
+        # caller-supplied session nonce into the HMAC envelope.
+        # For long-poll the nonce IS the session identity (the
+        # registry is keyed on it). Without binding, a captured
+        # frame from session-nonce A could be replayed inside
+        # session-nonce B since both sessions reset seq=0 + have
+        # independent nonce windows. Binding makes the HMAC fail.
+        # The legacy sentinel (no-nonce client) gets an empty
+        # binding string — those clients are documented as
+        # "remain susceptible to H1/H2".
+        binding = (
+            session_nonce if isinstance(session_nonce, str)
+            else ""
+        )
         signer = FrameSigner(
             secret=project_secret,
             agent_id=agent.id,
             project_id=agent.project_id,
+            session_id=binding,
         )
         verifier = FrameVerifier(
             secret=project_secret,
             agent_id=agent.id,
             project_id=agent.project_id,
+            session_id=binding,
             direction="agent->brain",
         )
         _sessions[key] = (signer, verifier)
@@ -272,6 +290,26 @@ class FrameUploadBody(BaseModel):
 
     frames: list[str] = Field(min_length=1, max_length=500)
 
+    @field_validator("frames")
+    @classmethod
+    def _cap_per_frame_size(cls, v: list[str]) -> list[str]:
+        """Round-8 audit fix R8-Pyd-MED (Apr 2026): per-frame size cap.
+
+        Pre-fix the 500-element list cap was the only bound — each
+        string was unlimited, so a single request could carry
+        500 × 100 MB and OOM the brain before any downstream
+        validator ran. Per-frame ceiling matches the wire frame
+        cap (default 1 MiB).
+        """
+        max_per_frame = 1 * 1024 * 1024  # 1 MiB
+        for idx, frame in enumerate(v):
+            if len(frame) > max_per_frame:
+                raise ValueError(
+                    f"frames[{idx}] is {len(frame)} bytes; cap is "
+                    f"{max_per_frame}",
+                )
+        return v
+
 
 class FrameUploadResponse(BaseModel):
     accepted: int
@@ -304,6 +342,7 @@ async def agent_events(
     response: Response,
     authorization: str | None = Header(default=None),
     session_nonce: str | None = Header(default=None, alias=_SESSION_HEADER),
+    _throttle: None = Depends(require_agent_connect_throttle),
 ) -> FrameUploadResponse:
     """Accept a batch of signed agent->brain frames over HTTPS."""
     settings = request.app.state.settings
@@ -410,6 +449,7 @@ async def agent_commands(
     max_frames: int = Query(default=50, ge=1, le=500),
     authorization: str | None = Header(default=None),
     session_nonce: str | None = Header(default=None, alias=_SESSION_HEADER),
+    _throttle: None = Depends(require_agent_connect_throttle),
 ) -> CommandPullResponse:
     """Long-poll for pending commands targeting this agent."""
     settings = request.app.state.settings
@@ -434,7 +474,34 @@ async def agent_commands(
 
     # Inner helper that does ONE pass over the commands table for
     # this agent. Returns the list of pending Command rows or [].
+    #
+    # Round-6 audit fix WS-HIGH-2 (Apr 2026): also include
+    # recently-DISPATCHED commands. Pre-fix, if the HTTP response
+    # never reached the agent (network drop after the brain
+    # committed mark_dispatched), the command sat in DISPATCHED
+    # state with no agent ever seeing it - recoverable only via
+    # CommandTimeoutWorker (minutes later, surfaced as a generic
+    # timeout to the user).
+    #
+    # Now: include commands dispatched within
+    # ``Z4J_AGENT_LONGPOLL_REDISPATCH_SECONDS`` (default 60s) so a
+    # quickly-reconnecting agent gets the same command re-sent.
+    # The agent's in-memory ``_seen_commands`` dedup (300s TTL)
+    # silently absorbs duplicates that reach a still-running
+    # process. The redispatch only re-fires for commands the
+    # agent never processed because the network dropped before
+    # delivery completed.
+    from datetime import UTC, datetime, timedelta  # noqa: PLC0415
+
+    redispatch_cutoff = datetime.now(UTC) - timedelta(
+        seconds=getattr(
+            settings, "agent_longpoll_redispatch_seconds", 60.0,
+        ),
+    )
+
     async def _pull_pending() -> list["Command"]:
+        from sqlalchemy import or_
+
         from z4j_brain.persistence.models import Command
 
         async with db.session() as session:
@@ -442,7 +509,16 @@ async def agent_commands(
                 select(Command)
                 .where(
                     Command.agent_id == agent.id,
-                    Command.status == CommandStatus.PENDING,
+                    or_(
+                        Command.status == CommandStatus.PENDING,
+                        # Recently dispatched but possibly never
+                        # delivered (network drop). Re-send;
+                        # agent dedups by id.
+                        (
+                            (Command.status == CommandStatus.DISPATCHED)
+                            & (Command.dispatched_at >= redispatch_cutoff)
+                        ),
+                    ),
                 )
                 .order_by(Command.issued_at.asc())
                 .limit(max_frames),
@@ -496,11 +572,26 @@ async def agent_commands(
         for cmd in pending:
             claimed = False
             try:
-                claimed = await commands_repo.mark_dispatched(cmd.id)
-                if not claimed:
-                    # Another poller (or the WebSocket gateway) won the
-                    # race for this command. Skip silently.
-                    continue
+                # Round-6 audit fix WS-HIGH-2 (Apr 2026): two
+                # paths now feed this loop:
+                #
+                # 1. PENDING command → standard claim-then-sign.
+                # 2. DISPATCHED command in the recovery window
+                #    (network-drop redelivery) → skip the claim
+                #    (it's already claimed) and sign + include
+                #    so the agent gets it. Agent-side dedup
+                #    silently absorbs duplicates that reached a
+                #    still-running process.
+                if cmd.status == CommandStatus.DISPATCHED:
+                    # Recovery path - skip the claim (idempotent
+                    # re-send).
+                    claimed = True
+                else:
+                    claimed = await commands_repo.mark_dispatched(cmd.id)
+                    if not claimed:
+                        # Another poller (or the WebSocket gateway) won the
+                        # race for this command. Skip silently.
+                        continue
                 payload = CommandPayload(
                     action=cmd.action,
                     target={"type": cmd.target_type, "id": cmd.target_id},

@@ -76,7 +76,22 @@ class BrainRegistry(Protocol):
         ws: "WebSocket",
     ) -> None: ...
 
-    async def unregister(self, agent_id: UUID) -> None: ...
+    async def unregister(
+        self,
+        agent_id: UUID,
+        *,
+        ws: "WebSocket | None" = None,
+    ) -> None:
+        """Drop ``agent_id`` from the registry.
+
+        Round-7 audit fix R7-HIGH (race) (Apr 2026): callers that
+        track the WebSocket they're tearing down should pass it as
+        ``ws``; the registry only evicts the slot if its current
+        entry IS that exact WebSocket. Prevents the old gateway's
+        ``finally`` block from clobbering a freshly-replaced
+        connection after a "second connection wins" force-close.
+        """
+        ...
 
     def is_online(self, agent_id: UUID) -> bool: ...
 

@@ -263,6 +263,34 @@ def _wrap_with_cn_check(
     return handler
 
 
+def _normalise_cn(cn: str) -> str:
+    """Normalise a peer-cert CN/SAN entry for allow-list lookup.
+
+    gRPC's AuthContext sometimes returns SAN entries with a URI-style
+    prefix (``DNS:scheduler-1``) and the CN as just the bare name.
+    This helper strips known prefixes and trims whitespace.
+
+    **Important**: uses ``removeprefix`` (NOT ``lstrip``). ``lstrip``
+    takes a SET of characters and would strip any leading combination
+    of ``D``, ``N``, ``S``, ``:`` — so a legitimate CN like
+    ``"DNS-Scheduler-1"`` or ``"Scheduler-1"`` would silently lose
+    its leading characters and fail the allow-list. Pinned by
+    ``tests/unit/test_scheduler_grpc.py::TestNormaliseCnDoesNotMangle``.
+
+    Round-9 audit fix R9-Sched-MED (Apr 2026): also strip ``IP:``,
+    ``URI:``, ``email:`` general-name prefixes. Pre-fix the embedded
+    server's IP-SAN (``127.0.0.1``, ``::1``) was returned as the
+    literal string ``"IP:127.0.0.1"`` so allow-list operators had
+    to list the prefixed form — undocumented and a footgun.
+    """
+    bare = cn
+    for prefix in ("DNS:", "IP:", "URI:", "email:"):
+        if bare.startswith(prefix):
+            bare = bare.removeprefix(prefix)
+            break
+    return bare.strip()
+
+
 async def _enforce_cn(
     context: grpc.aio.ServicerContext,
     allowed: frozenset[str],
@@ -300,14 +328,7 @@ async def _enforce_cn(
         except UnicodeDecodeError:
             continue
 
-    # Strip URI-style prefixes that gRPC sometimes embeds. Use
-    # ``removeprefix`` (NOT ``lstrip``) - lstrip takes a SET of
-    # characters and would strip any leading D/N/S/colon, so a
-    # legitimate CN like ``Scheduler-1`` would become
-    # ``cheduler-1`` and silently fail the allow-list. This is a
-    # subtle correctness bug that bites only deployments whose
-    # naming starts with one of those characters.
-    normalised = {c.removeprefix("DNS:").strip() for c in cn_candidates}
+    normalised = {_normalise_cn(c) for c in cn_candidates}
 
     if not normalised & allowed:
         # Don't echo the actual rejected CN back to the caller -

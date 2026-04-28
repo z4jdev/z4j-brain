@@ -12,9 +12,8 @@ export const Route = createFileRoute(
 )({
   beforeLoad: ({ params }) => {
     throw redirect({
-      to: "/projects/$slug/settings/notifications",
+      to: "/projects/$slug/settings/notifications/channels",
       params: { slug: params.slug },
-      search: { tab: "channels" },
       replace: true,
     });
   },

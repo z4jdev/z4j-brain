@@ -78,6 +78,28 @@ async def ws_agent(websocket: WebSocket) -> None:
     settings = _settings_from(websocket)
     db = _db_from(websocket)
 
+    # Round-6 audit fix WS-HIGH-3 (Apr 2026): per-IP rate limit
+    # on the WS handshake. Pre-fix a leaked bearer could open
+    # thousands of connections (the "second connection wins"
+    # policy only kicks the OTHER active session per agent;
+    # doesn't prevent connect floods).
+    from z4j_brain.domain.ip_rate_limit import _agent_connect_bucket  # noqa: PLC0415
+
+    client_host = websocket.client.host if websocket.client else None
+    if client_host is not None:
+        ok = await _agent_connect_bucket.hit(client_host)
+        if not ok:
+            await websocket.accept()
+            await websocket.close(
+                code=4429,  # custom: 4429 = "too many requests"
+                reason="agent connect rate limit exceeded",
+            )
+            logger.warning(
+                "z4j gateway: WS connect rate-limited",
+                source_ip=client_host,
+            )
+            return
+
     await websocket.accept()
 
     # ------------------------------------------------------------------
@@ -237,15 +259,24 @@ async def ws_agent(websocket: WebSocket) -> None:
     # cannot forge frames against other projects.
     master_bytes = settings.secret.get_secret_value().encode("utf-8")
     project_secret = derive_project_secret(master_bytes, project_id)
+    # Round-9 audit fix R9-Wire-H1+H2 (Apr 2026): pass the
+    # newly-minted session_id into the signer + verifier so the
+    # HMAC envelope binds to this specific session. A captured
+    # frame from a previous session can't be replayed inside this
+    # one — the verifier reconstitutes the envelope with THIS
+    # session_id and the bytes signed under the prior session's
+    # binding fail HMAC.
     signer = FrameSigner(
         secret=project_secret,
         agent_id=agent_id,
         project_id=project_id,
+        session_id=session_id,
     )
     verifier = FrameVerifier(
         secret=project_secret,
         agent_id=agent_id,
         project_id=project_id,
+        session_id=session_id,
         direction="agent->brain",
     )
     # Attach as attributes - Starlette's WebSocket has no __slots__,
@@ -338,7 +369,12 @@ async def ws_agent(websocket: WebSocket) -> None:
 
             await frame_router.dispatch(frame)
     finally:
-        await registry.unregister(agent_id)
+        # Round-7 audit fix R7-HIGH (race) (Apr 2026): pass our own
+        # ``websocket`` so the registry only evicts the entry IF it
+        # still points at us. Without this, the old gateway's
+        # ``finally`` after a forced reconnect-replacement would
+        # clobber the new connection's registry slot.
+        await registry.unregister(agent_id, ws=websocket)
         async with db.session() as db_session:
             await AgentRepository(db_session).mark_offline(agent_id)
             await db_session.commit()
@@ -471,6 +507,25 @@ async def _drain_pending_for_agent(
         commands = list(result.scalars().all())
 
     for cmd in commands:
+        # Round-6 audit fix WS-HIGH-1 (Apr 2026): claim FIRST,
+        # push second. Pre-fix the registry's reconcile loop
+        # could see this same PENDING command and concurrently
+        # push it to the same agent - causing duplicate execution
+        # for destructive commands (purge_queue, restart_worker,
+        # bulk_retry) when the agent's in-memory dedup TTL was
+        # exceeded or the agent process restarted between the two
+        # pushes. Long-poll path already does claim-then-push
+        # (agent_longpoll.py); the WS path now matches.
+        async with db.session() as session:
+            from z4j_brain.persistence.repositories import CommandRepository
+
+            claimed = await CommandRepository(session).mark_dispatched(
+                cmd.id,
+            )
+            await session.commit()
+        if not claimed:
+            # Another worker / replica already claimed it.
+            continue
         try:
             await deliver_command_frame(
                 websocket=websocket,
@@ -479,16 +534,14 @@ async def _drain_pending_for_agent(
             )
         except Exception:  # noqa: BLE001
             logger.exception(
-                "z4j gateway: drain push failed; will retry on next connect",
+                "z4j gateway: drain push failed AFTER claim - command "
+                "is stuck in DISPATCHED state until CommandTimeoutWorker "
+                "expires it. Continuing with the next command.",
                 command_id=str(cmd.id),
             )
-            return
-
-        async with db.session() as session:
-            from z4j_brain.persistence.repositories import CommandRepository
-
-            await CommandRepository(session).mark_dispatched(cmd.id)
-            await session.commit()
+            # Round-6 audit fix WS-MED-2: continue draining so a
+            # single push failure doesn't strand the whole batch.
+            continue
 
 
 # ---------------------------------------------------------------------------

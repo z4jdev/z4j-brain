@@ -1078,6 +1078,96 @@ def _run_allowed_hosts(args: argparse.Namespace) -> int:
     return 2
 
 
+# ---------------------------------------------------------------------------
+# Secret-file mint helpers (Round-8 audit fix R8-HIGH-1 + R8-HIGH-2).
+# ---------------------------------------------------------------------------
+
+
+def _write_secret_env_atomic(path: Path, payload: bytes) -> None:
+    """Mint a fresh secret.env with mode 0o600 atomically.
+
+    Round-8 audit fix R8-HIGH-1 (Apr 2026): pre-fix the file was
+    written with the process umask (typically 0o644) and chmod'd
+    afterward — on a multi-user host any local UID could read the
+    secrets in the brief window before chmod, and on Windows chmod
+    is a no-op so the file stayed world-readable.
+
+    Strategy:
+
+    1. Write to ``path.tmp`` via ``O_CREAT | O_EXCL | O_WRONLY |
+       O_NOFOLLOW`` with mode 0o600 — the kernel applies the mode
+       atomically and rejects any pre-existing symlink at the
+       filename. ``O_EXCL`` blocks a colocated user who pre-creates
+       the temp as a symlink to e.g. ``/etc/cron.d/x``.
+    2. ``os.replace`` is an atomic rename within the same FS, so
+       the final ``path`` exists with mode 0o600 from the moment
+       it appears — no chmod window.
+    3. On Windows ``O_NOFOLLOW`` doesn't exist (no symlinks in the
+       traditional sense); we drop the flag and rely on NTFS ACLs.
+       A best-effort ``unlink`` of the temp on failure prevents
+       a stray file blocking a re-run.
+    """
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    # Tear down a stale .tmp from a crashed prior run before O_EXCL
+    # would refuse it.
+    try:
+        tmp_path.unlink()
+    except FileNotFoundError:
+        pass
+    fd = os.open(str(tmp_path), flags, 0o600)
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(payload)
+        os.replace(str(tmp_path), str(path))
+    except Exception:
+        try:
+            tmp_path.unlink()
+        except OSError:
+            pass
+        raise
+
+
+def _append_secret_env_atomic(path: Path, payload: bytes) -> None:
+    """Append a single ``KEY=value\\n`` line to an existing secret.env.
+
+    Round-8 audit fix R8-HIGH-2 (Apr 2026): the prior code did
+    ``path.open("a")`` which (a) follows symlinks, (b) is not atomic,
+    and (c) doesn't re-assert mode. A colocated user who pre-created
+    a symlink at ``secret.env`` after install would see the freshly-
+    minted token written through the symlink to the attacker's path.
+
+    Strategy: read existing payload, mint a fresh file via
+    :func:`_write_secret_env_atomic` with the appended line, then
+    ``os.replace`` swaps it in. The brief read-then-write race
+    matters less than the symlink/mode hardening — an attacker
+    who could write into ``~/.z4j`` already has the box.
+    """
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        fd = os.open(str(path), flags)
+    except OSError:
+        # File missing or symlink rejected — fall through to
+        # caller. Caller handles missing-file by minting fresh.
+        raise
+    try:
+        with os.fdopen(fd, "rb") as fh:
+            existing = fh.read()
+    except OSError:
+        os.close(fd)
+        raise
+    if existing and not existing.endswith(b"\n"):
+        existing += b"\n"
+    new_payload = existing + payload
+    # Write a fresh file (atomic) + replace, so mode is re-asserted.
+    path.unlink()
+    _write_secret_env_atomic(path, new_payload)
+
+
 def _run_serve(args: argparse.Namespace) -> int:
     """Run uvicorn programmatically.
 
@@ -1098,21 +1188,60 @@ def _run_serve(args: argparse.Namespace) -> int:
     if args.environment:
         os.environ["Z4J_ENVIRONMENT"] = args.environment
 
-    # Auto-setup: pass admin credentials as env vars so the brain's
-    # first-boot hook creates the admin user + default project and
-    # skips the setup-URL banner. The env var names below are the
-    # same names a Helm / compose manifest sets directly, so
-    # ``z4j-brain serve --admin-email ...`` and native env-var
-    # provisioning share one code path.
+    # Auto-setup: pass admin credentials so the brain's first-boot
+    # hook creates the admin user + default project and skips the
+    # setup-URL banner. Helm / compose manifests set these via env
+    # vars directly (read in startup.py); the cli flags below set
+    # the email via env (non-secret, useful for debugging) but the
+    # password lands in a module-level holder so it never appears
+    # in ``os.environ``.
+    #
+    # Round-8 audit fix R8-HIGH-4 (Apr 2026): the prior version
+    # set ``Z4J_BOOTSTRAP_ADMIN_PASSWORD`` in ``os.environ``, which
+    # made it readable via ``/proc/<pid>/environ`` by the same UID
+    # for the lifetime of the process AND inheritable by every
+    # subprocess we fork. The module-global holder pattern keeps
+    # the password in process memory only.
     if args.admin_email:
         os.environ["Z4J_BOOTSTRAP_ADMIN_EMAIL"] = args.admin_email
     if args.admin_password:
-        os.environ["Z4J_BOOTSTRAP_ADMIN_PASSWORD"] = args.admin_password
+        # Round-9 audit fix R9-Reaud-H2 (Apr 2026): refuse the
+        # ``--admin-password`` flag together with ``--workers > 1``.
+        # On POSIX uvicorn forks N workers from the parent process;
+        # the in-process ``_CLI_BOOTSTRAP_PASSWORD`` holder is
+        # copied into every child's memory via fork, surfacing the
+        # cleartext in /proc/<pid>/maps and via ptrace on every
+        # worker for the lifetime of first-boot. Restricting to a
+        # single worker keeps the holder in one address space; only
+        # the first-boot lifespan reads + clears it. Helm /
+        # systemd / compose deployments should use the env-var
+        # path which startup.py already pops eagerly.
+        workers_requested = getattr(args, "workers", None) or 1
+        if workers_requested > 1:
+            raise SystemExit(
+                "z4j-brain: --admin-password is incompatible with "
+                f"--workers={workers_requested}. uvicorn fork would "
+                "copy the cleartext password into every worker's "
+                "memory (readable via /proc/<pid>/maps + ptrace). "
+                "Either drop --workers (default 1), set the password "
+                "via Z4J_BOOTSTRAP_ADMIN_PASSWORD env (eagerly popped "
+                "by startup.py), or run bootstrap-admin separately "
+                "before serving.",
+            )
+        from z4j_brain import startup as _startup
+        _startup.set_cli_bootstrap_password(args.admin_password)
 
     # Default to SQLite if no DATABASE_URL is set (bare-metal mode).
     if not os.environ.get("Z4J_DATABASE_URL"):
         data_dir = Path.home() / ".z4j"
-        data_dir.mkdir(parents=True, exist_ok=True)
+        # Round-8 audit fix R8-MED-2 (Apr 2026): force ~/.z4j to
+        # 0o700 on first creation. Previously created with default
+        # umask (typically 0o755 → world-traversable on multi-user
+        # hosts). Even though private files inside are 0o600, leaking
+        # filenames + cert metadata is undesirable. ``mkdir(mode=...)``
+        # only takes effect on creation; existing dirs are unchanged
+        # so we don't surprise an operator who deliberately widened it.
+        data_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         db_path = data_dir / "z4j.db"
         os.environ["Z4J_DATABASE_URL"] = f"sqlite+aiosqlite:///{db_path}"
         os.environ.setdefault("Z4J_REGISTRY_BACKEND", "local")
@@ -1136,7 +1265,7 @@ def _run_serve(args: argparse.Namespace) -> int:
     # explicitly (case 1). Auto-mint is for dev / homelab / evaluation.
     if not os.environ.get("Z4J_SECRET"):
         data_dir = Path.home() / ".z4j"
-        data_dir.mkdir(parents=True, exist_ok=True)
+        data_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         secret_env = data_dir / "secret.env"
         if secret_env.exists():
             for line in secret_env.read_text(encoding="utf-8").splitlines():
@@ -1158,8 +1287,14 @@ def _run_serve(args: argparse.Namespace) -> int:
                 import secrets as _secrets  # local alias, avoid shadow
 
                 new_metrics = _secrets.token_urlsafe(32)
-                with secret_env.open("a", encoding="utf-8") as fh:
-                    fh.write(f"Z4J_METRICS_AUTH_TOKEN={new_metrics}\n")
+                # Round-8 audit fix R8-HIGH-2 (Apr 2026): symlink-safe
+                # atomic append via :func:`_append_secret_env_atomic`.
+                # Pre-fix ``open("a")`` followed symlinks and didn't
+                # re-assert mode.
+                _append_secret_env_atomic(
+                    secret_env,
+                    f"Z4J_METRICS_AUTH_TOKEN={new_metrics}\n".encode("utf-8"),
+                )
                 os.environ["Z4J_METRICS_AUTH_TOKEN"] = new_metrics
                 print(  # noqa: T201
                     f"z4j-brain: minted Z4J_METRICS_AUTH_TOKEN (in-place "
@@ -1212,18 +1347,22 @@ def _run_serve(args: argparse.Namespace) -> int:
             new_secret = _secrets.token_urlsafe(48)
             new_session = _secrets.token_urlsafe(48)
             new_metrics = _secrets.token_urlsafe(32)
-            secret_env.write_text(
+            payload = (
                 f"Z4J_SECRET={new_secret}\n"
                 f"Z4J_SESSION_SECRET={new_session}\n"
-                f"Z4J_METRICS_AUTH_TOKEN={new_metrics}\n",
-                encoding="utf-8",
-            )
-            try:
-                # chmod 600 on Unix; no-op on Windows (NTFS uses ACLs).
-                # Best-effort: we don't fail the boot if chmod is denied.
-                secret_env.chmod(0o600)
-            except OSError:
-                pass
+                f"Z4J_METRICS_AUTH_TOKEN={new_metrics}\n"
+            ).encode("utf-8")
+            # Round-8 audit fix R8-HIGH-1 (Apr 2026): atomic mode-0o600
+            # mint via O_CREAT|O_EXCL|O_NOFOLLOW. Pre-fix the file was
+            # written with the process umask (typically 0o644) and
+            # chmod'd afterward — on a multi-user host any local UID
+            # could read all three secrets in the brief window before
+            # chmod, and on Windows chmod is a no-op so the file stayed
+            # world-readable. ``O_EXCL`` blocks a colocated user who
+            # pre-creates the file as a symlink to e.g. /etc/cron.d/.
+            # ``O_NOFOLLOW`` rejects an existing-symlink attack on the
+            # filename itself.
+            _write_secret_env_atomic(secret_env, payload)
             os.environ["Z4J_SECRET"] = new_secret
             os.environ["Z4J_SESSION_SECRET"] = new_session
             os.environ["Z4J_METRICS_AUTH_TOKEN"] = new_metrics
@@ -1720,7 +1859,22 @@ def _run_migrate_sync(
                     "alembic_version",
                 }
                 extra_tables = db_tables - known_tables
+                # Round-7 audit fix R7-LOW (Apr 2026): defensively
+                # validate the table identifier before f-string
+                # interpolation. Today ``db_tables`` comes from
+                # ``inspect(engine).get_table_names()`` and is therefore
+                # operator-controlled, but a future code path that
+                # widens the source could introduce SQL-injection if
+                # this guard is missing.
+                import re as _re  # noqa: PLC0415
+                _IDENT_RE = _re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
                 for tbl in sorted(extra_tables):
+                    if not _IDENT_RE.fullmatch(tbl):
+                        print(  # noqa: T201
+                            f"  refusing to drop table with unsafe "
+                            f"identifier: {tbl!r}",
+                        )
+                        continue
                     print(  # noqa: T201
                         f"  dropping unknown table: {tbl}",
                     )
@@ -2090,15 +2244,29 @@ def _bootstrap_env_for_management_commands() -> None:
     before instantiating anything - callers that need Settings +
     engine use :func:`_build_settings_from_env` which wraps this.
 
-    Idempotent: safe to call multiple times. Only mints secrets
-    when ``~/.z4j/secret.env`` doesn't exist.
+    Idempotent: safe to call multiple times.
+
+    Round-8 audit fix R8-HIGH-3 (Apr 2026): the previous version
+    silently MINTED a fresh ``Z4J_SECRET`` here when ``secret.env``
+    was absent. That was a real footgun: any management command
+    run BEFORE the first ``serve`` (e.g. ``z4j status``,
+    ``z4j check``, ``z4j audit verify``) would bake in a secret the
+    operator never saw a banner for. Then the eventual ``serve``
+    would either re-use that secret silently (good) or run
+    ``z4j audit verify`` later against rows signed under a
+    different secret (silent verification mismatches).
+
+    New behavior: management commands READ an existing secret.env
+    if present, but REFUSE to mint when missing — they exit with a
+    clear error pointing the operator at ``z4j-brain serve`` (which
+    mints + prints the visible setup banner).
     """
     import os
     from pathlib import Path
 
     if not os.environ.get("Z4J_DATABASE_URL"):
         data_dir = Path.home() / ".z4j"
-        data_dir.mkdir(parents=True, exist_ok=True)
+        data_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         db_path = data_dir / "z4j.db"
         os.environ["Z4J_DATABASE_URL"] = f"sqlite+aiosqlite:///{db_path}"
         os.environ.setdefault("Z4J_REGISTRY_BACKEND", "local")
@@ -2113,24 +2281,13 @@ def _bootstrap_env_for_management_commands() -> None:
                 k, v = line.split("=", 1)
                 os.environ.setdefault(k.strip(), v.strip())
         else:
-            # Mint fresh secrets so management commands work on a
-            # never-served install. `serve` will re-use these on
-            # its first boot.
-            import secrets as _secrets
-
-            secret_env.parent.mkdir(parents=True, exist_ok=True)
-            new_secret = _secrets.token_urlsafe(48)
-            new_session = _secrets.token_urlsafe(48)
-            secret_env.write_text(
-                f"Z4J_SECRET={new_secret}\nZ4J_SESSION_SECRET={new_session}\n",
-                encoding="utf-8",
+            raise SystemExit(
+                "z4j-brain: refusing to mint Z4J_SECRET from a management "
+                "command — secret minting must happen via `z4j-brain serve`"
+                " so the operator sees the persisted-secret banner. Run "
+                "`z4j-brain serve` once first (or set Z4J_SECRET + "
+                "Z4J_SESSION_SECRET explicitly via env vars).",
             )
-            try:
-                secret_env.chmod(0o600)
-            except OSError:
-                pass
-            os.environ["Z4J_SECRET"] = new_secret
-            os.environ["Z4J_SESSION_SECRET"] = new_session
 
     os.environ.setdefault("Z4J_ENVIRONMENT", "dev")
     os.environ.setdefault(
@@ -2594,8 +2751,14 @@ def _run_bootstrap_admin(args: argparse.Namespace) -> int:
 
     # Thread the env-var path inside run_first_boot_check so the
     # CLI and the env-var mode produce byte-identical outcomes.
+    # Round-8 audit fix R8-HIGH-4 (Apr 2026): password lands in the
+    # in-process holder instead of os.environ. See cli.py serve
+    # path comment + startup.py::set_cli_bootstrap_password for the
+    # full rationale (avoids /proc/<pid>/environ leakage and
+    # subprocess inheritance).
     os.environ["Z4J_BOOTSTRAP_ADMIN_EMAIL"] = args.email
-    os.environ["Z4J_BOOTSTRAP_ADMIN_PASSWORD"] = password
+    from z4j_brain import startup as _startup
+    _startup.set_cli_bootstrap_password(password)
     if args.display_name:
         os.environ["Z4J_BOOTSTRAP_ADMIN_DISPLAY_NAME"] = args.display_name
 

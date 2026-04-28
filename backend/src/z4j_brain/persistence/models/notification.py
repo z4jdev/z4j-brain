@@ -419,7 +419,8 @@ class NotificationDelivery(PKMixin, Base):
     Attributes:
         subscription_id: Which subscription fired this delivery.
             SET NULL on subscription delete (audit history outlives
-            the subscription).
+            the subscription). Always NULL for test fires (they
+            aren't owned by any subscription).
         channel_id: NotificationChannel target. NULL if the channel
             was a UserChannel (we only audit project-channel sends
             globally; user-channel sends are owned by the user).
@@ -433,6 +434,11 @@ class NotificationDelivery(PKMixin, Base):
         response_body: Truncated response body (for debugging failures).
         error: Error message if delivery failed.
         sent_at: When the delivery attempt was made.
+        triggered_by_user_id: User who manually triggered this row
+            (test fires only). NULL for subscription-driven fires.
+            Lets the personal Global Notification Log surface test
+            rows the operator triggered themselves; the dashboard
+            renders these with a "channel test" badge.
     """
 
     __tablename__ = "notification_deliveries"
@@ -479,6 +485,14 @@ class NotificationDelivery(PKMixin, Base):
         nullable=False,
         server_default=func.now(),
     )
+    # v1.1.0: pointer to the user who manually triggered this row
+    # (test fires only). Subscription-driven fires leave it NULL.
+    # Migration 2026_04_27_0009.
+    triggered_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+    )
 
     # Hot-path index for the admin Delivery Log page -
     # ``list_for_project`` filters by ``project_id`` and orders by
@@ -491,6 +505,10 @@ class NotificationDelivery(PKMixin, Base):
             "ix_notification_deliveries_project_sent",
             "project_id",
             desc("sent_at"),
+        ),
+        Index(
+            "ix_notification_deliveries_triggered_by_user",
+            "triggered_by_user_id",
         ),
     )
 

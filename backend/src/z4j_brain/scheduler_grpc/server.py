@@ -105,11 +105,35 @@ class SchedulerGrpcServer:
             )
             return
 
+        # Audit fix H-1 (Apr 2026): emit the empty-allow-list
+        # warning BEFORE TLS material loading so the warning fires
+        # even when the TLS path fails (otherwise an operator's
+        # first sign of a misconfigured allow-list could be hidden
+        # by an unrelated cert error). Log the choice loudly so it
+        # shows up in any structured-log search for
+        # "scheduler_grpc_open_ca".
+        allowed_cns = tuple(self._settings.scheduler_grpc_allowed_cns)
+        if not allowed_cns:
+            # ``extra={"message": ...}`` would collide with the
+            # built-in LogRecord ``message`` attribute - stdlib
+            # rejects that. Use ``detail`` instead so structured-
+            # log handlers still pick it up cleanly.
+            logger.warning(
+                "scheduler_grpc_open_ca: "
+                "Z4J_SCHEDULER_GRPC_ALLOWED_CNS is empty - any "
+                "client cert signed by the configured CA "
+                "(Z4J_SCHEDULER_GRPC_TLS_CA) can drive the "
+                "SchedulerService. This is the "
+                "'trust the CA' deployment model. For "
+                "defense in depth, set the env var to the "
+                "list of CN/SAN values you mint via "
+                "`z4j-brain mint-scheduler-cert`.",
+                extra={"event": "scheduler_grpc_open_ca"},
+            )
+
         creds = _build_server_credentials(self._settings)
         interceptors = (
-            SchedulerAllowlistInterceptor(
-                allowed_cns=tuple(self._settings.scheduler_grpc_allowed_cns),
-            ),
+            SchedulerAllowlistInterceptor(allowed_cns=allowed_cns),
         )
         # gRPC server options. The two ``min_*ping*`` knobs match
         # the scheduler client's keepalive cadence (30s by default,

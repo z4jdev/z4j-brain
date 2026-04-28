@@ -13,7 +13,7 @@ from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 
 from fastapi import APIRouter, Depends
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from z4j_brain.api.deps import (
     get_audit_log_repo,
@@ -79,14 +79,33 @@ class ApiKeyCreated(ApiKeyPublic):
 
 class CreateApiKeyRequest(BaseModel):
     name: str = Field(min_length=1, max_length=200)
+    # Round-8 audit fix R8-Pyd-H6 (Apr 2026): cap list cardinality
+    # AND per-element length. Pre-fix the list was unbounded and
+    # each scope string was unbounded, so a 1M-element list of
+    # 100KB strings reached ``validate_requested_scopes`` before
+    # rejection. ``ALL_SCOPES`` has tens of values; 64 leaves
+    # plenty of headroom.
     scopes: list[str] = Field(
         default_factory=list,
+        max_length=64,
         description=(
             "Catalogue of allowed actions. See "
             "z4j_brain.auth.scopes.ALL_SCOPES for valid values. "
             "An empty list mints a powerless token."
         ),
     )
+
+    @field_validator("scopes")
+    @classmethod
+    def _cap_scope_strings(cls, v: list[str]) -> list[str]:
+        for entry in v:
+            if not isinstance(entry, str):
+                raise ValueError("scope entries must be strings")
+            if len(entry) > 64:
+                raise ValueError(
+                    "scope entries are bounded to 64 characters",
+                )
+        return v
     project_id: uuid.UUID | None = Field(
         default=None,
         description=(

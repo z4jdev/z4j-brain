@@ -548,6 +548,7 @@ async def setup_form(
     token: str = Query(default=""),  # noqa: ARG001 - read by JS, not server
     setup_service: "SetupService" = Depends(get_setup_service),
     users: "UserRepository" = Depends(get_user_repo),
+    tokens: "FirstBootTokenRepository" = Depends(get_first_boot_token_repo),
 ) -> HTMLResponse:
     """Serve the inline HTML form.
 
@@ -558,8 +559,27 @@ async def setup_form(
     ``window.location.search`` and stuffs it into the hidden form
     field. The server's only job is to gate visibility on the
     first-boot flag.
+
+    Round-8 audit fix R8-Bootstrap-MED (Apr 2026): also require
+    that an active token row exists. Pre-fix, between a successful
+    ``complete()`` commit and the user row becoming visible to a
+    parallel reader (Postgres replica lag), ``users.count() == 0``
+    could still be True even though the setup is conceptually done.
+    The form would render referencing a stale URL — confusing UX
+    and a small information leak about install state. Tying
+    visibility to "active token AND users empty" closes the gap.
     """
     if not await setup_service.is_first_boot(users):
+        return HTMLResponse(
+            "<!doctype html><meta charset=utf-8><title>Not found</title><p>404</p>",
+            status_code=404,
+        )
+    active_token = await tokens.get_active(lock=False)
+    if active_token is None:
+        # No mintable token — operator hasn't restarted the brain
+        # since the prior token expired or was consumed. Render 404
+        # so the page doesn't claim "first boot" with no path
+        # forward.
         return HTMLResponse(
             "<!doctype html><meta charset=utf-8><title>Not found</title><p>404</p>",
             status_code=404,

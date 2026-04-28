@@ -93,12 +93,20 @@ RUN pip install --no-cache-dir "uv>=0.5.10"
 WORKDIR /build
 COPY packages/z4j-core /build/packages/z4j-core
 COPY packages/z4j-brain /build/packages/z4j-brain
+# z4j-scheduler is a separate PyPI package but bundling it inside the
+# brain image enables the optional ``Z4J_EMBEDDED_SCHEDULER=true``
+# sidecar (docs/SCHEDULER.md §21.3) without requiring a second image.
+# The runtime cost is ~10 MB of pure-Python wheel; embedded mode stays
+# off by default so the brain starts identically to pre-1.x releases
+# unless the operator opts in.
+COPY packages/z4j-scheduler /build/packages/z4j-scheduler
 
 RUN uv venv /opt/venv \
     && VIRTUAL_ENV=/opt/venv uv pip install \
         --no-cache \
         /build/packages/z4j-core \
-        "/build/packages/z4j-brain[postgres]"
+        "/build/packages/z4j-brain[postgres,scheduler-grpc]" \
+        /build/packages/z4j-scheduler
 
 # -----------------------------------------------------------------
 # Image-leanness pass. The installed venv carries a few classes of

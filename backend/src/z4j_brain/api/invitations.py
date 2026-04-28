@@ -247,11 +247,24 @@ async def mint_invitation(
         min_role=ProjectRole.ADMIN,
     )
 
+    # Round-9 audit fix R9-Auth-LOW (Apr 2026): canonicalize the
+    # invitee email at mint time. Pre-fix ``get_by_email`` casefolded
+    # but did NOT NFKC/IDNA normalize, so an admin who pasted
+    # ``Ｕｓｅｒ@example.com`` (full-width) while ``user@example.com``
+    # already existed got a "no existing user" response, the invite
+    # was minted, and accept-time TOCTOU re-canonicalization
+    # eventually 409'd — wasted invite + confusing UX. Canonicalize
+    # before the dup-check AND store the canonical form on the row
+    # so the accept path sees consistent state.
+    from z4j_brain.domain.auth_service import canonicalize_email  # noqa: PLC0415
+
+    canonical_email = canonicalize_email(body.email)
+
     # Reject inviting someone who is already a member - no value
     # in creating dangling invites. 409 Conflict with a clean
     # error body so the dashboard can show "that user is already
     # a member" directly.
-    existing_user = await users.get_by_email(body.email)
+    existing_user = await users.get_by_email(canonical_email)
     if existing_user is not None:
         existing = await memberships.get_for_user_project(
             user_id=existing_user.id, project_id=project.id,
@@ -259,7 +272,7 @@ async def mint_invitation(
         if existing is not None:
             raise ConflictError(
                 "user is already a member of this project",
-                details={"email": body.email},
+                details={"email": canonical_email},
             )
 
     plaintext = _mint_token()
@@ -268,7 +281,7 @@ async def mint_invitation(
 
     row = await invitations.create(
         project_id=project.id,
-        email=body.email,
+        email=canonical_email,
         role=body.role,
         invited_by=user.id,
         token_hash=token_hash,
@@ -305,7 +318,12 @@ async def mint_invitation(
     return InvitationMintPublic(
         invitation=_invitation_public(row),
         token=plaintext,
-        accept_url_path=f"/invite?token={plaintext}",
+        # Round-9 audit fix R9-Auth-MED (Apr 2026): URL fragment
+        # not query string. See auth.py password-reset accept_url
+        # for the threat model — fragment isn't sent in Referer
+        # headers, isn't written to access logs, and isn't synced
+        # by most browser history mechanisms.
+        accept_url_path=f"/invite#token={plaintext}",
         email_sent=email_sent,
     )
 
@@ -351,10 +369,11 @@ async def _try_send_invitation_email(
     if not email_channels:
         return False
 
+    # Round-9 audit fix R9-Auth-MED (Apr 2026): URL fragment.
     accept_url = (
-        f"{settings.public_url.rstrip('/')}/invite?token={token}"
+        f"{settings.public_url.rstrip('/')}/invite#token={token}"
         if getattr(settings, "public_url", None)
-        else f"/invite?token={token}"
+        else f"/invite#token={token}"
     )
     subject = f"z4j: you're invited to {project_name}"
     body = (

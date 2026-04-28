@@ -87,7 +87,16 @@ def upgrade() -> None:
         # SQLite: skip. The handler detects the dialect at runtime
         # and falls back to polling.
         return
+    # Audit fix (Apr 2026 follow-up): make the upgrade idempotent.
+    # ``CREATE OR REPLACE FUNCTION`` already is, but ``CREATE
+    # TRIGGER`` is not - re-running the migration against a
+    # partially-applied DB raised ``trigger ... already exists``.
+    # ``DROP TRIGGER IF EXISTS`` first, then re-create. (Postgres
+    # 14+ supports ``CREATE OR REPLACE TRIGGER`` directly; we use
+    # the drop-then-create form so the migration runs against the
+    # supported floor of Postgres 17.)
     op.execute(sa.text(_TRIGGER_FUNCTION_SQL))
+    op.execute(sa.text(_DROP_TRIGGER_SQL))
     op.execute(
         sa.text(
             "CREATE TRIGGER z4j_schedules_notify_trigger "

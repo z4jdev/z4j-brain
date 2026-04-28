@@ -7,35 +7,245 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [1.0.19] - 2026-04-27
+### Added
 
-> **Theme: the last fully-stable v1.0.x patch.** Pre-1.0.19, downgrading
-> from a newer brain to an older one could flap-loop alembic, and
-> 1.0.18 silently introduced 3 always-on workers that consumed
-> connection-pool slots. From 1.0.19 onward every v1.0.x version
-> upgrades and downgrades cleanly to / from every other v1.0.x. See
-> `docs/MIGRATIONS.md` for the additive-only contract.
+- **Schedule CRUD UI in the dashboard** (closes
+  `docs/SCHEDULER.md §3.2 wish #3`: "manage schedules from a real
+  UI, not Django admin"). The `/projects/{slug}/schedules` page
+  ships:
+  - `+ New schedule` header button → full create dialog with
+    kind-aware expression hint, JSON-validated args/kwargs,
+    catch-up policy + queue + engine pickers, and a DST
+    fall-back warning when the cron + timezone combination
+    would fire twice on the ambiguous day.
+  - Per-row Edit + Delete icons. Delete confirmation warns when
+    the schedule's `source` isn't `dashboard` (because
+    declarative reconcilers will recreate it).
+  - Schedule detail page at
+    `/projects/{slug}/schedules/{id}` with a metadata card +
+    "Last 50 fires" panel (status pill per
+    `schedule_fires.status` enum, latency rendered in ms or
+    seconds, error_code + error_message for failures).
+  - Reconciliation diff page at
+    `/projects/{slug}/schedules/reconcile` consuming the new
+    `POST /api/v1/projects/{slug}/schedules:diff` endpoint.
+    Operator pastes a JSON array of schedules, picks mode
+    (upsert / replace_for_source) + optional source_filter,
+    sees four buckets (insert / update / unchanged / delete)
+    with inline before/after diff for the update rows.
+- **`POST /schedules:diff` endpoint** - read-only preview of
+  what `:import` would do. Same body shape as `:import` but
+  returns the four-bucket classification instead of mutating.
+  No audit row written (audit hygiene for repeated previews
+  while iterating on a `Z4J["schedules"]` config). ADMIN-gated
+  to mirror `:import`'s role gate. Pinned by
+  `backend/tests/unit/test_schedules_diff.py` (7 tests).
+- **DST fall-back warning in the schedule create form**
+  (closes `docs/SCHEDULER.md §5.5` UI gap). New
+  `dashboard/src/lib/dst-warnings.ts` helper walks the
+  timezone's UTC-offset transitions for the next 12 months via
+  `Intl.DateTimeFormat`, parses the cron HOUR field (supports
+  `*`, lists, ranges, steps), and emits an actionable warning
+  when the cron's hour falls inside the ambiguous fall-back
+  window. Spring-forward gets a softer "info"-level note since
+  z4j-scheduler's next-on-time semantics shift the fire rather
+  than drop it. 11 new dashboard tests cover non-cron kinds,
+  UTC, non-DST timezones (Phoenix, Tokyo), the US + EU
+  fall-back cases, ranges + steps, and malformed input.
+
+## [1.1.0] - 2026-04-28
+
+> **Theme: enterprise-grade baseline.** v1.0.x had real upgrade /
+> downgrade hazards (1.0.18 → 1.0.17 alembic flap loops, scheduler
+> workers eating connection-pool slots, SPA cache holding stale
+> `index.html` after upgrade). v1.1.0 fixes all of them, ships the
+> brain-side z4j-scheduler service that replaces celery-beat, and
+> closes **96 HIGH-severity findings across 9 audit rounds** (see
+> `docs/SECURITY_AUDIT_2026_04.md`). Codifies the upgrade/downgrade
+> contract going forward - every v1.1.x patch upgrades AND
+> downgrades cleanly to / from every other v1.1.x patch. See
+> `docs/MIGRATIONS.md` for the binding additive-only rules.
 >
-> Coordinated minor publish: ships alongside `z4j-core` 1.0.6 (the
-> SDK companion that adds `Schedule.catch_up` / `source` /
-> `source_hash` defaults so deserializing brain responses doesn't
-> trip `extra="forbid"`) and the `z4j` umbrella 1.0.19. The bigger
-> v1.1.0 baseline (embedded scheduler sidecar, `z4j-scheduler` 1.1.0,
-> reconciliation `:diff` UI, ecosystem-wide adapter rebumps) ships
-> after 1.0.19 has soaked.
+> Coordinated ecosystem release: ships alongside `z4j-core` 1.1.0,
+> `z4j-scheduler` 1.1.0 (first PyPI publish), `z4j-bare` 1.1.0,
+> `z4j-django` 1.1.0, `z4j-flask` 1.1.0, `z4j-fastapi` 1.1.0,
+> `z4j-celery` 1.1.0, `z4j-celerybeat` 1.1.0, `z4j-huey` 1.1.0
+> (real bug fix), and the `z4j` umbrella 1.1.0. Engine adapters
+> without production-code changes (`z4j-rq`, `z4j-arq`,
+> `z4j-dramatiq`, `z4j-taskiq`, plus 5 scheduler adapters) stay at
+> 1.0.1 and interop cleanly with the new core/bare floors.
+
+### Security (rounds 7-9 audit + backlog closure)
+
+**Round 7** - IDOR audit: ZERO HIGH/MED findings. The R3+R4+R5
+defenses (project-scoped repository methods, explicit policy gates)
+held under deep re-audit.
+
+**Round 8** - 21 HIGH closed (cleanest surface in the entire sweep
+was the dashboard: zero HIGH/MED - only two LOW polish items).
+Highlights:
+
+- **Bootstrap + CLI**: atomic `O_NOFOLLOW` mint of
+  `~/.z4j/secret.env` (no umask race, no symlink TOCTOU,
+  Windows-safe). Management commands now refuse to mint divergent
+  secrets (no more silent audit-chain mismatches).
+  `Z4J_BOOTSTRAP_ADMIN_PASSWORD` flows through process-memory
+  holder, not `os.environ` (no `/proc/<pid>/environ` leak, no
+  subprocess inheritance). Setup-token global rate cap
+  complements per-IP cap (closes NAT/XFF rotation bypass).
+- **Time / DST**: solar schedules now actually fire (was silently
+  auto-disabled). IANA timezone validated at the API boundary
+  (typos like `"America/New York"` rejected with 422). One-shot
+  past-dated schedules fire instead of being silently consumed.
+  DST fall-back fold collision fixed (Nov first-Sunday US/Eastern
+  was de-duping a legit fire). RQ exporter emits tz-aware
+  datetime (was 7-8h off in non-UTC deployments).
+- **Pydantic boundary**: per-list / per-string caps on every wire
+  schema (HelloPayload, EventBatchPayload, HeartbeatPayload,
+  CommandPayload, RegistryDeltaPayload, ErrorPayload).
+  `RetryTaskRequest.override_args/kwargs` capped at 64 KiB.
+  `BulkDeleteRequest.task_ids` capped at 1000. Notification
+  subscription `channel_ids` capped at 64. API key scopes capped
+  at 64 list × 64 char each.
+- **Async cancellation**: leader-gate `stop()` shields advisory-
+  lock release (no HA split-brain on rolling redeploy). Audit
+  queue drain re-enqueues on cancel (no lost denial events on
+  graceful shutdown). FireSchedule semaphore-bounded (no
+  connection-pool wedge under fire bursts). Notification dispatch
+  DB session bounded (256 tasks no longer drain a 30-conn pool).
+
+**Round 9** - 17 HIGH closed including 2 NEW HIGHs the re-audit
+found in Round 8's own fixes (exactly why the agent asked for the
+self-audit pass):
+
+- **R8 self-audit**: `count_recent_by_action` matched the success
+  row, eating 1 retry from the budget. `_CLI_BOOTSTRAP_PASSWORD`
+  holder was fork-inherited by `--workers > 1` (memory copy of
+  cleartext).
+- **Auth (real exploit)**: `password-reset/confirm` skipped policy
+  validation; phished link → any 8-char password. Closed.
+- **Storage / partitioning**: `events_default` silently swallowed
+  when worker died. Retention worker dropped partitions by name
+  parsing without content check. `CREATE PARTITION` took
+  `ACCESS EXCLUSIVE` without `lock_timeout`. Audit chain advisory
+  lock held across I/O (global serialization point) - released
+  before I/O. Added DB-level UNIQUE on `prev_row_hmac` (chain
+  forks now refuse at the DB layer; new migration
+  `2026_04_28_0012-audit_chain_unique.py`).
+  `get_latest_row_hmac` ordering deterministic on
+  microsecond-tied rows.
+- **Scheduler / IPC / cert**: `is_running` flapped on transient
+  crashes (k8s pages on benign restarts). `embedded_scheduler_argv`
+  arbitrary-arg-injection closed. SIGTERM handler missing task
+  reference (GC mid-shutdown leaked advisory locks) fixed.
+  TriggerGrpcServer keepalive added (NAT half-open no longer
+  wedges client for hours).
+- **Wire protocol**: `seq + nonce` reset per session enabled
+  cross-session replay - fixed by binding `session_id` into the
+  HMAC envelope (signer + verifier; brain gateway, brain
+  long-poll, agent WS, agent long-poll all wired).
+  `canonical_json` accepted `NaN/Infinity` - fixed with
+  `allow_nan=False`.
+
+**Backlog closure** (R7+R8+R9 deferred MED/LOW): 20 items closed
+in a focused pass. Async-cancel `asyncio.shield` discipline applied
+to BrainClient.close, channels._post aclose, TickEngine sleep
+gather, notifications dispatch gather, and agent long-poll close.
+`/setup` form now requires active token row (closes replica-lag
+stale-URL surface). `/health/ready` gates on
+`app.state.lifespan_ready` (k8s readiness no longer flips green
+pre-bootstrap). Embedded scheduler stdout redacts TLS material.
+`derive_fire_id` truncates to whole seconds (closes restart-time
+double-Command race). Reset + invitation tokens moved to URL
+fragment (no Referer leakage). Mint-invitation canonicalizes email
+before dup-check (no NFKC bypass). Plus IANA tz validation, IP/URI
+prefix stripping in CN normalization, naive timestamp rejection,
+HelloAck field caps + nonce tightening, and dashboard hue clamp.
+
+### Security (round-6 audit, 10/10 HIGH closed)
+
+- **WS-HIGH-1: drain-race double-deliver closed.** Pre-fix,
+  `websocket/gateway.py:466` pushed the command frame BEFORE
+  marking it dispatched; the reconcile loop concurrently saw the
+  same command as un-dispatched and pushed it again. Agent
+  in-memory dedup caught it within 300 s, but a process restart
+  between the two pushes could deliver the same destructive
+  command (`purge_queue`, `restart_worker`, `bulk_retry`) twice.
+  Fix: `mark_dispatched` now runs BEFORE push in both
+  `websocket/gateway.py` and the `main.py` reconcile loop.
+- **WS-HIGH-2: long-poll re-includes DISPATCHED commands on
+  reconnect.** A long-poll/WS handler that marked a command
+  DISPATCHED but failed to deliver the bytes (HTTP write error,
+  WS drop) left the command stranded - it would only recover via
+  `CommandTimeoutWorker` minutes later. New
+  `agent_longpoll_redispatch_seconds` window pulls DISPATCHED
+  commands back into the long-poll response on reconnect, so
+  agents resume work immediately after a network blip.
+- **WS-HIGH-3: rate limit on `/ws/agent` and
+  `/api/v1/agent/events`.** Pre-fix a leaked bearer could connect
+  unboundedly. New `_agent_connect_bucket` (600/min/IP) in
+  `domain/ip_rate_limit.py:164` caps reconnect storms; 1000
+  agents reconnecting simultaneously would have opened 3000
+  concurrent DB sessions before any drain ran.
+- **Mig-HIGH-1: events DROP TABLE idempotent guard.** The 0001
+  initial migration did `DROP TABLE events` then re-created as
+  partitioned - "safe because table is empty" only on first run.
+  A partial-failure recovery hit this and destroyed an existing
+  populated events table. Now guarded with a row-count check +
+  `IF EXISTS`.
+- **Mig-HIGH-2: `CREATE INDEX CONCURRENTLY` discipline +
+  `transaction_per_migration=True`.** Stops migrations from
+  taking write locks on potentially-50M-row tables (`tasks`,
+  `events`) for the duration of a re-application. Combined with
+  the 3-second `db_lock_timeout_ms`, this prevents every
+  concurrent INSERT from failing during migration.
+- **Mig-HIGH-3: downgrade no-op for `_drop_extensions`.**
+  Pre-fix `migrate downgrade base` did `DROP EXTENSION pg_trgm /
+  citext / pgcrypto`. Operators sharing a Postgres cluster with
+  other applications got those silently broken. Now a documented
+  no-op - extensions stay installed across upgrade/downgrade.
+- **SR-HIGH: multi-key acceptance for `Z4J_SECRET` rotation.**
+  Pre-fix, rotating the master secret invalidated every prior
+  audit-log row's HMAC, breaking compliance for operators with
+  90-day mandatory rotation policies. New
+  `Z4J_PREVIOUS_SECRETS` and `Z4J_PREVIOUS_SESSION_SECRETS` env
+  vars accept comma-separated old keys for verify-only fallback,
+  enabling zero-downtime rotation. The audit chain stays
+  verifiable through the rotation window.
+- **Notif-HIGH: user-channel test endpoint now writes audit
+  rows.** Pre-fix `/api/v1/user/channels/{id}/test` and
+  `/api/v1/user/channels/test` (unsaved-config preflight)
+  dispatched real notifications to operator-controlled URLs but
+  left no `user_notifications.channel.test` audit row, defeating
+  the security review trail.
+
+### Security (round-6 audit, MEDIUM batch)
+
+- WebSocket `frame_router.py` now caps `adapter_health` keys at
+  256, `queue_depths` inner entries at 1024, and `event_batch`
+  at 1000 frames per inbound message - protects the brain from
+  a hostile or runaway agent flooding state.
+- `domain/notifications/channels.py:849`: Slack outbound
+  webhooks host-locked to `hooks.slack.com`; Discord webhooks
+  host-locked to the four official Discord webhook hosts. Closes
+  the exfil pivot where a compromised channel config could point
+  at `attacker.com` and look "Slack-shaped".
+- `domain/notifications/channels.py:741`: Email Subject / From /
+  To headers now stripped of CR/LF before SMTP send - closes the
+  classic header-injection vector.
 
 ### Fixed
 
-- **C1 — schema-version skew now warns instead of raising.**
+- **C1 - schema-version skew now warns instead of raising.**
   `startup_version.check_and_update_schema_version` previously raised
   `SchemaVersionError` if the DB's `z4j_meta.schema_version` was newer
   than the running code, killing boot. After downgrade (1.0.18 → 1.0.17)
-  this caused systemd flap loops. Now logs a warning and continues —
+  this caused systemd flap loops. Now logs a warning and continues -
   old code can boot against forward-migrated DBs. The
   `SchemaVersionError` class is kept as a back-compat shim for any
   downstream import. Pinned by
   `tests/unit/test_compat_fixes.py::TestC1SchemaVersionWarnNotRaise`.
-- **C2 — `auto-migrate` detects unknown DB head before invoking
+- **C2 - `auto-migrate` detects unknown DB head before invoking
   alembic.** When the DB is stamped at a revision the running wheel
   doesn't ship (downgrade scenario), alembic exited with `Can't locate
   revision identified by '…'` and the brain flap-looped. Now
@@ -44,7 +254,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `_UnknownDBRevisionError` that the serve handler catches → warns +
   continues boot. Pinned by
   `tests/unit/test_compat_fixes.py::TestC2AutoMigrateUnknownRevision`.
-- **H1 — scheduler workers gated behind `Z4J_SCHEDULER_GRPC_ENABLED`.**
+- **H1 - scheduler workers gated behind `Z4J_SCHEDULER_GRPC_ENABLED`.**
   v1.0.18 shipped 3 unconditional periodic workers
   (`pending_fires_replay`, `schedule_circuit_breaker`,
   `schedule_fires_prune`) that consumed connection-pool slots.
@@ -53,63 +263,154 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   now only register when the gRPC scheduler service is opted in.
   Default-off operators get zero scheduler-worker activity. Pinned by
   `tests/unit/test_compat_fixes.py::TestH1SchedulerWorkersGated`.
-- **H2 — `SubscriptionFilters` relaxed to `extra="ignore"`.** Pre-1.0.19
+- **H2 - `SubscriptionFilters` relaxed to `extra="ignore"`.** Pre-1.1
   this Pydantic model used `extra="forbid"`, so a newer dashboard
-  bundle adding any unknown filter key would 422 against an older
-  brain. Now unknown keys are silently dropped. The two
-  security-relevant `extra="forbid"` schemas (`BulkDeleteRequest`,
-  `UserSubscriptionCreate` — both R3 audit defenses against
-  `project_id` / `user_id` smuggling) are deliberately NOT relaxed.
-  Pinned by
+  bundle adding any unknown filter key (a future `severity` field,
+  say) would 422 against an older brain. Now unknown keys are
+  silently dropped. The two security-relevant `extra="forbid"`
+  schemas (`BulkDeleteRequest`, `UserSubscriptionCreate` - both R3
+  audit defenses against `project_id` / `user_id` smuggling) are
+  deliberately NOT relaxed. Pinned by
   `tests/unit/test_compat_fixes.py::TestH2SubscriptionFiltersExtraIgnore`.
-- **M2 — SPA fallback `index.html` ships no-cache headers.**
-  Pre-1.0.19 the dashboard SPA entry point was served with default
+- **M2 - SPA fallback `index.html` ships no-cache headers.**
+  Pre-1.1 the dashboard SPA entry point was served with default
   caching, so browsers held a stale `index.html` (referencing
   hashed asset filenames that no longer existed) after a brain
   upgrade. The fallback now sends `Cache-Control: no-cache,
-  no-store, must-revalidate` — hashed assets under `/assets/` keep
+  no-store, must-revalidate` - hashed assets under `/assets/` keep
   their long-lived caching, by design. Pinned by
   `tests/unit/test_compat_fixes.py::TestM2DashboardCacheControl`.
-- **gRPC `too_many_pings` reconnect storm** (only affects operators
-  with `Z4J_SCHEDULER_GRPC_ENABLED=1`). The brain's
+- **gRPC `too_many_pings` reconnect storm.** The brain's
   `SchedulerGrpcServer` was using stock defaults for
   `keepalive_min_recv_ping_interval_without_data_ms` (300_000 ms),
   so the scheduler client's 30 s keepalive was treated as abuse and
   the server sent `GOAWAY too_many_pings` every ~150 seconds. The
   watch stream then reconnected and re-issued a full sync. Net
-  effect: 12 – 20 spurious watch reconnects per hour silently
-  churning the cache. Now sets matching server options
+  effect in production: 12-20 spurious watch reconnects per hour
+  silently churning the cache. Now sets matching server options
   (`min_recv_ping_interval_without_data_ms=10_000`,
   `http2.min_ping_interval_without_data_ms=10_000`,
-  `http2.max_ping_strikes=0`).
-- **mTLS interceptor accepted bytes-keyed AuthContext only** (only
-  affects operators with `Z4J_SCHEDULER_GRPC_ENABLED=1`).
+  `http2.max_ping_strikes=0`). 4-minute Docker soak observed 0
+  GOAWAY events post-fix vs 2 pre-fix.
+- **mTLS interceptor accepted bytes-keyed AuthContext only.**
   `_enforce_cn` looked up the peer cert under
   `auth_ctx.get(b"x509_common_name", [])`. grpc.aio 1.6+ returns
   the same logical entries under str keys, so every CN check
   silently returned `[]` and any client cert was rejected as
-  `peer CNs []`. Now looks up under both shapes and decodes
-  bytes / str values defensively. Pinned by
+  `peer CNs []`. Mirrored fix on the scheduler-side trigger
+  interceptor. Pinned by
   `tests/unit/test_scheduler_grpc.py::TestEnforceCnAuthContextShape`.
 
 ### Added
 
-- **`z4j-brain migrate sync`** — recovery escape hatch for operators
+- **Embedded scheduler sidecar (`Z4J_EMBEDDED_SCHEDULER=true`).** Brain
+  spawns `z4j-scheduler serve` as a supervised subprocess in its own
+  lifespan when the flag is set. Auto-mints loopback mTLS certs at
+  boot (operator does not have to manage cert distribution), spawns
+  the subprocess after the gRPC server binds, and supervises with
+  bounded auto-restart + graceful SIGTERM-then-SIGKILL teardown.
+  Intended for the single-container homelab deploy described in
+  `docs/SCHEDULER.md §21.3`. Operator surface: see
+  `docs/DEPLOYMENT.md §7.5.1`. Default-off (per the new contract,
+  rule #4 - every new periodic worker / supervised subprocess is
+  opt-in). Pinned by `tests/unit/test_embedded_scheduler.py`.
+- **Schedule fire-history fields surfaced on `SchedulePublic`.** The
+  REST `GET /api/v1/projects/{slug}/schedules` and
+  `GET .../schedules/{id}` payloads now carry `source`, `catch_up`,
+  and `source_hash` so the dashboard can render the "managed by"
+  badge, catch-up policy, and reconciler hash without a second
+  round-trip. Wire-protocol additive; older clients ignore the
+  fields. Schema additions in `z4j-core` 1.1.0 (`Schedule.catch_up`,
+  `Schedule.source`, `Schedule.source_hash`, `CatchUpPolicy` enum)
+  let external SDK consumers deserialize the responses cleanly.
+- **`POST /projects/{slug}/schedules:diff`** - dry-run preview of
+  the `:import` reconciler. Returns four buckets (insert / update /
+  unchanged / delete) with proposed + current shapes for each entry.
+  ADMIN-gated (mirrors `:import`); writes no audit row (audit
+  hygiene for repeated previews). Backed by a new dashboard route
+  `/projects/{slug}/schedules/reconcile` with paste-box, mode
+  selector, source filter, and color-coded result panel.
+- **`z4j-brain migrate sync`** - recovery escape hatch for operators
   who land in DB-ahead-of-code state in spite of the new contract.
   Default behavior shows the drift and refuses to act. With
   `--allow-future-schema --i-know-this-can-corrupt-data` it stamps
   the DB to the code's head and drops unknown tables. The
-  double-confirm flag is intentional — this is a recovery tool,
+  double-confirm flag is intentional - this is a recovery tool,
   not a routine operation. Documented in `docs/MIGRATIONS.md`.
 
 ### Documentation
 
-- **`docs/MIGRATIONS.md`** — the binding additive-only contract for
-  the v1.0.x line. Five rules (`server_default` for NOT NULL, no
+- **`docs/MIGRATIONS.md`** - the binding additive-only contract for
+  the v1.1.x line. Five rules (`server_default` for NOT NULL, no
+  destructive ops within a minor, new tables tolerate empty, new
+  workers / subprocesses gated behind a setting, `extra="forbid"`
+  reserved for privilege-smuggling defenses) plus the
+  `migrate sync` recovery escape hatch.
+
+### Fixed
+
+- **C1 - schema-version skew now warns instead of raising.**
+  `startup_version.check_and_update_schema_version` previously raised
+  `SchemaVersionError` if the DB's `z4j_meta.schema_version` was newer
+  than the running code, killing boot. After downgrade (1.0.18 → 1.0.17)
+  this caused systemd flap loops. Now logs a warning and continues -
+  old code can boot against forward-migrated DBs. The
+  `SchemaVersionError` class is kept as a back-compat shim for any
+  downstream import. Pinned by
+  `tests/unit/test_compat_fixes.py::TestC1SchemaVersionWarnNotRaise`.
+- **C2 - `auto-migrate` detects unknown DB head before invoking
+  alembic.** When the DB is stamped at a revision the running wheel
+  doesn't ship (downgrade scenario), alembic exited with `Can't locate
+  revision identified by '…'` and the brain flap-looped. Now
+  `_detect_unknown_db_head` pre-flights the DB's `alembic_version`
+  against the code's known revisions and raises a clean
+  `_UnknownDBRevisionError` that the serve handler catches → warns +
+  continues boot. Pinned by
+  `tests/unit/test_compat_fixes.py::TestC2AutoMigrateUnknownRevision`.
+- **H1 - scheduler workers gated behind `Z4J_SCHEDULER_GRPC_ENABLED`.**
+  v1.0.18 shipped 3 unconditional periodic workers
+  (`pending_fires_replay`, `schedule_circuit_breaker`,
+  `schedule_fires_prune`) that consumed connection-pool slots.
+  Operators reported agents flapping to "offline" after upgrade
+  because the heartbeat path couldn't get a slot. These three workers
+  now only register when the gRPC scheduler service is opted in.
+  Default-off operators get zero scheduler-worker activity. Pinned by
+  `tests/unit/test_compat_fixes.py::TestH1SchedulerWorkersGated`.
+- **H2 - `SubscriptionFilters` relaxed to `extra="ignore"`.** Pre-1.0.19
+  this Pydantic model used `extra="forbid"`, so a newer dashboard
+  bundle adding any unknown filter key (a future `severity` field,
+  say) would 422 against an older brain. Now unknown keys are
+  silently dropped. The two security-relevant `extra="forbid"`
+  schemas (`BulkDeleteRequest`, `UserSubscriptionCreate` - both R3
+  audit defenses against `project_id`/`user_id` smuggling) are
+  deliberately NOT relaxed. Pinned by
+  `tests/unit/test_compat_fixes.py::TestH2SubscriptionFiltersExtraIgnore`.
+- **M2 - SPA fallback `index.html` ships no-cache headers.**
+  Pre-1.0.19 the dashboard SPA entry point was served with default
+  caching, so browsers held a stale `index.html` (referencing
+  hashed asset filenames that no longer existed) after a brain
+  upgrade. The fallback now sends `Cache-Control: no-cache,
+  no-store, must-revalidate` - hashed assets under `/assets/` keep
+  their long-lived caching, by design. Pinned by
+  `tests/unit/test_compat_fixes.py::TestM2DashboardCacheControl`.
+
+### Added
+
+- **`z4j-brain migrate sync`** - recovery escape hatch for operators
+  who land in DB-ahead-of-code state in spite of the new contract.
+  Default behavior shows the drift and refuses to act. With
+  `--allow-future-schema --i-know-this-can-corrupt-data` it stamps
+  the DB to the code's head and drops unknown tables. The
+  double-confirm flag is intentional - this is a recovery tool,
+  not a routine operation. Documented in `docs/MIGRATIONS.md`.
+
+### Documentation
+
+- **`docs/MIGRATIONS.md`** - the binding additive-only contract for
+  the v1.0.x line. Five rules (server_default for NOT NULL, no
   destructive ops within a minor, new tables tolerate empty, new
   workers gated behind a setting, `extra="forbid"` reserved for
-  privilege-smuggling defenses) plus the `migrate sync` recovery
-  escape hatch.
+  privilege-smuggling defenses) plus the recovery escape hatch.
 
 ## [1.0.18] - 2026-04-27
 
@@ -137,13 +438,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   covering add-channel-to-existing, partial cooldown, trigger
   rename, trigger collision 409, foreign-channel 409, IDOR 404,
   empty-noop).
-- **`GET /api/v1/user/deliveries`** — personal delivery history
+- **`GET /api/v1/user/deliveries`** - personal delivery history
   across all of the user's projects. Mirror of the project-scoped
   `/projects/{slug}/notifications/deliveries` audit log, scoped to
   the calling user via a join to `user_subscriptions.user_id`.
   Cursor-paginated (50/page) with optional `?project_slug=` filter
   to narrow to one project. Includes deliveries from projects the
-  user is no longer a member of — historical audit data outlives
+  user is no longer a member of - historical audit data outlives
   membership. The dashboard renders ex-membership rows with a
   "you left this project" badge so the row reads honestly. Pinned
   by `tests/unit/test_user_deliveries_and_sub_edit.py::TestUserDeliveries`
@@ -153,7 +454,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Filter parity between personal subscriptions and project
   defaults.** The backend `SubscriptionFilters` schema has
   supported `priority`, `task_name_pattern`, and `queue` since
-  v1.0.x — but the dashboard exposed only some of them on each
+  v1.0.x - but the dashboard exposed only some of them on each
   surface. v1.0.18 adds the missing inputs:
   - **Project defaults dialog** gained `priority`,
     `task_name_pattern`, AND `queue` filter inputs (none of the
@@ -181,7 +482,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Notification settings reorganized into role-based hubs (Option C).**
   Pre-1.0.18 the dashboard exposed five separate notification routes
-  whose ownership was confusing — was "Channels" personal or
+  whose ownership was confusing - was "Channels" personal or
   shared? The two channel pages were 1252+1256 lines of nearly
   duplicated UI. v1.0.18 collapses them by ROLE:
   - `/settings/notifications` becomes the **"Global Notifications"**
@@ -190,7 +491,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `/projects/{slug}/settings/notifications` becomes the
     **"Project Notifications"** hub (admin-gated) with three
     tabs: *Project Channels* + *Default Subscriptions* + *Delivery
-    Log*. Project-scope, admin-only — non-admin members no
+    Log*. Project-scope, admin-only - non-admin members no
     longer see this entry in the project sidebar at all.
   - The five old route URLs (`/settings/channels`, `/projects/{slug}/settings/providers`,
     `/projects/{slug}/settings/defaults`, `/projects/{slug}/settings/deliveries`,
@@ -204,7 +505,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`NotificationDeliveryRepository.list_for_project` cursor fix.**
   The encoded next-cursor used to point at the OVERFLOW row
   (the `limit + 1`th fetch), but the WHERE predicate is strict
-  `sent_at < cursor` — so each page boundary silently skipped
+  `sent_at < cursor` - so each page boundary silently skipped
   one row. v1.0.18 encodes the LAST visible row of the current
   page; page 2 then starts with what was previously the overflow,
   exactly as paging is intended. Same fix applied to the new
@@ -215,7 +516,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Compatibility
 
 - Backwards compatible. Existing API consumers see no breaking
-  changes — every old endpoint URL still works (PATCH gained
+  changes - every old endpoint URL still works (PATCH gained
   optional fields, DeliveryPublic gained an optional
   `project_id` field).
 - Old dashboard bookmarks survive via permanent client-side
@@ -225,7 +526,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `/projects/{slug}/settings/defaults` → `?tab=defaults`
   `/projects/{slug}/settings/deliveries` → `?tab=deliveries`
 - Non-admin project members lose visibility of the project
-  Notifications sidebar entry (every tab inside is admin-only —
+  Notifications sidebar entry (every tab inside is admin-only -
   members manage their notifications from the personal hub).
   This is a deliberate de-clutter, not a permission change.
 - No DB migrations. No env changes. Operator action: `pip install
@@ -338,7 +639,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - is dialect-aware (Postgres + SQLite ≥3.24 native
     `ON CONFLICT DO UPDATE`; falls back to the original per-row
     path for any other dialect);
-  - preserves "no key, no touch" semantics — a heartbeat-only
+  - preserves "no key, no touch" semantics - a heartbeat-only
     batch carrying just `last_heartbeat` + `state` does not
     blank `hostname` / `concurrency` from an earlier
     `worker_details` batch;
@@ -417,7 +718,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Compatibility
 
 - Backwards compatible. The P-1 batched-upsert path is
-  internally transparent — same write semantics, fewer SQL
+  internally transparent - same write semantics, fewer SQL
   round-trips.
 - Schema additions auto-apply on `z4j-brain serve`; no
   operator action required.
@@ -437,7 +738,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   **Operator action on upgrade from 1.0.13:**
 
-  If your brain runs behind a reverse proxy (Cloudflare Tunnel / Caddy / nginx / Traefik) — most deployments — set three env vars in your systemd unit (or wherever you set process env):
+  If your brain runs behind a reverse proxy (Cloudflare Tunnel / Caddy / nginx / Traefik) - most deployments - set three env vars in your systemd unit (or wherever you set process env):
 
   ```ini
   [Service]
@@ -446,7 +747,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Environment=Z4J_ALLOWED_HOSTS=["tasks.example.com"]
   ```
 
-  Then `sudo systemctl daemon-reload && sudo systemctl restart z4j`. **Existing dashboard sessions will be invalidated** because the cookie name changes from `z4j_session` to `__Host-z4j_session` (browser-enforced isolation in production mode). Users will need to log in again — one-time.
+  Then `sudo systemctl daemon-reload && sudo systemctl restart z4j`. **Existing dashboard sessions will be invalidated** because the cookie name changes from `z4j_session` to `__Host-z4j_session` (browser-enforced isolation in production mode). Users will need to log in again - one-time.
 
   See [/operations/dev-vs-production/](https://z4j.dev/operations/dev-vs-production/) for the full migration guide including homelab-on-LAN and loopback-only paths.
 
@@ -463,32 +764,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - `z4j metrics-token` now accepts subcommands (`show` and `rotate`). Bare `z4j metrics-token` still prints the token (defaults to `show`), so existing scripts continue to work unchanged.
-- **`z4j --version` and `z4j -V` now print the version**, matching the standard Python CLI convention. The bare `z4j` (no subcommand) and `z4j version` paths still work — the new flags are additive. `-v` (lowercase) is intentionally NOT bound so it stays free for a future `--verbose` flag, matching pip / docker / kubectl.
+- **`z4j --version` and `z4j -V` now print the version**, matching the standard Python CLI convention. The bare `z4j` (no subcommand) and `z4j version` paths still work - the new flags are additive. `-v` (lowercase) is intentionally NOT bound so it stays free for a future `--verbose` flag, matching pip / docker / kubectl.
 
-### Security audit pass — 2026-04-26
+### Security audit pass - 2026-04-26
 
-Following Codex's audit hardening wave (also folded into this release), an independent three-axis audit was run against the v1.0.14 surface plus the rest of the brain (channels / IDOR / N+1 + DoS). Every Critical, High, Medium, and most Low findings are closed in this release. One pure-perf finding (heartbeat handler N+1 — pre-existing through 1.0.5–1.0.13) is deferred to v1.0.15 with dedicated concurrent-load regression tests.
+Following Codex's audit hardening wave (also folded into this release), an independent three-axis audit was run against the v1.0.14 surface plus the rest of the brain (channels / IDOR / N+1 + DoS). Every Critical, High, Medium, and most Low findings are closed in this release. One pure-perf finding (heartbeat handler N+1 - pre-existing through 1.0.5-1.0.13) is deferred to v1.0.15 with dedicated concurrent-load regression tests.
 
 #### Notification audit log secret-leakage hardening (HIGH)
 
-- **`notification_deliveries.error` no longer leaks channel webhook URLs.** Slack / Discord / Telegram URLs embed the secret in the path (`hooks.slack.com/services/T../B../<secret>`, `discord.com/api/webhooks/<id>/<token>`, `api.telegram.org/bot<TOKEN>/...`). When `httpx` raised a timeout / DNS error its `__str__` included the full URL, which got persisted verbatim into `notification_deliveries.error[:1024]` and surfaced via `GET /deliveries` to any project admin — defeating the masking that `_mask_config` applied on `GET /channels`. New `domain.notifications.sanitize.sanitize_audit_text` scrubs the channel's `webhook_url` / `bot_token` / `integration_key` substrings from `error` and `response_body` before either persistence path writes (test-dispatch + real-event dispatch).
-- **`notification_deliveries.response_body` no longer stores hostile attacker bytes verbatim.** A malicious webhook target could plant phishing HTML / JS / fake CSRF tokens in its 200 response; the body got stored unsanitized and rendered on the Delivery Log page. Sanitizer strips control characters (`\x00`–`\x1f` except tab/CR/LF), enforces a 2 KB cap, and the dashboard already escapes via React text rendering — defense in depth at the write layer.
+- **`notification_deliveries.error` no longer leaks channel webhook URLs.** Slack / Discord / Telegram URLs embed the secret in the path (`hooks.slack.com/services/T../B../<secret>`, `discord.com/api/webhooks/<id>/<token>`, `api.telegram.org/bot<TOKEN>/...`). When `httpx` raised a timeout / DNS error its `__str__` included the full URL, which got persisted verbatim into `notification_deliveries.error[:1024]` and surfaced via `GET /deliveries` to any project admin - defeating the masking that `_mask_config` applied on `GET /channels`. New `domain.notifications.sanitize.sanitize_audit_text` scrubs the channel's `webhook_url` / `bot_token` / `integration_key` substrings from `error` and `response_body` before either persistence path writes (test-dispatch + real-event dispatch).
+- **`notification_deliveries.response_body` no longer stores hostile attacker bytes verbatim.** A malicious webhook target could plant phishing HTML / JS / fake CSRF tokens in its 200 response; the body got stored unsanitized and rendered on the Delivery Log page. Sanitizer strips control characters (`\x00`-`\x1f` except tab/CR/LF), enforces a 2 KB cap, and the dashboard already escapes via React text rendering - defense in depth at the write layer.
 - **SSRF probe error strings no longer leak internal-network DNS.** Rejection messages like `"target IP 10.0.0.5 is in blocked range 10.0.0.0/8"` used to let an admin enumerate internal-network DNS records via the audit log. Now collapsed to `"target rejected by policy"` in persisted/returned text; resolved IPs only land in operator-facing structlog. Private IP regex (`10.x`, `172.16-31.x`, `192.168.x`, `169.254.x`, `127.x`) is also masked as `<private-ip>` for any leaked address that escapes the SSRF-pattern collapse.
 
 #### `metrics-token rotate` hardening (MEDIUM)
 
-- **Atomic file creation.** Pre-1.0.14 used `Path.write_text` which created the temp file with the process umask (typically `0o644`) then narrowed to `0o600` via `chmod` — a small race window where any local user could read the new bearer from `~/.z4j/secret.env.rotate-tmp`. Now uses `os.open(tmp, O_WRONLY|O_CREAT|O_EXCL, 0o600)` so the file is created with the right mode from the start. The `chmod` follow-up still fires (defense in depth on systems with weird umask interactions) and now warns to stderr instead of silently swallowing failures.
-- **Structured log line on rotate** for ops-team correlation — previously rotates were silent, now they emit a `metrics_token_rotated` info-level log with `secret_env` path + uid.
+- **Atomic file creation.** Pre-1.0.14 used `Path.write_text` which created the temp file with the process umask (typically `0o644`) then narrowed to `0o600` via `chmod` - a small race window where any local user could read the new bearer from `~/.z4j/secret.env.rotate-tmp`. Now uses `os.open(tmp, O_WRONLY|O_CREAT|O_EXCL, 0o600)` so the file is created with the right mode from the start. The `chmod` follow-up still fires (defense in depth on systems with weird umask interactions) and now warns to stderr instead of silently swallowing failures.
+- **Structured log line on rotate** for ops-team correlation - previously rotates were silent, now they emit a `metrics_token_rotated` info-level log with `secret_env` path + uid.
 
 #### PagerDuty `severity_map` validator hardening (MEDIUM)
 
 - Validator now asserts `severity_map` keys are strings AND match the canonical trigger pattern (`task.failed` / `agent.online` / `test.dispatch` / etc.). Pre-1.0.14 the loop accepted any key type; a stored config with `None` / int / bool keys would crash the dispatcher mid-loop on string ops elsewhere.
-- `severity_map` capped at 32 entries — well above z4j's ~6 trigger types with headroom.
+- `severity_map` capped at 32 entries - well above z4j's ~6 trigger types with headroom.
 
 #### `clear_deliveries` audit + retention (LOW)
 
 - Every `DELETE /api/v1/projects/{slug}/notifications/deliveries` writes one row to the brain audit log (`notifications.deliveries.clear` action) before the delete. Pre-1.0.14 a rogue admin could silently wipe the delivery audit log to cover the trail of a sensitive test dispatch. Audit row carries actor + deleted count + optional `before` timestamp.
-- New `?before=<iso8601>` query parameter on the same endpoint — lets future retention-policy automation delete only rows older than N days without wiping recent debugging history. Default behavior (omit `before`) unchanged.
+- New `?before=<iso8601>` query parameter on the same endpoint - lets future retention-policy automation delete only rows older than N days without wiping recent debugging history. Default behavior (omit `before`) unchanged.
 
 #### Channel-name snapshot in delivery rows (LOW)
 
@@ -496,21 +797,21 @@ Following Codex's audit hardening wave (also folded into this release), an indep
 
 #### Defense-in-depth: import endpoints (LOW)
 
-- `import_from_user` and `import_from_project` now `copy.deepcopy` the source channel's `config` instead of `dict(...)` (shallow copy). Closes a future-aliasing bug class where nested dicts (`headers`, `severity_map`) shared references between source and imported channel — a PATCH on the source could leak into the imported copy via the shared reference if SQLAlchemy's `MutableDict` were ever added to the JSON column.
+- `import_from_user` and `import_from_project` now `copy.deepcopy` the source channel's `config` instead of `dict(...)` (shallow copy). Closes a future-aliasing bug class where nested dicts (`headers`, `severity_map`) shared references between source and imported channel - a PATCH on the source could leak into the imported copy via the shared reference if SQLAlchemy's `MutableDict` were ever added to the JSON column.
 
 #### Performance + DoS hardening (HIGH/MEDIUM)
 
-- **`task_name_pattern` ReDoS guard.** `fnmatch` on a hostile pattern like `"a*a*a*a*a*a*a*a*a*a*b"` is catastrophically backtracking on long inputs. The filter runs synchronously per event in the WS frame ingest path — one bad subscription DoSed event ingestion across all tenants on the worker. Pydantic validator now rejects patterns with > 5 wildcards or > 3 character classes; runtime guard in `NotificationService._matches_filters` skips the match (and logs) for stale subscriptions whose stored pattern slips past the validator (defense for pre-1.0.14 rows).
+- **`task_name_pattern` ReDoS guard.** `fnmatch` on a hostile pattern like `"a*a*a*a*a*a*a*a*a*a*b"` is catastrophically backtracking on long inputs. The filter runs synchronously per event in the WS frame ingest path - one bad subscription DoSed event ingestion across all tenants on the worker. Pydantic validator now rejects patterns with > 5 wildcards or > 3 character classes; runtime guard in `NotificationService._matches_filters` skips the match (and logs) for stale subscriptions whose stored pattern slips past the validator (defense for pre-1.0.14 rows).
 - **DNS resolve in validators wrapped in `asyncio.wait_for(5.0)`.** Previously a slow / black-holed DNS server could pin a REST handler for the OS resolver's full retry budget (~30s). The 5s hard cap is well above legit DNS round-trip; a timeout caches the negative result for the same window so a flood of requests for a bad host doesn't multiply the wait.
-- **Notification dispatch detached from WS receive loop.** Pre-1.0.14 each `evaluate_and_dispatch` call awaited up to 16 concurrent HTTP deliveries with a 10s timeout *inside* the agent receive loop — a 50-event burst with email subscriptions could pin the WS frame handler for tens of seconds, dropping the agent's heartbeat clock. Now each evaluation runs in a detached `asyncio.Task` with its own DB session; the FrameRouter holds strong references to defeat GC + logs unhandled exceptions via done-callback. Backpressure cap of 256 in-flight tasks per connection prevents an event flood from spawning unbounded background work.
+- **Notification dispatch detached from WS receive loop.** Pre-1.0.14 each `evaluate_and_dispatch` call awaited up to 16 concurrent HTTP deliveries with a 10s timeout *inside* the agent receive loop - a 50-event burst with email subscriptions could pin the WS frame handler for tens of seconds, dropping the agent's heartbeat clock. Now each evaluation runs in a detached `asyncio.Task` with its own DB session; the FrameRouter holds strong references to defeat GC + logs unhandled exceptions via done-callback. Backpressure cap of 256 in-flight tasks per connection prevents an event flood from spawning unbounded background work.
 - **Rate limits on test / import / bulk endpoints.** New per-IP throttle buckets:
-  - `channel-test` (20/min) — `/channels/test`, `/channels/{id}/test`, `/user/channels/test`, `/user/channels/{id}/test`
-  - `channel-import` (30/min) — `/channels/import_from_user`, `/user/channels/import_from_project`
-  - `bulk-action` (10/min) — `/tasks/bulk-delete`, `/commands/bulk-retry`, `/commands/purge-queue`, `/schedules/{id}/trigger`
+  - `channel-test` (20/min) - `/channels/test`, `/channels/{id}/test`, `/user/channels/test`, `/user/channels/{id}/test`
+  - `channel-import` (30/min) - `/channels/import_from_user`, `/user/channels/import_from_project`
+  - `bulk-action` (10/min) - `/tasks/bulk-delete`, `/commands/bulk-retry`, `/commands/purge-queue`, `/schedules/{id}/trigger`
 - **List-endpoint LIMIT caps.** `/agents`, `/workers`, `/channels` now enforce a server-side `limit` (default 500, max 5000) instead of returning the entire project's rows. Defends against unbounded result sets in projects with churning rows.
-- **Channel `config` size capped at 16 KiB JSON-serialized** at the pydantic boundary on every channel write path (`ChannelCreate`, `ChannelUpdate`, `ChannelTestRequest`, `UserChannelCreate`, `UserChannelUpdate`). Realistic configs are ~1–4 KiB; 16 KiB is comfortably above legit needs and rejects abusive 1 MiB payloads before they hit the DB.
+- **Channel `config` size capped at 16 KiB JSON-serialized** at the pydantic boundary on every channel write path (`ChannelCreate`, `ChannelUpdate`, `ChannelTestRequest`, `UserChannelCreate`, `UserChannelUpdate`). Realistic configs are ~1-4 KiB; 16 KiB is comfortably above legit needs and rejects abusive 1 MiB payloads before they hit the DB.
 - **Tasks export ceiling lowered from 5 000 000 → 100 000 rows** (`Z4J_TASKS_EXPORT_MAX_ROWS`). Pre-1.0.14 a single export could materialize hundreds of MB of task rows + their JSONB blobs in Python memory. Streaming-cursor rewrite tracked for v1.1.x.
-- **`dashboard_hub` PostgreSQL NOTIFY fan-out tasks held by strong refs + done-callback** — pre-1.0.14 fire-and-forget `asyncio.create_task` could be GC'd mid-flight per asyncio docs, swallowing exceptions silently. Mirrors the pattern already used by `registry/postgres_notify.py`.
+- **`dashboard_hub` PostgreSQL NOTIFY fan-out tasks held by strong refs + done-callback** - pre-1.0.14 fire-and-forget `asyncio.create_task` could be GC'd mid-flight per asyncio docs, swallowing exceptions silently. Mirrors the pattern already used by `registry/postgres_notify.py`.
 
 #### Bonus: pre-existing bug fix
 

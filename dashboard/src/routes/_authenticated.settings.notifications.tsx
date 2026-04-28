@@ -1,83 +1,84 @@
 /**
- * Personal Notifications hub - "Global Notifications" page (v1.0.18).
+ * Personal Notifications hub - "Global Notifications" page.
  *
- * Combines what used to be three separate routes into one tabbed
- * page so the user has ONE place to manage everything notification-
- * receiving across all their projects:
+ * v1.0.18: collapsed three separate routes into one tabbed page so
+ * the user has ONE place to manage everything notification-receiving
+ * across all their projects (channels / subscriptions / delivery
+ * history).
  *
- *   - Tab "My Channels"           (was /settings/channels)
- *   - Tab "My Subscriptions"      (was /settings/notifications, now with edit)
- *   - Tab "My Delivery History"   (NEW — personal audit log across projects)
+ * v1.1.0: tabs are now path-based instead of query-string-based:
  *
- * Old URLs redirect here with the appropriate ``?tab=`` so old
- * bookmarks survive forever (notifications/channels redirect file
- * also lives in this routes directory).
+ *   /settings/notifications/channels       (Global Channels)
+ *   /settings/notifications/subscriptions  (Global Subscriptions)
+ *   /settings/notifications/deliveries     (Global Notification Log)
+ *
+ * Bare ``/settings/notifications`` redirects to ``/subscriptions``.
+ * Old ``?tab=X`` URLs are redirected by the index route so existing
+ * bookmarks survive.
  *
  * The mirror page on the project side
  * (``_authenticated.projects.$slug.settings.notifications.tsx``) is
- * admin-only and combines Project Channels + Default Subscriptions
- * + Delivery Log under "Project Notifications".
+ * admin-only and follows the same path-based tab structure.
  */
-import { createFileRoute, useSearch } from "@tanstack/react-router";
-import { z } from "zod";
+import { createFileRoute, Link, Outlet, useRouterState } from "@tanstack/react-router";
 import { PageHeader } from "@/components/domain/page-header";
-import {
-  Tabs,
-  TabsContent,
-  TabsList,
-  TabsTrigger,
-} from "@/components/ui/tabs";
-import { MyChannelsTab } from "@/components/notifications/my-channels-tab";
-import { MyDeliveriesTab } from "@/components/notifications/my-deliveries-tab";
-import { MySubscriptionsTab } from "@/components/notifications/my-subscriptions-tab";
-
-const TABS = ["channels", "subscriptions", "deliveries"] as const;
-type TabValue = (typeof TABS)[number];
-
-const searchSchema = z.object({
-  tab: z.enum(TABS).optional(),
-});
+import { cn } from "@/lib/utils";
 
 export const Route = createFileRoute("/_authenticated/settings/notifications")({
-  validateSearch: searchSchema,
-  component: GlobalNotificationsPage,
+  component: GlobalNotificationsLayout,
 });
 
-function GlobalNotificationsPage() {
-  const search = useSearch({ from: Route.id });
-  const navigate = Route.useNavigate();
-  const activeTab: TabValue = search.tab ?? "subscriptions";
+function GlobalNotificationsLayout() {
+  // Path-driven tab highlight: read the active path segment so the
+  // current child route's tab is visually selected. ``useRouterState``
+  // re-renders on navigation so the highlight stays in sync as the
+  // user clicks between tabs.
+  const pathname = useRouterState({ select: (s) => s.location.pathname });
+  const segments = pathname.split("/").filter(Boolean);
+  const activeSegment = segments[segments.length - 1];
+
+  const tabClass = (isActive: boolean) =>
+    cn(
+      "border-b-2 px-1 py-2 text-sm font-medium transition-colors",
+      isActive
+        ? "border-primary text-foreground"
+        : "border-transparent text-muted-foreground hover:border-border hover:text-foreground",
+    );
 
   return (
     <div className="space-y-6">
       <PageHeader
         title="Global Notifications"
-        description="Personal notification settings that follow you across every project — your channels, your subscriptions, and the full history of alerts that landed in your inbox."
+        description="Personal notification settings that follow you across every project — your channels, your subscriptions, and the full log of notifications that landed in your inbox."
       />
-      <Tabs
-        value={activeTab}
-        onValueChange={(v) =>
-          navigate({
-            search: { tab: v as TabValue },
-            replace: true,
-          })
-        }
-      >
-        <TabsList>
-          <TabsTrigger value="subscriptions">My Subscriptions</TabsTrigger>
-          <TabsTrigger value="channels">My Channels</TabsTrigger>
-          <TabsTrigger value="deliveries">My Delivery History</TabsTrigger>
-        </TabsList>
-        <TabsContent value="subscriptions" className="mt-4">
-          <MySubscriptionsTab />
-        </TabsContent>
-        <TabsContent value="channels" className="mt-4">
-          <MyChannelsTab />
-        </TabsContent>
-        <TabsContent value="deliveries" className="mt-4">
-          <MyDeliveriesTab />
-        </TabsContent>
-      </Tabs>
+      <div className="border-b">
+        <nav className="-mb-px flex gap-4" aria-label="Notification settings">
+          <Link
+            to="/settings/notifications/channels"
+            replace
+            className={tabClass(activeSegment === "channels")}
+          >
+            Global Channels
+          </Link>
+          <Link
+            to="/settings/notifications/subscriptions"
+            replace
+            className={tabClass(activeSegment === "subscriptions")}
+          >
+            Global Subscriptions
+          </Link>
+          <Link
+            to="/settings/notifications/deliveries"
+            replace
+            className={tabClass(activeSegment === "deliveries")}
+          >
+            Global Notification Log
+          </Link>
+        </nav>
+      </div>
+      <div className="mt-4">
+        <Outlet />
+      </div>
     </div>
   );
 }

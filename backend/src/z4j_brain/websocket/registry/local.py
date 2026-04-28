@@ -68,8 +68,35 @@ class LocalRegistry:
             self._connections[agent_id] = ws
             self._project_for_agent[agent_id] = project_id
 
-    async def unregister(self, agent_id: UUID) -> None:
+    async def unregister(
+        self,
+        agent_id: UUID,
+        *,
+        ws: "WebSocket | None" = None,
+    ) -> None:
+        """Drop ``agent_id`` from the registry.
+
+        Round-7 audit fix R7-HIGH (race) (Apr 2026): callers should
+        pass the ``ws`` they're tearing down so we only remove the
+        registry entry IF that exact WebSocket is still the one
+        registered. Pre-fix sequence: agent reconnects → ``register``
+        replaces the old WS with the new and force-closes the old
+        → the old gateway's ``finally`` calls ``unregister(agent_id)``
+        which unconditionally pops the NEW connection. The freshly
+        connected agent then appears offline until the next
+        reconcile sweep, and commands take the slow NOTIFY/timeout
+        path. Identity check fixes it.
+
+        ``ws=None`` keeps the legacy "drop unconditionally" behaviour
+        for callers that don't track the ws (e.g. shutdown).
+        """
         async with self._lock:
+            if ws is not None:
+                current = self._connections.get(agent_id)
+                if current is not ws:
+                    # The new connection has already replaced this one;
+                    # leave the registry entry intact.
+                    return
             self._connections.pop(agent_id, None)
             self._project_for_agent.pop(agent_id, None)
 

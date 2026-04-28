@@ -97,12 +97,27 @@ class TestStatus:
 
 @pytest.mark.asyncio
 class TestForm:
-    async def test_form_served_in_first_boot(self, client) -> None:
+    async def test_form_served_in_first_boot(
+        self, client, fresh_token,  # noqa: ARG002 - just need the row minted
+    ) -> None:
+        # Round-9 audit fix R8-Bootstrap-MED test update (Apr 2026):
+        # the form is now also gated on an active token row
+        # existing. ``fresh_token`` mints one; the form's JS still
+        # reads the token from window.location, so the value passed
+        # in the URL is irrelevant to the gate.
         r = await client.get("/setup?token=anything")
         assert r.status_code == 200
         assert "z4j first-boot setup" in r.text
         assert r.headers.get("content-security-policy") is not None
         assert r.headers.get("referrer-policy") == "no-referrer"
+
+    async def test_form_404_when_no_active_token(self, client) -> None:
+        # Round-9 audit fix R8-Bootstrap-MED (Apr 2026): even in
+        # first-boot state, refuse the form when no token row
+        # exists — the operator either hasn't restarted to mint
+        # one or the prior token expired without consumption.
+        r = await client.get("/setup?token=anything")
+        assert r.status_code == 404
 
     async def test_form_404_after_first_boot(self, client, fresh_token) -> None:
         # Complete setup first.

@@ -865,10 +865,19 @@ async def _send_password_reset_email(
     )
 
     logger = logging.getLogger("z4j.brain.auth.password_reset")
+    # Round-9 audit fix R9-Auth-MED (Apr 2026): place the token
+    # in the URL FRAGMENT rather than the query string. The
+    # fragment is never sent in the Referer header to third-party
+    # assets on the reset page, never written to server-side
+    # access logs, and is excluded from most browser-history
+    # sync mechanisms. The reset page's JS reads it via
+    # ``window.location.hash`` and POSTs it with the form. Same
+    # 256-bit token, same TTL — just shifted to a header / cache
+    # surface that doesn't leak.
     accept_url = (
-        f"{settings.public_url.rstrip('/')}/reset?token={plaintext_token}"
+        f"{settings.public_url.rstrip('/')}/reset#token={plaintext_token}"
         if getattr(settings, "public_url", None)
-        else f"/reset?token={plaintext_token}"
+        else f"/reset#token={plaintext_token}"
     )
     subject = "z4j: password reset requested"
     email_body = (
@@ -965,6 +974,15 @@ async def password_reset_confirm(
         raise NotFoundError("invalid_or_expired")
 
     hasher = PasswordHasher(settings)
+    # Round-9 audit fix R9-Auth-H1 (Apr 2026): enforce the password
+    # policy on reset-confirm. Pre-fix this call site went straight
+    # to ``hasher.hash`` while every OTHER write path
+    # (``setup_service.complete``, ``change_password``,
+    # ``invitations.accept``) called ``validate_policy`` first. An
+    # attacker who phished a reset link could land any 8-char
+    # password on the account — Pydantic enforced ``min_length=8``
+    # but nothing else. Now mirrors ``change_password`` exactly.
+    hasher.validate_policy(body.new_password)
     new_hash = hasher.hash(body.new_password)
 
     # Correct repo signatures (audit H1: earlier code used wrong

@@ -320,11 +320,18 @@ class TestBadInputShapes:
         )
 
     @pytest.mark.asyncio
-    async def test_unknown_filter_field_returns_422(
+    async def test_unknown_filter_field_silently_dropped(
         self, settings: Settings, brain_app,
     ) -> None:
-        # SubscriptionFilters has extra="forbid"; an unknown filter
-        # key should be 422 not 500.
+        """v1.0.19 H2 fix: ``SubscriptionFilters`` switched from
+        ``extra="forbid"`` to ``extra="ignore"`` so a newer dashboard
+        sending a future filter key against an older brain doesn't
+        422. Unknown keys are silently dropped at validate time;
+        the created row carries only the keys the brain knows
+        about. Pinned by
+        ``test_compat_fixes.py::TestH2SubscriptionFiltersExtraIgnore``;
+        this test is the project-defaults companion check.
+        """
         seed = await _seed(brain_app, settings)
         async with _client(brain_app, settings, seed) as client:
             r = await client.post(
@@ -334,10 +341,14 @@ class TestBadInputShapes:
                     "in_app": True,
                     "project_channel_ids": [],
                     "cooldown_seconds": 300,
-                    "filters": {"made_up_field": "x"},
+                    "filters": {"made_up_field": "x", "priority": ["high"]},
                 },
             )
-        assert r.status_code == 422, (
-            f"unknown filter key should be 422, got "
-            f"{r.status_code}: {r.text}"
+        assert r.status_code in (200, 201), (
+            f"unknown filter key should be silently dropped (v1.0.19 H2), "
+            f"got {r.status_code}: {r.text}"
         )
+        body = r.json()
+        # The known key survived; the unknown key was stripped.
+        assert body.get("filters", {}).get("priority") == ["high"]
+        assert "made_up_field" not in body.get("filters", {})

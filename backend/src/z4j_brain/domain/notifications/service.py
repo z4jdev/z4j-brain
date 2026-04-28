@@ -534,7 +534,32 @@ class NotificationService:
                     error=result.error,
                 )
 
-        return list(await asyncio.gather(*(_run(p) for p in pending)))
+        # Round-8 audit fix R8-Async-MED (Apr 2026): use
+        # ``return_exceptions=True`` so a CancelledError on one
+        # leg doesn't sibling-cancel every other in-flight HTTP
+        # request mid-pin-IP / SNI handshake (those leak
+        # connections under abrupt cancel). ``_run`` already
+        # catches every per-leg ``Exception`` and returns a
+        # _DeliveryOutcome; the only remaining unhandled raise is
+        # CancelledError, which we coerce to a synthetic outcome.
+        results = await asyncio.gather(
+            *(_run(p) for p in pending), return_exceptions=True,
+        )
+        coerced: list[_DeliveryOutcome] = []
+        for idx, item in enumerate(results):
+            if isinstance(item, _DeliveryOutcome):
+                coerced.append(item)
+            else:
+                # Either CancelledError or an unexpected exception
+                # leak. Surface it as a failed delivery.
+                coerced.append(
+                    _DeliveryOutcome(
+                        pending=pending[idx],
+                        success=False,
+                        error=f"{type(item).__name__}: {item}",
+                    ),
+                )
+        return coerced
 
     # ------------------------------------------------------------------
     # Membership materialization (called when a user joins a project).

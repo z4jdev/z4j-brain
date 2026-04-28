@@ -106,32 +106,65 @@ class AgentRepository(BaseRepository[Agent]):
         ``host.name`` next to the mint-time agent name.
         """
         now = datetime.now(UTC)
-        # Read-modify-write the JSONB metadata column so we don't trample
-        # other keys a future feature might add. Single round-trip via a
-        # SELECT-then-UPDATE is fine here - mark_online runs once per
-        # agent connection, not per frame.
+        # Round-7 audit fix R7-LOW (race) (Apr 2026): use Postgres
+        # ``jsonb_set`` so the metadata write is a single atomic UPDATE
+        # instead of SELECT-then-UPDATE. The previous RMW could lose
+        # concurrent updates from a NAT-bounce double-reconnect (both
+        # sessions read the same baseline, the loser's write overwrites
+        # the winner's). On SQLite (no jsonb_set) we fall back to the
+        # legacy RMW path — the dev DB is single-writer so no race.
         if host:
-            row = await self.session.execute(
-                select(Agent.agent_metadata).where(Agent.id == agent_id),
+            host_payload = dict(host)
+            dialect = (
+                self.session.bind.dialect.name
+                if self.session.bind is not None else ""
             )
-            current_meta = row.scalar_one_or_none() or {}
-            new_meta = dict(current_meta)
-            new_meta["host"] = dict(host)
-            await self.session.execute(
-                update(Agent)
-                .where(Agent.id == agent_id)
-                .values(
-                    state=AgentState.ONLINE,
-                    last_connect_at=now,
-                    last_seen_at=now,
-                    protocol_version=protocol_version,
-                    framework_adapter=framework_adapter,
-                    engine_adapters=engine_adapters,
-                    scheduler_adapters=scheduler_adapters,
-                    capabilities=capabilities,
-                    agent_metadata=new_meta,
-                ),
-            )
+            if dialect == "postgresql":
+                from sqlalchemy import text as _text  # noqa: PLC0415
+
+                await self.session.execute(
+                    update(Agent)
+                    .where(Agent.id == agent_id)
+                    .values(
+                        state=AgentState.ONLINE,
+                        last_connect_at=now,
+                        last_seen_at=now,
+                        protocol_version=protocol_version,
+                        framework_adapter=framework_adapter,
+                        engine_adapters=engine_adapters,
+                        scheduler_adapters=scheduler_adapters,
+                        capabilities=capabilities,
+                        agent_metadata=_text(
+                            "jsonb_set("
+                            "COALESCE(agent_metadata, '{}'::jsonb), "
+                            "'{host}', :host_json::jsonb, true)"
+                        ).bindparams(
+                            host_json=__import__("json").dumps(host_payload),
+                        ),
+                    ),
+                )
+            else:
+                row = await self.session.execute(
+                    select(Agent.agent_metadata).where(Agent.id == agent_id),
+                )
+                current_meta = row.scalar_one_or_none() or {}
+                new_meta = dict(current_meta)
+                new_meta["host"] = host_payload
+                await self.session.execute(
+                    update(Agent)
+                    .where(Agent.id == agent_id)
+                    .values(
+                        state=AgentState.ONLINE,
+                        last_connect_at=now,
+                        last_seen_at=now,
+                        protocol_version=protocol_version,
+                        framework_adapter=framework_adapter,
+                        engine_adapters=engine_adapters,
+                        scheduler_adapters=scheduler_adapters,
+                        capabilities=capabilities,
+                        agent_metadata=new_meta,
+                    ),
+                )
         else:
             await self.session.execute(
                 update(Agent)

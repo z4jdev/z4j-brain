@@ -258,3 +258,146 @@ class TestReadRequiredPem:
         f = tmp_path / "ok.pem"
         f.write_bytes(b"-----BEGIN CERTIFICATE-----\n")
         assert _read_required_pem(str(f), "X") == f.read_bytes()
+
+
+# =====================================================================
+# Reconnect on stale-channel error (v1.1.0)
+# =====================================================================
+
+
+class TestReconnectOnStaleChannel:
+    """If the scheduler restarts, the cached gRPC channel goes stale
+    and the next call returns UNAVAILABLE / DEADLINE_EXCEEDED. The
+    client closes the dead channel, opens a fresh one, and retries
+    exactly once. Other status codes propagate.
+    """
+
+    @pytest.mark.asyncio
+    async def test_unavailable_triggers_reconnect_and_retry(
+        self, tmp_path: Path,
+    ) -> None:
+        import grpc
+
+        cert = tmp_path / "cert.pem"
+        key = tmp_path / "key.pem"
+        ca = tmp_path / "ca.pem"
+        for p in (cert, key, ca):
+            p.write_bytes(b"-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n")
+
+        client = TriggerScheduleClient(
+            settings=_settings(
+                scheduler_trigger_url="scheduler:7802",
+                scheduler_trigger_tls_cert=str(cert),
+                scheduler_trigger_tls_key=str(key),
+                scheduler_trigger_tls_ca=str(ca),
+            ),
+        )
+
+        connect_calls = {"count": 0}
+
+        # Fake stub: first call raises UNAVAILABLE, second succeeds.
+        class _FlakyStub:
+            def __init__(self) -> None:
+                self.call_count = 0
+
+            async def TriggerSchedule(self, request, timeout=None):
+                self.call_count += 1
+                if self.call_count == 1:
+                    err = grpc.aio.AioRpcError(
+                        code=grpc.StatusCode.UNAVAILABLE,
+                        initial_metadata=grpc.aio.Metadata(),
+                        trailing_metadata=grpc.aio.Metadata(),
+                        details="connection lost",
+                    )
+                    raise err
+
+                class _R:
+                    command_id = "after-reconnect"
+                    error_code = ""
+                    error_message = ""
+
+                return _R()
+
+        flaky = _FlakyStub()
+
+        async def _fake_connect():
+            connect_calls["count"] += 1
+            client._stub = flaky  # type: ignore[assignment]
+            client._channel = object()  # type: ignore[assignment]
+
+        async def _fake_close():
+            client._stub = None  # type: ignore[assignment]
+            client._channel = None  # type: ignore[assignment]
+
+        with (
+            patch.object(client, "connect", _fake_connect),
+            patch.object(client, "close", _fake_close),
+        ):
+            response = await client.trigger(
+                schedule_id=uuid.uuid4(),
+                user_id=uuid.uuid4(),
+                idempotency_key="k",
+            )
+
+        # First call (lazy connect) + reconnect after the UNAVAILABLE
+        assert connect_calls["count"] == 2, (
+            f"expected exactly one reconnect; got {connect_calls['count']} "
+            "connect calls"
+        )
+        assert flaky.call_count == 2  # original + retry
+        assert response.command_id == "after-reconnect"
+
+    @pytest.mark.asyncio
+    async def test_non_retriable_status_propagates(
+        self, tmp_path: Path,
+    ) -> None:
+        """PERMISSION_DENIED is NOT a stale-channel signal; the client
+        must not retry — propagate to the caller.
+        """
+        import grpc
+
+        cert = tmp_path / "cert.pem"
+        key = tmp_path / "key.pem"
+        ca = tmp_path / "ca.pem"
+        for p in (cert, key, ca):
+            p.write_bytes(b"x")
+
+        client = TriggerScheduleClient(
+            settings=_settings(
+                scheduler_trigger_url="scheduler:7802",
+                scheduler_trigger_tls_cert=str(cert),
+                scheduler_trigger_tls_key=str(key),
+                scheduler_trigger_tls_ca=str(ca),
+            ),
+        )
+
+        class _DeniedStub:
+            def __init__(self) -> None:
+                self.call_count = 0
+
+            async def TriggerSchedule(self, request, timeout=None):
+                self.call_count += 1
+                raise grpc.aio.AioRpcError(
+                    code=grpc.StatusCode.PERMISSION_DENIED,
+                    initial_metadata=grpc.aio.Metadata(),
+                    trailing_metadata=grpc.aio.Metadata(),
+                    details="not authorized",
+                )
+
+        denied = _DeniedStub()
+
+        async def _fake_connect():
+            client._stub = denied  # type: ignore[assignment]
+            client._channel = object()  # type: ignore[assignment]
+
+        with patch.object(client, "connect", _fake_connect):
+            with pytest.raises(grpc.aio.AioRpcError) as exc:
+                await client.trigger(
+                    schedule_id=uuid.uuid4(),
+                    user_id=None,
+                    idempotency_key=None,
+                )
+
+        assert exc.value.code() == grpc.StatusCode.PERMISSION_DENIED
+        # Must not retry — exactly one call.
+        assert denied.call_count == 1

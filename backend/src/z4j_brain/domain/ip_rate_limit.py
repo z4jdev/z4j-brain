@@ -149,6 +149,25 @@ through but stops a runaway script. Each import does config
 validation including a SSRF DNS resolve.
 """
 
+# Round-6 audit fix WS-HIGH-3 (Apr 2026): per-IP throttle on the
+# agent-facing endpoints. Pre-fix the WS handshake + long-poll
+# event-batch endpoints had no rate limit. A leaked or guessed
+# bearer could:
+#   - open thousands of WS connections (the "second connection
+#     wins" only kicks the OTHER active session; doesn't prevent
+#     a flood of new connections),
+#   - POST 500-frame batches to /agent/events continuously, each
+#     causing 500 frame parses + Pydantic validations + DB writes.
+# 600/min/IP allows a fleet of ~10 agents per IP doing 1 connect
+# per second of churn (well above any realistic operation) and
+# blocks credential-flood attempts.
+_agent_connect_bucket = _IPBucket(window_seconds=60, max_hits=600)
+"""Throttle for ``/ws/agent`` connect handshake + ``/api/v1/agent/*``
+HTTP endpoints (long-poll + event ingest).
+
+600/min/IP. A real fleet on one NAT will burst higher than for
+human-facing endpoints; we size for that headroom."""
+
 _bulk_action_bucket = _IPBucket(window_seconds=60, max_hits=10)
 """Throttle for bulk-write operations (audit P-9, added v1.0.14).
 
@@ -191,16 +210,21 @@ require_channel_import_throttle = _make_dependency(
 require_bulk_action_throttle = _make_dependency(
     _bulk_action_bucket, "bulk-action",
 )
+require_agent_connect_throttle = _make_dependency(
+    _agent_connect_bucket, "agent-connect",
+)
 
 
 __all__ = [
     "_IPBucket",
+    "_agent_connect_bucket",
     "_bulk_action_bucket",
     "_channel_import_bucket",
     "_channel_test_bucket",
     "_invitation_bucket",
     "_login_bucket",
     "_password_reset_bucket",
+    "require_agent_connect_throttle",
     "require_bulk_action_throttle",
     "require_channel_import_throttle",
     "require_channel_test_throttle",

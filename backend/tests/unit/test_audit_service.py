@@ -76,6 +76,13 @@ class TestRecord:
     async def test_default_outcome_for_failed(
         self, audit: AuditService, session: AsyncSession,
     ) -> None:
+        """v1.1.0: ``result="failed"`` now defaults to ``outcome="failure"``,
+        not ``outcome="deny"``. Pre-1.1 the two were conflated, so a
+        routine task crash showed up alongside real authorization
+        denials when an operator filtered the audit log by
+        ``outcome=deny``. The split lets security dashboards keep
+        ``outcome=deny`` as a pure access-rejected signal.
+        """
         repo = AuditLogRepository(session)
         row = await audit.record(
             repo,
@@ -83,7 +90,7 @@ class TestRecord:
             target_type="y",
             result="failed",
         )
-        assert row.outcome == "deny"
+        assert row.outcome == "failure"
 
     async def test_explicit_outcome_wins(
         self, audit: AuditService, session: AsyncSession,

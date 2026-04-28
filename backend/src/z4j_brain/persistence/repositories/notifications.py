@@ -218,18 +218,57 @@ class UserSubscriptionRepository(BaseRepository[UserSubscription]):
         user_id: UUID,
         *,
         project_id: UUID | None = None,
+        limit: int | None = None,
+        cursor_project_id: UUID | None = None,
+        cursor_trigger: str | None = None,
+        cursor_id: UUID | None = None,
     ) -> list[UserSubscription]:
         """All subscriptions for a user, optionally project-filtered.
 
         Used by the user's Notifications settings page.
+
+        v1.1.0 N+1 fix: optional keyset pagination on
+        ``(project_id, trigger, id)``. Caller passes ``limit`` and
+        the prior page's cursor tuple; this returns the next slice
+        in the same order. Legacy callers that omit ``limit`` and
+        every cursor still get the full unbounded list, so internal
+        dispatcher code (``list_active_for_dispatch`` is separate;
+        only the settings UI page is paginated) is unaffected.
         """
+        from sqlalchemy import and_, or_
+
         stmt = (
             select(UserSubscription)
             .where(UserSubscription.user_id == user_id)
-            .order_by(UserSubscription.project_id, UserSubscription.trigger)
+            .order_by(
+                UserSubscription.project_id,
+                UserSubscription.trigger,
+                UserSubscription.id,
+            )
         )
         if project_id is not None:
             stmt = stmt.where(UserSubscription.project_id == project_id)
+        if (
+            cursor_project_id is not None
+            and cursor_trigger is not None
+            and cursor_id is not None
+        ):
+            stmt = stmt.where(
+                or_(
+                    UserSubscription.project_id > cursor_project_id,
+                    and_(
+                        UserSubscription.project_id == cursor_project_id,
+                        UserSubscription.trigger > cursor_trigger,
+                    ),
+                    and_(
+                        UserSubscription.project_id == cursor_project_id,
+                        UserSubscription.trigger == cursor_trigger,
+                        UserSubscription.id > cursor_id,
+                    ),
+                ),
+            )
+        if limit is not None:
+            stmt = stmt.limit(limit)
         result = await self.session.execute(stmt)
         return list(result.scalars().all())
 
@@ -746,8 +785,18 @@ class NotificationDeliveryRepository(BaseRepository[NotificationDelivery]):
             .scalar_subquery()
         )
 
+        # v1.1.0: a row "belongs to" the user if EITHER it fired
+        # into one of their subscriptions OR they personally
+        # triggered it (channel-test fires, which have
+        # subscription_id=NULL but triggered_by_user_id=user.id).
+        # Without the OR, test fires never appear in the personal
+        # Global Notification Log even though the user fired them
+        # themselves. See migration 2026_04_27_0009.
         where_conds: list[Any] = [
-            NotificationDelivery.subscription_id.in_(owned_subs),
+            or_(
+                NotificationDelivery.subscription_id.in_(owned_subs),
+                NotificationDelivery.triggered_by_user_id == user_id,
+            ),
         ]
         if project_id is not None:
             where_conds.append(

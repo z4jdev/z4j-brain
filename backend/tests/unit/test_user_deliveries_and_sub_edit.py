@@ -351,6 +351,128 @@ class TestUserDeliveries:
 
 
 @pytest.mark.asyncio
+class TestChannelTestInUserLog:
+    """v1.1.0 Bug 1 fix: channel-test fires triggered by the user
+    must surface in their personal Global Notification Log.
+
+    Pre-1.1.0: ``test_channel_config`` wrote a delivery row with
+    ``subscription_id=NULL``, and the personal-log query filtered
+    by ``subscription_id IN (subs owned by user)``. So test fires
+    never appeared in the personal log.
+
+    v1.1.0: new ``triggered_by_user_id`` column gets stamped with
+    the user's id at write time, and the personal-log query OR's
+    that into the WHERE clause. Pinned by migration
+    2026_04_27_0009.
+    """
+
+    async def test_test_fire_appears_in_users_personal_log(
+        self, settings: Settings, brain_app,
+    ) -> None:
+        seed = await _seed_basic(brain_app, settings)
+        # Hand-write a row that mimics what _dispatch_test produces:
+        # subscription_id=NULL, trigger="test.dispatch",
+        # triggered_by_user_id=current_user.
+        async with brain_app.state.db.session() as s:
+            s.add(NotificationDelivery(
+                subscription_id=None,
+                channel_id=seed["alpha_channel_id"],
+                project_id=seed["alpha_id"],
+                trigger="test.dispatch",
+                task_id=None,
+                task_name=None,
+                status="sent",
+                response_code=200,
+                sent_at=datetime.now(UTC),
+                channel_name="alpha-webhook",
+                channel_type="webhook",
+                triggered_by_user_id=seed["user_id"],
+            ))
+            await s.commit()
+
+        async with _client(brain_app, settings, seed) as client:
+            resp = await client.get("/api/v1/user/deliveries")
+            assert resp.status_code == 200, resp.text
+            body = resp.json()
+            triggers = [item["trigger"] for item in body["items"]]
+            # Original 3 task.failed rows + the new test.dispatch row
+            assert "test.dispatch" in triggers, (
+                f"test fire not surfaced in personal log; got: {triggers}"
+            )
+            test_row = next(
+                it for it in body["items"]
+                if it["trigger"] == "test.dispatch"
+            )
+            assert test_row["triggered_by_user_id"] == str(seed["user_id"])
+            assert test_row["subscription_id"] is None
+
+    async def test_test_fire_only_visible_to_triggering_user(
+        self, settings: Settings, brain_app,
+    ) -> None:
+        """Two members on the same project. User A triggers a test.
+        Only A sees it in their personal log; member B does not.
+        """
+        seed = await _seed_basic(brain_app, settings)
+        # Add a second user as member of alpha + a session for them.
+        other_user_id = uuid.uuid4()
+        other_session_id = uuid.uuid4()
+        other_csrf = secrets.token_urlsafe(32)
+        async with brain_app.state.db.session() as s:
+            hasher = PasswordHasher(settings)
+            s.add(User(
+                id=other_user_id,
+                email=f"o-{uuid.uuid4().hex[:8]}@example.com",
+                password_hash=hasher.hash(
+                    "correct horse battery staple 9",
+                ),
+                is_admin=False, is_active=True,
+            ))
+            s.add(Session(
+                id=other_session_id,
+                user_id=other_user_id,
+                csrf_token=other_csrf,
+                expires_at=datetime.now(UTC) + timedelta(hours=1),
+                ip_at_issue="127.0.0.1",
+                user_agent_at_issue="test",
+            ))
+            s.add(Membership(
+                user_id=other_user_id, project_id=seed["alpha_id"],
+                role=ProjectRole.VIEWER,
+            ))
+            # User A triggers a test fire
+            s.add(NotificationDelivery(
+                subscription_id=None,
+                channel_id=seed["alpha_channel_id"],
+                project_id=seed["alpha_id"],
+                trigger="test.dispatch",
+                status="sent",
+                sent_at=datetime.now(UTC),
+                triggered_by_user_id=seed["user_id"],
+            ))
+            await s.commit()
+
+        # User B logs in, asks for personal log, must NOT see A's test.
+        other_seed = {
+            "user_id": other_user_id,
+            "session_id": other_session_id,
+            "csrf": other_csrf,
+            "alpha_id": seed["alpha_id"],
+            "beta_id": seed["beta_id"],
+            "sub_alpha_id": seed["sub_alpha_id"],
+            "sub_beta_id": seed["sub_beta_id"],
+            "alpha_channel_id": seed["alpha_channel_id"],
+        }
+        async with _client(brain_app, settings, other_seed) as client:
+            resp = await client.get("/api/v1/user/deliveries")
+            assert resp.status_code == 200, resp.text
+            body = resp.json()
+            triggers = [item["trigger"] for item in body["items"]]
+            assert "test.dispatch" not in triggers, (
+                f"user B leaked user A's test fire: {triggers}"
+            )
+
+
+@pytest.mark.asyncio
 class TestUserSubscriptionTriggerRename:
     async def test_rename_user_sub_trigger(
         self, settings: Settings, brain_app,
