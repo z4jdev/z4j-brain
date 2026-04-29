@@ -59,6 +59,34 @@ if TYPE_CHECKING:
     from fastapi import WebSocket
 
 
+class WorkerCapExceeded(Exception):
+    """Registering a new worker would exceed the per-agent cap.
+
+    Raised by ``register`` when:
+    - ``cap > 0`` (cap is enabled)
+    - the (agent_id, worker_id) slot does not already exist
+    - the agent already has ``cap`` distinct worker slots
+
+    The gateway catches this and closes the new WebSocket with
+    code 4429 ("too many workers under this agent"). Defense in
+    depth alongside the per-IP rate limit on /ws/agent: bounds
+    worst-case fd / memory per agent token even if a misbehaving
+    or malicious agent invents many distinct worker_ids.
+
+    Reconnects (same worker_id replacing its own existing slot)
+    do NOT trigger this - cap counts new slot creations only.
+    """
+
+    def __init__(self, agent_id: UUID, current: int, cap: int) -> None:
+        super().__init__(
+            f"agent {agent_id} already has {current} worker connections; "
+            f"cap is {cap}",
+        )
+        self.agent_id = agent_id
+        self.current = current
+        self.cap = cap
+
+
 @dataclass(frozen=True, slots=True)
 class DeliveryResult:
     """Outcome of a single ``deliver`` call.
@@ -92,7 +120,16 @@ class BrainRegistry(Protocol):
         agent_id: UUID,
         ws: "WebSocket",
         worker_id: str | None = None,
-    ) -> None: ...
+        cap: int = 0,
+    ) -> None:
+        """Register ``ws`` under (agent_id, worker_id).
+
+        ``cap``: per-agent concurrent-worker cap (1.2.1+). When
+        positive and adding this connection would push past it,
+        raises :class:`WorkerCapExceeded`. ``cap=0`` (or omitted)
+        keeps the unbounded 1.2.0 behavior.
+        """
+        ...
 
     async def unregister(
         self,
@@ -100,8 +137,9 @@ class BrainRegistry(Protocol):
         *,
         ws: "WebSocket | None" = None,
         worker_id: str | None = None,
-    ) -> None:
-        """Drop ``agent_id`` from the registry.
+    ) -> bool:
+        """Drop one slot for ``agent_id``. Returns ``True`` if the
+        agent has no more registered workers after this call.
 
         Round-7 audit fix R7-HIGH (race) (Apr 2026): callers that
         track the WebSocket they're tearing down should pass it as
@@ -114,6 +152,13 @@ class BrainRegistry(Protocol):
         ``worker_id``, callers MUST pass the same ``worker_id``
         here so the registry evicts only that worker's slot
         (other workers under the same agent_id stay registered).
+
+        v1.2.1+ (audit F3 fix): the bool return value is determined
+        atomically under the registry lock. Callers that need to
+        ``mark_offline`` the agent in the brain DB use this signal
+        instead of a separate ``is_online`` check, eliminating the
+        race window where another worker could connect between the
+        check and the DB write.
         """
         ...
 
@@ -138,4 +183,4 @@ class BrainRegistry(Protocol):
         """Cleanly stop background tasks. Called from lifespan shutdown."""
 
 
-__all__ = ["BrainRegistry", "DeliveryResult"]
+__all__ = ["BrainRegistry", "DeliveryResult", "WorkerCapExceeded"]

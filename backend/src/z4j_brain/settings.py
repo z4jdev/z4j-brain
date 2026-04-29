@@ -387,10 +387,21 @@ class Settings(BaseSettings):
     #: larger than this kill the connection. 1 MiB is well above
     #: any legitimate event_batch shape.
     ws_max_frame_bytes: int = Field(default=1_048_576, ge=8192, le=33_554_432)
-    #: Maximum number of WebSocket connections we accept for one
-    #: agent_id at the same time. Always 1 in v1 - a second
-    #: connection from the same agent kills the first one.
-    ws_per_agent_concurrency_limit: int = Field(default=1, ge=1, le=4)
+    #: Maximum number of concurrent worker connections accepted
+    #: per agent_id (1.2.1+, repurposed from a dead pre-1.2.0
+    #: setting that was never read in code). Default 64 covers the
+    #: realistic enterprise case (gunicorn 8-16 workers + Celery
+    #: 16-32 worker pool + scheduler + beat) with headroom; raise
+    #: for very dense hosts. Set 0 to disable the cap.
+    #:
+    #: Once a connection slot is full and a NEW worker_id tries to
+    #: register, the gateway rejects the handshake with WebSocket
+    #: close code 4429 ("too many workers under this agent"). This
+    #: bounds the worst-case fd / memory footprint per agent token
+    #: even if a misbehaving (or malicious) agent invents many
+    #: distinct worker_ids; defense-in-depth alongside the per-IP
+    #: rate limit on /ws/agent.
+    ws_per_agent_concurrency_cap: int = Field(default=64, ge=0, le=10_000)
     #: Per-connection idle timeout for both ``/ws/agent`` and
     #: ``/ws/dashboard``. If no frame arrives in this many seconds
     #: the connection is closed and the file descriptor released.

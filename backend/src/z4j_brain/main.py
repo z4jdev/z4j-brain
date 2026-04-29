@@ -36,6 +36,7 @@ from z4j_brain.api import (
     setup,
 )
 from z4j_brain.api import agent_longpoll as agent_longpoll_api
+from z4j_brain.api import agent_workers as agent_workers_api
 from z4j_brain.api import agents as agents_api
 from z4j_brain.api import api_keys as api_keys_api
 from z4j_brain.api import audit as audit_api
@@ -736,6 +737,7 @@ def create_app(
     app.include_router(tasks_api.router, prefix="/api/v1")
     app.include_router(events_api.router, prefix="/api/v1")
     app.include_router(workers_api.router, prefix="/api/v1")
+    app.include_router(agent_workers_api.router, prefix="/api/v1")
     app.include_router(queues_api.router, prefix="/api/v1")
     app.include_router(commands_api.router, prefix="/api/v1")
     app.include_router(schedules_api.router, prefix="/api/v1")

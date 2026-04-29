@@ -62,6 +62,7 @@ if TYPE_CHECKING:
     from z4j_brain.persistence.models import Command
     from z4j_brain.settings import Settings
     from z4j_brain.websocket.registry import BrainRegistry
+from z4j_brain.websocket.registry._protocol import WorkerCapExceeded
 
 
 logger = structlog.get_logger("z4j.brain.gateway")
@@ -108,6 +109,7 @@ async def ws_agent(websocket: WebSocket) -> None:
     bearer = websocket.headers.get("authorization")
     from z4j_brain.persistence.repositories import (
         AgentRepository,
+        AgentWorkerRepository,
         AuditLogRepository,
     )
 
@@ -298,6 +300,7 @@ async def ws_agent(websocket: WebSocket) -> None:
         project_id=project_id,
         agent_id=agent_id,
         dashboard_hub=getattr(websocket.app.state, "dashboard_hub", None),
+        worker_id=first_frame.payload.worker_id,
     )
 
     # Worker-first protocol (1.2.0+): pull the optional worker_id
@@ -305,12 +308,61 @@ async def ws_agent(websocket: WebSocket) -> None:
     # legacy 1.1.x agents - the registry preserves the historical
     # "one connection per agent_id" semantics for those.
     agent_worker_id = first_frame.payload.worker_id
-    await registry.register(
-        project_id=project_id,
-        agent_id=agent_id,
-        ws=websocket,
-        worker_id=agent_worker_id,
-    )
+    try:
+        await registry.register(
+            project_id=project_id,
+            agent_id=agent_id,
+            ws=websocket,
+            worker_id=agent_worker_id,
+            cap=settings.ws_per_agent_concurrency_cap,
+        )
+    except WorkerCapExceeded as exc:
+        # Per-agent worker cap exceeded (1.2.1+, audit F2). Bound
+        # the worst-case fd / memory per agent_id even if a buggy
+        # or malicious agent invents many distinct worker_ids.
+        # Defense in depth alongside the per-IP rate limit.
+        logger.warning(
+            "z4j gateway: per-agent worker cap exceeded; rejecting",
+            agent_id=str(agent_id),
+            current_workers=exc.current,
+            cap=exc.cap,
+            new_worker_id=agent_worker_id,
+        )
+        await _safe_close(websocket, code=4429)
+        return
+
+    # Worker-first persistence (1.2.1+): durable per-worker tracking
+    # in agent_workers. Idempotent upsert; safe to retry on each
+    # hello (the gateway only reaches this code on successful
+    # handshake + registry registration). Carries worker_role,
+    # worker_pid, worker_started_at off the hello payload so the
+    # dashboard can filter by role and show pid/uptime per worker.
+    try:
+        async with db.session() as db_session:
+            await AgentWorkerRepository(db_session).register_or_refresh(
+                agent_id=agent_id,
+                project_id=project_id,
+                worker_id=agent_worker_id,
+                role=first_frame.payload.worker_role,
+                framework=first_frame.payload.framework,
+                pid=first_frame.payload.worker_pid,
+                started_at=first_frame.payload.worker_started_at,
+            )
+            await db_session.commit()
+    except Exception:  # noqa: BLE001
+        # Best-effort: persistence is for the dashboard, not the
+        # control flow. If the DB write fails (unlikely with
+        # SQLite/Postgres in a healthy brain), the in-memory
+        # registry still routes commands; the dashboard just won't
+        # see this worker until the next heartbeat refreshes the
+        # row. Log + continue.
+        logger.exception(
+            "z4j gateway: agent_worker upsert failed (dashboard view "
+            "will be stale; control plane unaffected)",
+            agent_id=str(agent_id),
+            worker_id=agent_worker_id,
+        )
+
     try:
         await _drain_pending_for_agent(
             db=db,
@@ -380,16 +432,35 @@ async def ws_agent(websocket: WebSocket) -> None:
         # still points at us. v1.2.0: also pass worker_id so the
         # registry only drops THIS worker's slot, not all slots
         # under this agent_id.
-        await registry.unregister(
+        # v1.2.1 (audit F3 fix): use the atomic return value rather
+        # than a separate ``is_online`` check. Pre-1.2.1 the gateway
+        # called ``unregister`` then ``is_online`` then ``mark_offline``
+        # - between the second and third calls, another worker could
+        # register, making the brain DB say offline while a worker
+        # was actually connected. ``unregister`` now returns whether
+        # the LAST worker was just removed, decided under the
+        # registry lock.
+        last_worker_gone = await registry.unregister(
             agent_id, ws=websocket, worker_id=agent_worker_id,
         )
-        async with db.session() as db_session:
-            # Worker-first: mark offline only when LAST worker for
-            # this agent disconnected. Otherwise the agent stays
-            # online with whichever worker(s) remain.
-            if not registry.is_online(agent_id):
-                await AgentRepository(db_session).mark_offline(agent_id)
+        # Worker-first persistence (1.2.1+): flip THIS worker's row
+        # to offline regardless of whether others remain. The agent-
+        # level mark_offline only fires on the last-worker-gone case
+        # (atomic via the registry return value, F3 fix).
+        try:
+            async with db.session() as db_session:
+                await AgentWorkerRepository(db_session).mark_offline(
+                    agent_id=agent_id, worker_id=agent_worker_id,
+                )
+                if last_worker_gone:
+                    await AgentRepository(db_session).mark_offline(agent_id)
                 await db_session.commit()
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "z4j gateway: agent_worker offline flip failed",
+                agent_id=str(agent_id),
+                worker_id=agent_worker_id,
+            )
         if dashboard_hub is not None:
             try:
                 await dashboard_hub.publish_agent_change(project_id)

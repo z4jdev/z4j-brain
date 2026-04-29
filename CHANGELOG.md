@@ -7,6 +7,81 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.2.1] - 2026-04-29
+
+### Security / hardening (audit findings from 1.2.0 review)
+
+- **F1 (LOW): legacy slot collision fix.** The 1.2.0 in-memory
+  registry used the string `"__legacy__"` as the dict key for
+  legacy 1.1.x clients. A 1.2.0+ agent that sent
+  `worker_id="__legacy__"` would collide with that slot and kick
+  the legacy 1.1.x agent off the brain (close code 4002, same-
+  tenant DoS). 1.2.1 switches the legacy sentinel to Python's
+  `None`, which cannot collide with any string-typed worker_id
+  from the wire. Verified by regression test
+  `TestF1LegacySlotCollision::test_string_named_legacy_does_not_collide`.
+
+- **F2 (LOW): per-agent worker concurrency cap.** Added
+  `ws_per_agent_concurrency_cap` setting (default 64). The
+  registry's `register()` rejects new worker_id slots once the
+  cap is hit, raising `WorkerCapExceeded`; the gateway closes
+  the new connection with WS code 4429 ("too many workers under
+  this agent"). Defense in depth alongside the per-IP rate
+  limit on `/ws/agent`. Reconnects of an existing worker_id
+  (process restart in place) do NOT count against the cap.
+  Repurposes the dead pre-1.2.0 `ws_per_agent_concurrency_limit`
+  setting (was never read by any code path).
+
+- **F3 (LOW, cosmetic): atomic mark_offline.** Pre-1.2.1 the
+  gateway's disconnect path called `unregister(...)` then
+  `is_online(...)` then `mark_offline(...)` - between the second
+  and third calls, a concurrent `register` could land another
+  worker, making the brain DB briefly say offline while a worker
+  was actually connected. 1.2.1 moves the last-worker decision
+  inside the registry lock: `unregister` returns `True` iff the
+  agent has no more workers after this call, decided atomically.
+  Gateway uses the return value directly.
+
+### Added (worker-first persistence + API)
+
+- **`agent_workers` table** (migration `2026_04_29_0013_agent_workers`).
+  Persists per-worker state from the worker-first protocol:
+  `(agent_id, worker_id, role, framework, pid, started_at,
+  state, last_seen_at, last_connect_at)`. Composite uniqueness
+  on `(agent_id, worker_id)`. Distinct from the existing
+  `workers` table (which tracks engine-native Celery / RQ workers
+  via broker heartbeat events).
+
+- **`AgentWorkerRepository`** with CRUD + state transitions:
+  `register_or_refresh` (atomic upsert via Postgres
+  `ON CONFLICT` / SQLite UPSERT), `touch_heartbeat`,
+  `mark_offline`, `mark_all_offline_for_agent`,
+  `list_for_project`, `list_for_agent`.
+
+- **Gateway integration**: WebSocket handshake upserts the
+  agent_worker row; heartbeat refreshes `last_seen_at`;
+  disconnect flips `state='offline'`. All best-effort -
+  persistence failures log but never break the control plane.
+
+- **REST endpoint `GET /api/v1/projects/{slug}/agent-workers`**
+  with optional `state` (online/offline) and `role`
+  (web/task/scheduler/beat/other) query filters. Default limit
+  200, hard cap 500. RBAC: project member (VIEWER+).
+
+- **Heartbeat per-worker tracking.** `FrameRouter` now carries
+  the connection's `worker_id` and refreshes that worker's
+  row on each heartbeat. Operators can distinguish a healthy
+  multi-worker fleet from a partially degraded one (e.g. 3 of 4
+  gunicorn workers heartbeating, one wedged).
+
+### Deferred
+
+- **Dashboard `/workers` page enrichment** to display the new
+  agent_worker rows alongside engine workers. Backend is fully
+  ready; the UI is a focused 1.2.2 wave (no backend changes).
+  Operators can query the new endpoint via curl / scripts in
+  the meantime.
+
 ## [1.2.0] - 2026-04-29
 
 ### Added

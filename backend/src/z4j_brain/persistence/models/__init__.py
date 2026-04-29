@@ -14,6 +14,7 @@ silently ignores.
 from __future__ import annotations
 
 from z4j_brain.persistence.models.agent import Agent
+from z4j_brain.persistence.models.agent_worker import AgentWorker
 from z4j_brain.persistence.models.alert_event import AlertEvent
 from z4j_brain.persistence.models.api_key import ApiKey
 from z4j_brain.persistence.models.audit_log import AuditLog
@@ -52,6 +53,7 @@ from z4j_brain.persistence.models.worker import Worker
 
 __all__ = [
     "Agent",
+    "AgentWorker",
     "AlertEvent",
     "ApiKey",
     "AuditLog",

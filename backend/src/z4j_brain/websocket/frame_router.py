@@ -113,6 +113,7 @@ class FrameRouter:
         project_id: UUID,
         agent_id: UUID,
         dashboard_hub: "DashboardHub | None" = None,
+        worker_id: str | None = None,
     ) -> None:
         self._db = db
         self._ingestor = ingestor
@@ -120,6 +121,12 @@ class FrameRouter:
         self._project_id = project_id
         self._agent_id = agent_id
         self._dashboard_hub = dashboard_hub
+        # Worker-first persistence (1.2.1+): the per-connection
+        # worker_id from the hello payload, threaded through here
+        # so heartbeat handling can refresh THIS worker's row in
+        # agent_workers (rather than guessing from the heartbeat
+        # frame itself, which doesn't carry worker_id).
+        self._worker_id = worker_id
         # Strong references to detached notification dispatch tasks
         # (audit P-4 + P-10). Without this the asyncio event loop
         # may GC the task before its coroutine completes, swallowing
@@ -228,11 +235,20 @@ class FrameRouter:
     async def _handle_heartbeat(self, frame: HeartbeatFrame) -> None:
         from z4j_brain.persistence.repositories import (
             AgentRepository,
+            AgentWorkerRepository,
             QueueRepository,
         )
 
         async with self._db.session() as session:
             await AgentRepository(session).touch_heartbeat(self._agent_id)
+            # Worker-first persistence (1.2.1+): refresh THIS worker's
+            # last_seen_at so the dashboard can distinguish a healthy
+            # multi-worker fleet from a partially-degraded one (e.g.
+            # 3 of 4 gunicorn workers heartbeating, one wedged).
+            await AgentWorkerRepository(session).touch_heartbeat(
+                agent_id=self._agent_id,
+                worker_id=self._worker_id,
+            )
 
             # Project queue depths from the heartbeat's adapter_health.
             # The agent sends keys like "celery.queue_depths" with

@@ -19,7 +19,10 @@ from uuid import UUID
 
 import structlog
 
-from z4j_brain.websocket.registry._protocol import DeliveryResult
+from z4j_brain.websocket.registry._protocol import (
+    DeliveryResult,
+    WorkerCapExceeded,
+)
 
 if TYPE_CHECKING:
     from fastapi import WebSocket
@@ -36,24 +39,28 @@ logger = structlog.get_logger("z4j.brain.registry.local")
 LocalDeliverCallback = Callable[[UUID, "WebSocket"], Awaitable[bool]]
 
 
-#: Sentinel key for legacy 1.1.x agents that don't send a worker_id.
-#: One legacy slot per agent_id, alongside any 1.2.0+ worker slots.
-_LEGACY_SLOT = "__legacy__"
+#: 1.2.1+: legacy 1.1.x clients (worker_id=None) use Python's
+#: ``None`` directly as their dict key. Pre-1.2.1 used the string
+#: ``"__legacy__"`` as a sentinel, but a 1.2.0 agent that sent
+#: ``worker_id="__legacy__"`` could collide with the legacy slot
+#: and kick the 1.1.x agent off (audit finding F1, LOW: same-
+#: tenant DoS). Using ``None`` makes collision impossible because
+#: Pydantic-validated string fields cannot be None when set.
 
 
 class LocalRegistry:
     """Single-process registry for tests + single-worker dev mode.
 
     1.2.0+: tracks multiple WebSockets per agent_id, keyed by
-    worker_id. Legacy 1.1.x clients (worker_id=None) live under
-    a sentinel ``__legacy__`` slot so the data shape stays
-    homogeneous.
+    worker_id. Legacy 1.1.x clients (worker_id=None) use ``None``
+    as their dict key (1.2.1+ - earlier patches used a string
+    sentinel that could collide with attacker-chosen worker_ids).
     """
 
     def __init__(self, *, deliver_local: LocalDeliverCallback) -> None:
         self._lock = asyncio.Lock()
-        # agent_id -> {worker_id_or_legacy_sentinel: WebSocket}
-        self._connections: dict[UUID, dict[str, "WebSocket"]] = {}
+        # agent_id -> {worker_id (or None for legacy): WebSocket}
+        self._connections: dict[UUID, dict[str | None, "WebSocket"]] = {}
         self._project_for_agent: dict[UUID, UUID] = {}
         self._deliver_local = deliver_local
 
@@ -68,10 +75,19 @@ class LocalRegistry:
         agent_id: UUID,
         ws: "WebSocket",
         worker_id: str | None = None,
+        cap: int = 0,
     ) -> None:
-        slot = worker_id if worker_id is not None else _LEGACY_SLOT
+        slot: str | None = worker_id  # None = legacy 1.1.x slot
         async with self._lock:
             workers = self._connections.setdefault(agent_id, {})
+            # Cap check (1.2.1+): only counts NEW slot creations.
+            # Reconnects of an existing worker_id (process restart)
+            # don't push past the cap because they overwrite the
+            # existing slot in place.
+            if cap > 0 and slot not in workers and len(workers) >= cap:
+                raise WorkerCapExceeded(
+                    agent_id=agent_id, current=len(workers), cap=cap,
+                )
             existing = workers.get(slot)
             if existing is not None and existing is not ws:
                 # Same (agent_id, worker_id) reconnecting (or a
@@ -89,34 +105,35 @@ class LocalRegistry:
         *,
         ws: "WebSocket | None" = None,
         worker_id: str | None = None,
-    ) -> None:
-        """Drop one slot for ``agent_id`` from the registry.
+    ) -> bool:
+        """Drop one slot for ``agent_id``. Returns ``True`` if the
+        agent has no more workers registered after this call.
 
-        Round-7 audit fix R7-HIGH (race) (Apr 2026): callers should
-        pass the ``ws`` they're tearing down so we only remove the
-        registry entry IF that exact WebSocket is still the one
-        registered. v1.2.0: also pass ``worker_id`` so we drop the
-        right slot when an agent has multiple worker connections.
-
-        ``ws=None`` keeps the legacy "drop unconditionally" behaviour
-        for callers that don't track the ws (e.g. shutdown).
+        v1.2.1 (audit F3 fix): the return value is determined
+        atomically under ``self._lock``, so callers can
+        ``mark_offline`` the agent without a TOCTOU race against a
+        concurrent ``register``.
         """
-        slot = worker_id if worker_id is not None else _LEGACY_SLOT
+        slot: str | None = worker_id  # None = legacy 1.1.x slot
         async with self._lock:
             workers = self._connections.get(agent_id)
             if workers is None:
-                return
+                # Already gone; agent is not online.
+                return True
             if ws is not None:
                 current = workers.get(slot)
                 if current is not ws:
                     # The new connection has already replaced this one;
-                    # leave the registry entry intact.
-                    return
+                    # leave the registry entry intact. Other workers
+                    # may be present, so the agent isn't offline.
+                    return False
             workers.pop(slot, None)
             if not workers:
                 # Last worker for this agent disconnected.
                 self._connections.pop(agent_id, None)
                 self._project_for_agent.pop(agent_id, None)
+                return True
+            return False
 
     def is_online(self, agent_id: UUID) -> bool:
         workers = self._connections.get(agent_id)

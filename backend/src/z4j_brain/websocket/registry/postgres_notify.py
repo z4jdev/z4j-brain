@@ -44,7 +44,10 @@ from uuid import UUID, uuid4
 import asyncpg
 import structlog
 
-from z4j_brain.websocket.registry._protocol import DeliveryResult
+from z4j_brain.websocket.registry._protocol import (
+    DeliveryResult,
+    WorkerCapExceeded,
+)
 
 if TYPE_CHECKING:
     from fastapi import WebSocket
@@ -57,9 +60,10 @@ if TYPE_CHECKING:
 logger = structlog.get_logger("z4j.brain.registry.pg_notify")
 
 
-#: Sentinel key for legacy 1.1.x agents that don't send a worker_id.
-#: One legacy slot per agent_id, alongside any 1.2.0+ worker slots.
-_LEGACY_SLOT = "__legacy__"
+#: 1.2.1+: legacy 1.1.x clients use ``None`` as their dict key.
+#: Pre-1.2.1 used a string sentinel that an attacker could collide
+#: with via ``worker_id="__legacy__"`` (audit F1, LOW). ``None``
+#: cannot collide with any string-typed worker_id from the wire.
 
 
 def _log_task_exception(task: asyncio.Task[object]) -> None:
@@ -127,7 +131,7 @@ class PostgresNotifyRegistry:
         # brain accepts as many concurrent connections as the
         # operator's gunicorn / Celery / etc. workers spawn.
         self._lock = asyncio.Lock()
-        self._connections: dict[UUID, dict[str, "WebSocket"]] = {}
+        self._connections: dict[UUID, dict[str | None, "WebSocket"]] = {}
         self._project_for_agent: dict[UUID, UUID] = {}
 
         # Watchdog state.
@@ -148,10 +152,16 @@ class PostgresNotifyRegistry:
         agent_id: UUID,
         ws: "WebSocket",
         worker_id: str | None = None,
+        cap: int = 0,
     ) -> None:
-        slot = worker_id if worker_id is not None else _LEGACY_SLOT
+        slot: str | None = worker_id  # None = legacy 1.1.x slot
         async with self._lock:
             workers = self._connections.setdefault(agent_id, {})
+            # Cap check (1.2.1+): NEW slot creations only.
+            if cap > 0 and slot not in workers and len(workers) >= cap:
+                raise WorkerCapExceeded(
+                    agent_id=agent_id, current=len(workers), cap=cap,
+                )
             existing = workers.get(slot)
             if existing is not None and existing is not ws:
                 # Same (agent_id, worker_id) reconnecting (a worker
@@ -177,33 +187,47 @@ class PostgresNotifyRegistry:
         *,
         ws: "WebSocket | None" = None,
         worker_id: str | None = None,
-    ) -> None:
-        """Drop one slot for ``agent_id`` from the local map.
+    ) -> bool:
+        """Drop one slot for ``agent_id``. Returns ``True`` if the
+        agent has no more workers registered after this call.
 
-        Round-7 audit fix R7-HIGH (race) (Apr 2026): identity-check
-        the WebSocket. v1.2.0: also identity-check by worker_id so
-        we drop the right slot when an agent has multiple concurrent
-        worker connections.
+        v1.2.1 (audit F3 fix): atomic last-worker signal under
+        the registry lock so the gateway can ``mark_offline``
+        without a race against a concurrent ``register``.
         """
-        slot = worker_id if worker_id is not None else _LEGACY_SLOT
+        slot: str | None = worker_id  # None = legacy 1.1.x slot
+        last = False
         async with self._lock:
             workers = self._connections.get(agent_id)
             if workers is None:
-                return
-            if ws is not None:
-                current = workers.get(slot)
-                if current is not ws:
-                    return
-            workers.pop(slot, None)
-            if not workers:
-                self._connections.pop(agent_id, None)
-                self._project_for_agent.pop(agent_id, None)
+                last = True
+            else:
+                if ws is not None:
+                    current = workers.get(slot)
+                    if current is not ws:
+                        last = False
+                    else:
+                        workers.pop(slot, None)
+                        if not workers:
+                            self._connections.pop(agent_id, None)
+                            self._project_for_agent.pop(agent_id, None)
+                            last = True
+                        else:
+                            last = False
+                else:
+                    workers.pop(slot, None)
+                    if not workers:
+                        self._connections.pop(agent_id, None)
+                        self._project_for_agent.pop(agent_id, None)
+                        last = True
         logger.info(
             "z4j registry: agent unregistered",
             agent_id=str(agent_id),
             worker_id=self._worker_id,
             agent_worker_id=worker_id,
+            last_worker=last,
         )
+        return last
 
     def is_online(self, agent_id: UUID) -> bool:
         # Local-only check. The dashboard renders agent state from
