@@ -57,6 +57,11 @@ if TYPE_CHECKING:
 logger = structlog.get_logger("z4j.brain.registry.pg_notify")
 
 
+#: Sentinel key for legacy 1.1.x agents that don't send a worker_id.
+#: One legacy slot per agent_id, alongside any 1.2.0+ worker slots.
+_LEGACY_SLOT = "__legacy__"
+
+
 def _log_task_exception(task: asyncio.Task[object]) -> None:
     """Done callback for fire-and-forget tasks. Logs unhandled exceptions."""
     if task.cancelled():
@@ -113,8 +118,16 @@ class PostgresNotifyRegistry:
         self._worker_id: str = secrets.token_hex(8)
 
         # Local connections map. Updated under ``_lock``.
+        # 1.2.0+: stores multiple WS per agent_id, keyed by
+        # worker_id. Legacy 1.1.x agents (no worker_id) live under
+        # the ``__legacy__`` sentinel slot - one such slot per
+        # agent_id, kicked on duplicate (preserving 1.1.x semantics
+        # for that single connection). Worker-aware agents land in
+        # their own slot keyed by their generated worker_id; the
+        # brain accepts as many concurrent connections as the
+        # operator's gunicorn / Celery / etc. workers spawn.
         self._lock = asyncio.Lock()
-        self._connections: dict[UUID, "WebSocket"] = {}
+        self._connections: dict[UUID, dict[str, "WebSocket"]] = {}
         self._project_for_agent: dict[UUID, UUID] = {}
 
         # Watchdog state.
@@ -134,23 +147,28 @@ class PostgresNotifyRegistry:
         project_id: UUID,
         agent_id: UUID,
         ws: "WebSocket",
+        worker_id: str | None = None,
     ) -> None:
+        slot = worker_id if worker_id is not None else _LEGACY_SLOT
         async with self._lock:
-            existing = self._connections.get(agent_id)
+            workers = self._connections.setdefault(agent_id, {})
+            existing = workers.get(slot)
             if existing is not None and existing is not ws:
-                # One WS per agent. The new connection wins; the
-                # old one is force-closed with code 4002.
+                # Same (agent_id, worker_id) reconnecting (a worker
+                # process restarting, or a legacy-mode duplicate).
+                # Kick the old; accept the new.
                 try:
                     await existing.close(code=4002)
                 except Exception:  # noqa: BLE001
                     pass
-            self._connections[agent_id] = ws
+            workers[slot] = ws
             self._project_for_agent[agent_id] = project_id
         logger.info(
             "z4j registry: agent registered",
             agent_id=str(agent_id),
             project_id=str(project_id),
             worker_id=self._worker_id,
+            agent_worker_id=worker_id,
         )
 
     async def unregister(
@@ -158,30 +176,33 @@ class PostgresNotifyRegistry:
         agent_id: UUID,
         *,
         ws: "WebSocket | None" = None,
+        worker_id: str | None = None,
     ) -> None:
-        """Drop ``agent_id`` from the local map.
+        """Drop one slot for ``agent_id`` from the local map.
 
         Round-7 audit fix R7-HIGH (race) (Apr 2026): identity-check
-        the WebSocket. Pre-fix sequence: agent reconnects on a
-        flaky link → ``register`` replaces the old WS with the new
-        and force-closes the old → the old gateway's ``finally``
-        calls ``unregister(agent_id)`` which unconditionally pops
-        the NEW connection from the local map. The freshly
-        connected agent then appears offline to subsequent
-        ``deliver`` calls and commands take the slow NOTIFY path
-        until the next reconcile sweep. Identity check fixes it.
+        the WebSocket. v1.2.0: also identity-check by worker_id so
+        we drop the right slot when an agent has multiple concurrent
+        worker connections.
         """
+        slot = worker_id if worker_id is not None else _LEGACY_SLOT
         async with self._lock:
+            workers = self._connections.get(agent_id)
+            if workers is None:
+                return
             if ws is not None:
-                current = self._connections.get(agent_id)
+                current = workers.get(slot)
                 if current is not ws:
                     return
-            self._connections.pop(agent_id, None)
-            self._project_for_agent.pop(agent_id, None)
+            workers.pop(slot, None)
+            if not workers:
+                self._connections.pop(agent_id, None)
+                self._project_for_agent.pop(agent_id, None)
         logger.info(
             "z4j registry: agent unregistered",
             agent_id=str(agent_id),
             worker_id=self._worker_id,
+            agent_worker_id=worker_id,
         )
 
     def is_online(self, agent_id: UUID) -> bool:
@@ -189,7 +210,8 @@ class PostgresNotifyRegistry:
         # ``agents.state`` which the AgentHealthWorker maintains;
         # this method is only used for fast preflight checks before
         # issuing a command.
-        return agent_id in self._connections
+        workers = self._connections.get(agent_id)
+        return bool(workers)
 
     # ------------------------------------------------------------------
     # BrainRegistry - deliver
@@ -206,7 +228,12 @@ class PostgresNotifyRegistry:
         # single-worker deployments AND the common case in
         # multi-worker deployments where most agents tend to land
         # on a few warm workers.
-        ws = self._connections.get(agent_id)
+        # 1.2.0: when an agent has multiple workers in the local
+        # map, deliver to first-available. Future v1.3 work:
+        # per-role routing (schedule.fire -> role=task workers,
+        # config-update broadcast -> all role=web workers, etc.).
+        workers = self._connections.get(agent_id)
+        ws = next(iter(workers.values()), None) if workers else None
         if ws is not None:
             try:
                 ok = await self._deliver_local(command_id, ws)
@@ -290,11 +317,12 @@ class PostgresNotifyRegistry:
         self._listener_task = None
         self._reconcile_task = None
         async with self._lock:
-            for ws in list(self._connections.values()):
-                try:
-                    await ws.close(code=1001)
-                except Exception:  # noqa: BLE001
-                    pass
+            for workers in list(self._connections.values()):
+                for ws in list(workers.values()):
+                    try:
+                        await ws.close(code=1001)
+                    except Exception:  # noqa: BLE001
+                        pass
             self._connections.clear()
             self._project_for_agent.clear()
 
@@ -500,7 +528,11 @@ class PostgresNotifyRegistry:
         agent_id: UUID,
     ) -> None:
         """Pick up a notified command and push it to the local WS."""
-        ws = self._connections.get(agent_id)
+        # 1.2.0: pick first-available worker. v1.3 will support
+        # role-based routing by inspecting the command's target_role
+        # (if any) against each worker's declared role.
+        workers = self._connections.get(agent_id)
+        ws = next(iter(workers.values()), None) if workers else None
         if ws is None:
             return  # agent disconnected between notify and dispatch
         try:
@@ -566,7 +598,8 @@ class PostgresNotifyRegistry:
             rows = result.all()
 
         for command_id, agent_id in rows:
-            ws = self._connections.get(agent_id)
+            workers = self._connections.get(agent_id)
+            ws = next(iter(workers.values()), None) if workers else None
             if ws is None:
                 continue
             try:

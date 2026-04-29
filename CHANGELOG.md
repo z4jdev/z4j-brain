@@ -7,6 +7,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-04-29
+
+### Added
+
+- **Multi-worker connection support in the WebSocket registry.**
+  When an agent's Hello frame carries `worker_id`, the brain
+  registers the connection in a per-worker slot under
+  `(agent_id, worker_id)`. Multiple concurrent worker_ids
+  coexist; only same-worker reconnects (process restart) trigger
+  the 4002 displacement. Legacy 1.1.x agents (no worker_id)
+  keep the historical "one connection per agent" semantics in
+  a sentinel slot, alongside any worker-aware connections.
+  Resolves the agent-flap pattern operators saw with multi-
+  worker gunicorn / Celery deployments.
+- 8 regression tests covering the four cross-version
+  compatibility cases (legacy+legacy, worker+worker,
+  worker-reconnect, mixed-mode), under
+  `tests/unit/test_local_registry_worker_first.py`.
+
+### Changed
+
+- Registry storage shape: `dict[UUID, WebSocket]` becomes
+  `dict[UUID, dict[str, WebSocket]]` (agent_id -> worker_slot
+  -> WebSocket). `LocalRegistry` and `PostgresNotifyRegistry`
+  both updated; protocol/interface methods accept new optional
+  `worker_id` parameter.
+- `BrainRegistry.register()` and `unregister()` Protocol
+  signatures gain `worker_id: str | None = None` (additive,
+  default-compatible).
+- Gateway extracts `worker_id` from the Hello payload and
+  passes through to `register` / `unregister`. Agent's `mark_
+  offline` now waits until the LAST worker for the agent_id
+  disconnects, so a partial worker fleet failure doesn't make
+  the agent appear offline.
+
+
 ## [1.1.1] - 2026-04-28
 
 ### Fixed

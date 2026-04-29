@@ -36,12 +36,24 @@ logger = structlog.get_logger("z4j.brain.registry.local")
 LocalDeliverCallback = Callable[[UUID, "WebSocket"], Awaitable[bool]]
 
 
+#: Sentinel key for legacy 1.1.x agents that don't send a worker_id.
+#: One legacy slot per agent_id, alongside any 1.2.0+ worker slots.
+_LEGACY_SLOT = "__legacy__"
+
+
 class LocalRegistry:
-    """Single-process registry for tests + single-worker dev mode."""
+    """Single-process registry for tests + single-worker dev mode.
+
+    1.2.0+: tracks multiple WebSockets per agent_id, keyed by
+    worker_id. Legacy 1.1.x clients (worker_id=None) live under
+    a sentinel ``__legacy__`` slot so the data shape stays
+    homogeneous.
+    """
 
     def __init__(self, *, deliver_local: LocalDeliverCallback) -> None:
         self._lock = asyncio.Lock()
-        self._connections: dict[UUID, "WebSocket"] = {}
+        # agent_id -> {worker_id_or_legacy_sentinel: WebSocket}
+        self._connections: dict[UUID, dict[str, "WebSocket"]] = {}
         self._project_for_agent: dict[UUID, UUID] = {}
         self._deliver_local = deliver_local
 
@@ -55,17 +67,20 @@ class LocalRegistry:
         project_id: UUID,
         agent_id: UUID,
         ws: "WebSocket",
+        worker_id: str | None = None,
     ) -> None:
+        slot = worker_id if worker_id is not None else _LEGACY_SLOT
         async with self._lock:
-            existing = self._connections.get(agent_id)
+            workers = self._connections.setdefault(agent_id, {})
+            existing = workers.get(slot)
             if existing is not None and existing is not ws:
-                # v1 policy: one WS per agent. The new connection
-                # wins; the old one is force-closed.
+                # Same (agent_id, worker_id) reconnecting (or a
+                # legacy-mode duplicate). Kick the old.
                 try:
                     await existing.close(code=4002)
                 except Exception:  # noqa: BLE001
                     pass
-            self._connections[agent_id] = ws
+            workers[slot] = ws
             self._project_for_agent[agent_id] = project_id
 
     async def unregister(
@@ -73,35 +88,39 @@ class LocalRegistry:
         agent_id: UUID,
         *,
         ws: "WebSocket | None" = None,
+        worker_id: str | None = None,
     ) -> None:
-        """Drop ``agent_id`` from the registry.
+        """Drop one slot for ``agent_id`` from the registry.
 
         Round-7 audit fix R7-HIGH (race) (Apr 2026): callers should
         pass the ``ws`` they're tearing down so we only remove the
         registry entry IF that exact WebSocket is still the one
-        registered. Pre-fix sequence: agent reconnects → ``register``
-        replaces the old WS with the new and force-closes the old
-        → the old gateway's ``finally`` calls ``unregister(agent_id)``
-        which unconditionally pops the NEW connection. The freshly
-        connected agent then appears offline until the next
-        reconcile sweep, and commands take the slow NOTIFY/timeout
-        path. Identity check fixes it.
+        registered. v1.2.0: also pass ``worker_id`` so we drop the
+        right slot when an agent has multiple worker connections.
 
         ``ws=None`` keeps the legacy "drop unconditionally" behaviour
         for callers that don't track the ws (e.g. shutdown).
         """
+        slot = worker_id if worker_id is not None else _LEGACY_SLOT
         async with self._lock:
+            workers = self._connections.get(agent_id)
+            if workers is None:
+                return
             if ws is not None:
-                current = self._connections.get(agent_id)
+                current = workers.get(slot)
                 if current is not ws:
                     # The new connection has already replaced this one;
                     # leave the registry entry intact.
                     return
-            self._connections.pop(agent_id, None)
-            self._project_for_agent.pop(agent_id, None)
+            workers.pop(slot, None)
+            if not workers:
+                # Last worker for this agent disconnected.
+                self._connections.pop(agent_id, None)
+                self._project_for_agent.pop(agent_id, None)
 
     def is_online(self, agent_id: UUID) -> bool:
-        return agent_id in self._connections
+        workers = self._connections.get(agent_id)
+        return bool(workers)
 
     async def deliver(
         self,
@@ -109,13 +128,19 @@ class LocalRegistry:
         command_id: UUID,
         agent_id: UUID,
     ) -> DeliveryResult:
-        ws = self._connections.get(agent_id)
-        if ws is None:
+        workers = self._connections.get(agent_id)
+        if not workers:
             return DeliveryResult(
                 delivered_locally=False,
                 notified_cluster=False,
                 agent_was_known=False,
             )
+        # Pick any worker - first-available semantics. Future:
+        # per-role routing (deliver schedule.fire to role=task,
+        # config-update to role=web, etc.). For 1.2.0 we stay
+        # role-agnostic; commands flow to whichever worker the
+        # registry iteration yields first.
+        ws = next(iter(workers.values()))
         try:
             ok = await self._deliver_local(command_id, ws)
         except Exception:  # noqa: BLE001
@@ -139,11 +164,12 @@ class LocalRegistry:
 
     async def stop(self) -> None:
         async with self._lock:
-            for ws in list(self._connections.values()):
-                try:
-                    await ws.close(code=1001)
-                except Exception:  # noqa: BLE001
-                    pass
+            for workers in list(self._connections.values()):
+                for ws in list(workers.values()):
+                    try:
+                        await ws.close(code=1001)
+                    except Exception:  # noqa: BLE001
+                        pass
             self._connections.clear()
             self._project_for_agent.clear()
 

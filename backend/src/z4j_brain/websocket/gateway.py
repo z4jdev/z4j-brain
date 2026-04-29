@@ -300,10 +300,16 @@ async def ws_agent(websocket: WebSocket) -> None:
         dashboard_hub=getattr(websocket.app.state, "dashboard_hub", None),
     )
 
+    # Worker-first protocol (1.2.0+): pull the optional worker_id
+    # off the Hello payload and pass to the registry. None for
+    # legacy 1.1.x agents - the registry preserves the historical
+    # "one connection per agent_id" semantics for those.
+    agent_worker_id = first_frame.payload.worker_id
     await registry.register(
         project_id=project_id,
         agent_id=agent_id,
         ws=websocket,
+        worker_id=agent_worker_id,
     )
     try:
         await _drain_pending_for_agent(
@@ -371,13 +377,19 @@ async def ws_agent(websocket: WebSocket) -> None:
     finally:
         # Round-7 audit fix R7-HIGH (race) (Apr 2026): pass our own
         # ``websocket`` so the registry only evicts the entry IF it
-        # still points at us. Without this, the old gateway's
-        # ``finally`` after a forced reconnect-replacement would
-        # clobber the new connection's registry slot.
-        await registry.unregister(agent_id, ws=websocket)
+        # still points at us. v1.2.0: also pass worker_id so the
+        # registry only drops THIS worker's slot, not all slots
+        # under this agent_id.
+        await registry.unregister(
+            agent_id, ws=websocket, worker_id=agent_worker_id,
+        )
         async with db.session() as db_session:
-            await AgentRepository(db_session).mark_offline(agent_id)
-            await db_session.commit()
+            # Worker-first: mark offline only when LAST worker for
+            # this agent disconnected. Otherwise the agent stays
+            # online with whichever worker(s) remain.
+            if not registry.is_online(agent_id):
+                await AgentRepository(db_session).mark_offline(agent_id)
+                await db_session.commit()
         if dashboard_hub is not None:
             try:
                 await dashboard_hub.publish_agent_change(project_id)
