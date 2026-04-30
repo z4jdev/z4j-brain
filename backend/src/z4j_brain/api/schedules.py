@@ -34,6 +34,7 @@ from z4j_brain.api.deps import (
     get_session,
     get_settings,
     require_csrf,
+    resolve_api_key_id,
 )
 from z4j_brain.domain.ip_rate_limit import require_bulk_action_throttle
 from z4j_brain.errors import NotFoundError, ValidationError
@@ -480,7 +481,18 @@ class ScheduleCreateIn(BaseModel):
     kwargs: dict[str, Any] = {}
     catch_up: str = Field(default="skip", min_length=1, max_length=20)
     is_enabled: bool = True
-    scheduler: str = Field(default="z4j-scheduler", min_length=1, max_length=40)
+    # 1.2.2: when None, the create handler falls back to the
+    # project's ``default_scheduler_owner`` (default
+    # ``"z4j-scheduler"``). Operators in celery-beat-first shops
+    # can flip the project default so dashboard-created schedules
+    # land under celery-beat ownership instead of z4j-scheduler.
+    # Pre-1.2.2 this field defaulted to ``"z4j-scheduler"``
+    # unconditionally; the new None default is backward-compatible
+    # because callers that explicitly pass ``"z4j-scheduler"``
+    # still get z4j-scheduler-owned schedules.
+    scheduler: str | None = Field(
+        default=None, min_length=1, max_length=40,
+    )
     source: str = Field(default="dashboard", min_length=1, max_length=_SOURCE_MAX)
     source_hash: str | None = Field(default=None, max_length=_SOURCE_HASH_MAX)
 
@@ -524,6 +536,16 @@ class ScheduleUpdateIn(BaseModel):
     None means "do not touch this field." This lets the dashboard
     flip a single attribute (timezone, expression, queue) without
     re-sending the rest of the row.
+
+    NOTE (1.2.2 audit fix): ``scheduler`` is intentionally NOT in
+    this model. Changing a schedule's owner mid-flight would
+    create surprising side-effects (the new owner has different
+    fire history, possibly different `allowed_schedulers`
+    membership). Operators who need to migrate ownership delete +
+    recreate via the importer or the dashboard "Promote" action.
+    If this list ever gains a ``scheduler`` field, the
+    ``update_schedule`` handler MUST call
+    ``_validate_scheduler_in_allowlist`` before persisting it.
     """
 
     engine: str | None = Field(default=None, min_length=1, max_length=40)
@@ -596,6 +618,7 @@ class ScheduleUpdateIn(BaseModel):
 async def create_schedule(
     slug: str,
     body: ScheduleCreateIn,
+    request: Request,
     user: "User" = Depends(get_current_user),
     memberships: "MembershipRepository" = Depends(get_membership_repo),
     projects: "ProjectRepository" = Depends(get_project_repo),
@@ -621,10 +644,23 @@ async def create_schedule(
         min_role=ProjectRole.ADMIN,
     )
 
+    # 1.2.2: when scheduler is None (operator didn't pick), fall
+    # back to the project's default_scheduler_owner. Defaults to
+    # ``"z4j-scheduler"`` for fresh projects; celery-beat-first
+    # shops flip it via PATCH /projects/{slug}.
+    create_data = body.model_dump()
+    if create_data.get("scheduler") is None:
+        create_data["scheduler"] = getattr(
+            project, "default_scheduler_owner", "z4j-scheduler",
+        )
+    # 1.2.2 audit fix MED-13: enforce per-project allow-list when
+    # set. ``None`` means unrestricted (the default).
+    _validate_scheduler_in_allowlist(project, create_data["scheduler"])
+
     repo = ScheduleRepository(db_session)
     try:
         row = await repo.create_for_project(
-            project_id=project.id, data=body.model_dump(),
+            project_id=project.id, data=create_data,
         )
     except ValueError as exc:
         # 422 Unprocessable Entity - the request was syntactically
@@ -645,6 +681,7 @@ async def create_schedule(
         outcome="allow",
         user_id=user.id,
         project_id=project.id,
+        api_key_id=resolve_api_key_id(request),
         source_ip=ip,
         metadata={"name": row.name, "engine": row.engine, "kind": row.kind.value},
     )
@@ -661,6 +698,7 @@ async def update_schedule(
     slug: str,
     schedule_id: uuid.UUID,
     body: ScheduleUpdateIn,
+    request: Request,
     user: "User" = Depends(get_current_user),
     memberships: "MembershipRepository" = Depends(get_membership_repo),
     projects: "ProjectRepository" = Depends(get_project_repo),
@@ -717,6 +755,7 @@ async def update_schedule(
         outcome="allow",
         user_id=user.id,
         project_id=project.id,
+        api_key_id=resolve_api_key_id(request),
         source_ip=ip,
         metadata={"fields_changed": sorted(patch.keys())},
     )
@@ -732,6 +771,7 @@ async def update_schedule(
 async def delete_schedule(
     slug: str,
     schedule_id: uuid.UUID,
+    request: Request,
     user: "User" = Depends(get_current_user),
     memberships: "MembershipRepository" = Depends(get_membership_repo),
     projects: "ProjectRepository" = Depends(get_project_repo),
@@ -775,6 +815,7 @@ async def delete_schedule(
         outcome="allow",
         user_id=user.id,
         project_id=project.id,
+        api_key_id=resolve_api_key_id(request),
         source_ip=ip,
         metadata={},
     )
@@ -1079,6 +1120,7 @@ async def trigger_schedule_now(
                     outcome="deny",
                     user_id=user.id,
                     project_id=project.id,
+                    api_key_id=resolve_api_key_id(request),
                     source_ip=ip,
                     metadata={
                         "error_code": response.error_code,
@@ -1115,6 +1157,7 @@ async def trigger_schedule_now(
             outcome="allow",
             user_id=user.id,
             project_id=project.id,
+            api_key_id=resolve_api_key_id(request),
             source_ip=ip,
             metadata={
                 "scheduler_command_id": response.command_id,
@@ -1242,8 +1285,14 @@ class ImportedScheduleIn(BaseModel):
     kwargs: dict[str, Any] = {}
     catch_up: str = Field(default="skip", min_length=1, max_length=20)
     is_enabled: bool = True
-    scheduler: str = Field(
-        default="z4j-scheduler", min_length=1, max_length=40,
+    # Audit fix CRIT-2 (1.2.2 second-pass): default ``None`` so
+    # the import handler resolves to the project's
+    # ``default_scheduler_owner`` instead of overriding it with a
+    # hardcoded ``"z4j-scheduler"``. Pre-fix, a project that had
+    # flipped its default to ``celery-beat`` saw imported rows
+    # silently land under ``z4j-scheduler`` ownership.
+    scheduler: str | None = Field(
+        default=None, min_length=1, max_length=40,
     )
     source: str = Field(
         default="imported", min_length=1, max_length=_SOURCE_MAX,
@@ -1323,6 +1372,39 @@ _REPLACE_FOR_SOURCE_ALLOWLIST: frozenset[str] = frozenset({
 })
 
 
+def _validate_scheduler_in_allowlist(
+    project: "Project", scheduler_name: str,
+) -> None:
+    """Reject schedulers outside the project's allow-list (1.2.2+).
+
+    When ``project.allowed_schedulers`` is ``None`` (the default
+    for every existing operator) we accept any value — backwards-
+    compat. When it's a list we enforce membership; the project's
+    own ``default_scheduler_owner`` is implicitly allowed so
+    flipping the setting never strands existing schedules.
+
+    Audit fix MED-13 (1.2.2 deep audit). Raises ``ValueError`` so
+    both the schedule-create handler (which re-raises as
+    ``ValidationError`` for a 422) and the per-row import loop
+    (which catches ``ValueError`` to report row-scoped errors)
+    handle it uniformly.
+    """
+    allowed = getattr(project, "allowed_schedulers", None)
+    if allowed is None:
+        return  # unrestricted
+    default_owner = getattr(
+        project, "default_scheduler_owner", "z4j-scheduler",
+    )
+    if scheduler_name == default_owner or scheduler_name in allowed:
+        return
+    raise ValueError(
+        f"allowed_schedulers: scheduler {scheduler_name!r} is not "
+        f"in this project's allow-list "
+        f"(allow-list: {sorted(allowed)}, "
+        f"default: {default_owner!r})",
+    )
+
+
 def _validate_replace_for_source_label(label: str | None) -> str:
     """Reject obviously-destructive replace-mode source labels.
 
@@ -1366,9 +1448,17 @@ class ImportSchedulesRequest(BaseModel):
     and must come from the audited replace-source allow-list.
     Defaults to the source of the first row in the batch (the
     framework adapters always tag everything with one label).
+
+    Audit fix HIGH-8: ``schedules`` is capped at 2000 entries to
+    bound the worst-case blast radius of
+    ``mode=replace_for_source`` (a misconfigured CI pipeline with
+    an empty list could otherwise wipe thousands of schedules in
+    one POST). Operators with legitimately larger schedule sets
+    should batch their reconciles by source label or contact us
+    so we can raise the cap with safer semantics.
     """
 
-    schedules: list[ImportedScheduleIn]
+    schedules: list[ImportedScheduleIn] = Field(..., max_length=2000)
     mode: str = "upsert"
     source_filter: str | None = None
 
@@ -1402,6 +1492,7 @@ class ImportSchedulesResponse(BaseModel):
 async def import_schedules(
     slug: str,
     body: ImportSchedulesRequest,
+    request: Request,
     user: "User" = Depends(get_current_user),
     memberships: "MembershipRepository" = Depends(get_membership_repo),
     projects: "ProjectRepository" = Depends(get_project_repo),
@@ -1483,6 +1574,21 @@ async def import_schedules(
     # lock is released on commit/rollback - no manual cleanup. Only
     # applies on Postgres; SQLite has a single writer so the race
     # cannot happen there.
+    # 1.2.2 round-7 audit fix CRIT: acquire the project-wide
+    # advisory lock FOR EVERY import mode so a concurrent project
+    # PATCH that rewrites stored ``Schedule.scheduler`` values
+    # cannot race this import. ``update_project`` takes the SAME
+    # ``(proj_int, 0)`` lock; both paths serialize on it.
+    #
+    # Round-7 second pass: the lock used to be inside the
+    # ``replace_for_source`` branch (because the source-specific
+    # lock only matters for replace), but the PATCH-vs-import race
+    # affects EVERY import that touches declarative-source rows
+    # under the OLD scheduler — including ``upsert_only``. Hoist
+    # the project-wide lock outside the mode check; keep the
+    # source-specific lock inside (it's finer-grained
+    # reconcile-vs-reconcile serialization, only meaningful for
+    # ``replace_for_source``).
     if body.mode == "replace_for_source" and (
         db_session.bind.dialect.name == "postgresql"
         if db_session.bind is not None
@@ -1499,6 +1605,9 @@ async def import_schedules(
         )
         # Two-int form so we can fit both project_id and source-label
         # hash in the 64-bit advisory-lock key space without collision.
+        # Source-specific lock for replace_for_source serializes
+        # concurrent reconciles for the SAME source label. (Audit
+        # fix M-3, predates 1.2.2.)
         proj_int = int.from_bytes(project.id.bytes[:4], "big", signed=True)
         source_int = int.from_bytes(
             sha256(scope_key.encode()).digest()[:4], "big", signed=True,
@@ -1519,19 +1628,40 @@ async def import_schedules(
     # import with 5% failures was 250 sequential round-trips
     # serialized inside the request. Operational scale + admin-
     # driven imports made this a real tail-latency contributor.
+    # Audit fix CRIT-2 (1.2.2 second-pass): resolve each row's
+    # scheduler to the project's ``default_scheduler_owner`` when
+    # the row didn't pick. Pre-fix the import default was a
+    # hardcoded ``"z4j-scheduler"`` which silently overrode the
+    # project's chosen default for every row that didn't specify.
+    project_default_scheduler = getattr(
+        project, "default_scheduler_owner", "z4j-scheduler",
+    )
+
+    def _resolve_scheduler(row_scheduler: str | None) -> str:
+        return row_scheduler or project_default_scheduler
+
     existing_id_map: dict[tuple[str, str], uuid.UUID] = {}
     if body.mode == "replace_for_source" and body.schedules:
         from sqlalchemy import select, tuple_  # noqa: PLC0415
 
         from z4j_brain.persistence.models import Schedule  # noqa: PLC0415
 
+        # The pre-flight existing-row lookup is keyed by the
+        # resolved (scheduler, name) tuple — the same key the
+        # upsert uses. Pre-1.2.2-stored rows that were saved
+        # under the legacy hardcoded default ``"z4j-scheduler"``
+        # in projects whose ``default_scheduler_owner`` has been
+        # flipped get a one-shot data migration (alembic 0019)
+        # that rewrites them to the project's current default.
+        # See migration ``2026_05_01_0019_legacy_scheduler_migrate``.
+        # That migration runs at upgrade time so the lookup here
+        # finds them under the new key without runtime dual-key
+        # logic (which had a double-firing bug — see round-4
+        # audit fix CRIT).
         batch_keys = [
-            (row.scheduler or "z4j-scheduler", row.name)
+            (_resolve_scheduler(row.scheduler), row.name)
             for row in body.schedules
         ]
-        # Postgres + SQLite both support row-value IN; SQLAlchemy
-        # emits the right SQL per dialect. For very large batches
-        # this is one query regardless of batch size.
         existing_lookup = await db_session.execute(
             select(
                 Schedule.scheduler,
@@ -1552,10 +1682,22 @@ async def import_schedules(
     surviving_ids: set[uuid.UUID] = set()
     for idx, row in enumerate(body.schedules):
         try:
+            # 1.2.2 audit fix MED-13: enforce per-project
+            # allowed_schedulers allow-list before we touch the DB.
+            # When the project sets the list, a row with an
+            # unauthorised ``scheduler`` value is rejected per-row
+            # (so the rest of the batch still commits).
+            row_scheduler = _resolve_scheduler(row.scheduler)
+            _validate_scheduler_in_allowlist(project, row_scheduler)
+            # Force the resolved scheduler into the upsert payload
+            # so the persisted row matches the allowlist-validated
+            # value (and the surviving_ids tuple — see below).
+            row_data = row.model_dump()
+            row_data["scheduler"] = row_scheduler
             outcome, schedule_row = await upsert_imported_schedule(
                 session=db_session,
                 project_id=project.id,
-                data=row.model_dump(),
+                data=row_data,
             )
         except ValueError as exc:
             # Per-row validation failure (bad kind, empty name, etc.)
@@ -1573,7 +1715,12 @@ async def import_schedules(
             # rows where 1 has a typo would silently delete that
             # schedule.
             if body.mode == "replace_for_source":
-                key = (row.scheduler or "z4j-scheduler", row.name)
+                # M-6 fix: in replace_for_source mode, when a row's
+                # upsert raises (validation error / allow-list
+                # rejection), add the EXISTING brain row's id to
+                # surviving_ids so the replace pass doesn't delete
+                # the corresponding row that's currently live.
+                key = (_resolve_scheduler(row.scheduler), row.name)
                 existing_id = existing_id_map.get(key)
                 if existing_id is not None:
                     surviving_ids.add(existing_id)
@@ -1630,6 +1777,9 @@ async def import_schedules(
             body.source_filter
             or (body.schedules[0].source if body.schedules else None)
         )
+    # Audit fix HIGH-11 (1.2.2): also record the API key that
+    # fired this action (if the request came in via bearer auth).
+    api_key_id = resolve_api_key_id(request)
     await audit.record(
         audit_log,
         action="schedules.import",
@@ -1639,6 +1789,7 @@ async def import_schedules(
         outcome="allow",
         user_id=user.id,
         project_id=project.id,
+        api_key_id=api_key_id,
         source_ip=ip,
         metadata=audit_metadata,
     )
@@ -1776,8 +1927,14 @@ async def diff_schedules(
     # ``tuple_(...).in_(...)`` is portable across Postgres + SQLite.
     from sqlalchemy import tuple_  # noqa: PLC0415
 
+    # Audit fix CRIT-2 (1.2.2 second-pass): same project-default
+    # resolution as the :import path, so :diff previews the same
+    # row identity that :import will write.
+    diff_project_default = getattr(
+        project, "default_scheduler_owner", "z4j-scheduler",
+    )
     diff_batch_keys = [
-        (row.scheduler or "z4j-scheduler", row.name)
+        (row.scheduler or diff_project_default, row.name)
         for row in body.schedules
     ]
     existing_rows: dict[tuple[str, str], Schedule] = {}
@@ -1794,7 +1951,7 @@ async def diff_schedules(
             existing_rows[(sched_row.scheduler, sched_row.name)] = sched_row
 
     for row in body.schedules:
-        scheduler = row.scheduler or "z4j-scheduler"
+        scheduler = row.scheduler or diff_project_default
         batch_keys.add((scheduler, row.name))
         existing = existing_rows.get((scheduler, row.name))
         proposed = {

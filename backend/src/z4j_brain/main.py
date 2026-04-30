@@ -129,6 +129,18 @@ def create_app(
     from z4j_core.redaction import RedactionConfig, RedactionEngine
 
     hasher = PasswordHasher(settings)
+
+    # Audit fix CRIT-3 (1.2.2 fifth-pass): run the canonical-fields
+    # round-trip drift guard at startup so a future regression is
+    # caught early — but BEFORE we've started the brain proper, so
+    # the operator sees a clean error rather than a half-booted
+    # brain. The cheap membership check ran at module import; this
+    # is the deeper "field is in tuple but not emitted" check.
+    from z4j_brain.domain.audit_service import (
+        verify_canonical_fields_emitted,
+    )
+
+    verify_canonical_fields_emitted()
     audit_service = AuditService(settings)
     auth_service = AuthService(
         settings=settings, hasher=hasher, audit=audit_service,
@@ -518,6 +530,48 @@ def create_app(
         audit_queue.start(db=db, settings=settings)
         app.state.audit_queue = audit_queue
 
+        # 1.2.2: audit-log retention sweeper. Periodic background
+        # task that prunes ``audit_log`` rows older than
+        # ``settings.audit_retention_days``. The trigger function
+        # added in migration 0015 permits DELETE only when this
+        # task's ``SET LOCAL z4j.audit_sweep = 'on'`` is active.
+        from z4j_brain.audit_retention import AuditRetentionSweeper
+
+        audit_sweeper = AuditRetentionSweeper()
+        audit_sweeper.start(db=db, settings=settings)
+        app.state.audit_sweeper = audit_sweeper
+
+        # 1.2.2: SQLite WAL checkpoint task. Runs
+        # ``PRAGMA wal_checkpoint(TRUNCATE)`` every
+        # ``wal_checkpoint_interval_seconds`` so the ``-wal`` sidecar
+        # doesn't grow unbounded on a write-heavy homelab box. No-op
+        # on Postgres deployments.
+        from z4j_brain.wal_checkpoint import WalCheckpointTask
+
+        wal_checkpoint = WalCheckpointTask()
+        wal_checkpoint.start(db=db, settings=settings)
+        app.state.wal_checkpoint = wal_checkpoint
+
+        # 1.2.2: register the Prometheus self-watch provider so
+        # /metrics surfaces the audit-sweeper + WAL-checkpoint
+        # state. Operators graphing
+        # ``z4j_audit_retention_last_run_timestamp`` can alert if
+        # the sweeper stalls.
+        from z4j_brain.api.metrics import register_self_watch_provider
+
+        def _self_watch_provider() -> dict:
+            return {
+                "audit_pruned_total": audit_sweeper.total_deleted,
+                "audit_last_deleted": audit_sweeper.last_deleted,
+                "audit_last_run_at": audit_sweeper.last_run_at,
+                "audit_error": audit_sweeper.last_error,
+                "wal_pages_last": wal_checkpoint.last_pages_checkpointed,
+                "wal_last_run_at": wal_checkpoint.last_run_at,
+                "wal_error": wal_checkpoint.last_error,
+            }
+
+        register_self_watch_provider(_self_watch_provider)
+
         try:
             await registry.start()
         except Exception:  # noqa: BLE001
@@ -659,6 +713,14 @@ def create_app(
                 await audit_queue.stop()
             except Exception:  # noqa: BLE001
                 logger.exception("z4j brain audit_queue stop crashed")
+            try:
+                await audit_sweeper.stop()
+            except Exception:  # noqa: BLE001
+                logger.exception("z4j brain audit_sweeper stop crashed")
+            try:
+                await wal_checkpoint.stop()
+            except Exception:  # noqa: BLE001
+                logger.exception("z4j brain wal_checkpoint stop crashed")
             # Tear down the shared notification HTTP client AFTER the
             # workers have stopped so any in-flight delivery can drain.
             try:

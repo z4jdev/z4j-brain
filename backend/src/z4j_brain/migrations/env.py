@@ -21,11 +21,17 @@ from sqlalchemy.engine import Connection
 from sqlalchemy.ext.asyncio import async_engine_from_config
 
 from z4j_brain.persistence import Base
+from z4j_brain.persistence import models as _models  # noqa: F401
 from z4j_brain.settings import Settings
 
-# B2 will register every model module here so Base.metadata is fully
-# populated before autogenerate runs. In B1 there are no models yet,
-# which is the expected state - `alembic upgrade head` is a no-op.
+# Force-import the ``models`` submodule so every model class
+# registers with ``Base.metadata`` before alembic reads it.
+# Without this line, ``Base.metadata.tables`` is EMPTY when
+# alembic runs from a fresh ``pip install`` (no test fixtures
+# loading the models as a side effect) and
+# ``Base.metadata.create_all`` silently creates zero tables.
+# This was exactly the bug the 1.3.0 release-discipline smoke
+# test caught — easy to miss without a clean-venv run.
 
 config = context.config
 

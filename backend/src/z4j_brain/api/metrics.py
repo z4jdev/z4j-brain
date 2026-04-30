@@ -229,6 +229,151 @@ def record_swallowed(module: str, site: str) -> None:
         return
 
 
+# -- Self-watch (brain's own background tasks) --
+#
+# 1.2.2 introduces the audit-log retention sweeper and SQLite WAL
+# checkpoint task. Both are silent loops that operators can't see
+# from the outside. These metrics expose their state so a Grafana
+# alert can fire if either stalls or starts logging errors.
+#
+# Audit fix CRIT-5: every self-watch metric is a Gauge sampled
+# at scrape time. The earlier design used a synthetic-delta
+# Counter which had two flaws:
+#   1) Multiple Prometheus replicas scraping the same brain would
+#      double-count the delta against the same shared baseline.
+#   2) Test fixtures that call ``register_self_watch_provider``
+#      twice (e.g. brain_app fixture + dedicated test) carried
+#      stale baseline state across test cases.
+# Gauges that mirror the underlying singleton attributes
+# (``total_deleted``, ``last_pages_checkpointed``, etc.) are
+# scrape-idempotent and have no in-process baseline state.
+
+z4j_audit_retention_pruned_total = Gauge(
+    "z4j_audit_retention_pruned_total",
+    "Cumulative audit_log rows deleted by the retention sweeper "
+    "since this brain process started (resets on restart).",
+    registry=registry,
+)
+
+z4j_audit_retention_last_run_timestamp = Gauge(
+    "z4j_audit_retention_last_run_timestamp",
+    "Unix timestamp of the most recent audit-log retention sweep "
+    "(0 if the sweeper has never run a successful pass).",
+    registry=registry,
+)
+
+z4j_audit_retention_last_deleted = Gauge(
+    "z4j_audit_retention_last_deleted",
+    "Rows deleted in the most recent audit-log retention sweep "
+    "pass.",
+    registry=registry,
+)
+
+z4j_wal_checkpoint_pages_last = Gauge(
+    "z4j_wal_checkpoint_pages_last",
+    "Pages checkpointed in the most recent WAL checkpoint pass "
+    "(SQLite-only; -1 on non-WAL or unsupported response shape).",
+    registry=registry,
+)
+
+z4j_wal_checkpoint_last_run_timestamp = Gauge(
+    "z4j_wal_checkpoint_last_run_timestamp",
+    "Unix timestamp of the most recent WAL checkpoint pass "
+    "(0 on Postgres deployments, or before the task has run once).",
+    registry=registry,
+)
+
+z4j_background_task_error_active = Gauge(
+    "z4j_background_task_error_active",
+    "1 if the named background task's most recent pass failed, "
+    "0 otherwise. Cleared when a subsequent pass succeeds.",
+    labelnames=("task",),
+    registry=registry,
+)
+
+#: Sampled at scrape time. Each callable returns a dict of:
+#: ``{"audit_pruned_total": int, "audit_last_run_at": datetime|None,
+#:    "audit_last_deleted": int, "audit_error": str|None,
+#:    "wal_pages_last": int, "wal_last_run_at": datetime|None,
+#:    "wal_error": str|None}``.
+#: Registered by ``main.py`` once the singletons exist.
+_self_watch_provider: "Callable[[], dict] | None" = None
+
+
+def register_self_watch_provider(provider: "Callable[[], dict]") -> None:
+    """Register the callable that supplies self-watch state.
+
+    The provider is invoked at scrape time and should be cheap
+    (read instance attributes, no DB queries).
+    """
+    global _self_watch_provider
+    _self_watch_provider = provider
+
+
+def _refresh_self_watch_gauges() -> None:
+    """Pull the latest state from the registered provider."""
+    if _self_watch_provider is None:
+        return
+    try:
+        snap = _self_watch_provider()
+    except Exception:  # noqa: BLE001
+        record_swallowed("metrics", "self_watch_provider")
+        return
+
+    # Audit-retention gauges
+    audit_total = int(snap.get("audit_pruned_total") or 0)
+    try:
+        z4j_audit_retention_pruned_total.set(audit_total)
+    except Exception:  # noqa: BLE001
+        record_swallowed("metrics", "audit_pruned_set")
+
+    audit_last_deleted = int(snap.get("audit_last_deleted") or 0)
+    try:
+        z4j_audit_retention_last_deleted.set(audit_last_deleted)
+    except Exception:  # noqa: BLE001
+        record_swallowed("metrics", "audit_last_deleted_set")
+
+    audit_last = snap.get("audit_last_run_at")
+    try:
+        z4j_audit_retention_last_run_timestamp.set(
+            audit_last.timestamp() if audit_last is not None else 0,
+        )
+    except Exception:  # noqa: BLE001
+        record_swallowed("metrics", "audit_last_run_set")
+
+    audit_err_active = 1 if snap.get("audit_error") else 0
+    try:
+        z4j_background_task_error_active.labels(
+            task="audit_retention",
+        ).set(audit_err_active)
+    except Exception:  # noqa: BLE001
+        record_swallowed("metrics", "audit_err_set")
+
+    # WAL-checkpoint gauges
+    wal_pages = snap.get("wal_pages_last")
+    if wal_pages is not None:
+        try:
+            z4j_wal_checkpoint_pages_last.set(int(wal_pages))
+        except Exception:  # noqa: BLE001
+            record_swallowed("metrics", "wal_pages_set")
+
+    wal_last = snap.get("wal_last_run_at")
+    try:
+        z4j_wal_checkpoint_last_run_timestamp.set(
+            wal_last.timestamp() if wal_last is not None else 0,
+        )
+    except Exception:  # noqa: BLE001
+        record_swallowed("metrics", "wal_last_run_set")
+
+    wal_err_active = 1 if snap.get("wal_error") else 0
+    try:
+        z4j_background_task_error_active.labels(
+            task="wal_checkpoint",
+        ).set(wal_err_active)
+    except Exception:  # noqa: BLE001
+        record_swallowed("metrics", "wal_err_set")
+
+
 def _check_metrics_auth(request: Request, settings: "Settings") -> None:
     """Enforce bearer-token auth on ``/metrics`` (fail-secure default).
 
@@ -306,6 +451,7 @@ async def metrics_endpoint(
     """
     _check_metrics_auth(request, settings)
     _refresh_inmemory_gauges()
+    _refresh_self_watch_gauges()
     body = generate_latest(registry)
     return Response(content=body, media_type=CONTENT_TYPE_LATEST)
 
@@ -313,9 +459,14 @@ async def metrics_endpoint(
 __all__ = [
     "record_swallowed",
     "register_inmemory_subsystem",
+    "register_self_watch_provider",
     "registry",
     "router",
     "z4j_agents_online",
+    "z4j_audit_retention_last_deleted",
+    "z4j_audit_retention_last_run_timestamp",
+    "z4j_audit_retention_pruned_total",
+    "z4j_background_task_error_active",
     "z4j_command_late_results_total",
     "z4j_commands_total",
     "z4j_db_pool_checked_out",
@@ -328,6 +479,8 @@ __all__ = [
     "z4j_swallowed_exceptions_total",
     "z4j_task_duration_seconds",
     "z4j_tasks_total",
+    "z4j_wal_checkpoint_last_run_timestamp",
+    "z4j_wal_checkpoint_pages_last",
     "z4j_workers_online",
     "z4j_ws_connections",
 ]

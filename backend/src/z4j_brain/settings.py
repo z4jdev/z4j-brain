@@ -157,6 +157,33 @@ class Settings(BaseSettings):
     # ------------------------------------------------------------------
     event_retention_days: int = Field(default=30, ge=1, le=3650)
     audit_retention_days: int = Field(default=90, ge=1, le=3650)
+    #: Periodic sweeper cadence for the audit-log retention task
+    #: (1.2.2+). Default 1h is enough to keep up with even the
+    #: noisiest brain (~1M rows/day). Operators worried about
+    #: vacuum churn on Postgres can lengthen this freely.
+    audit_retention_sweep_interval_seconds: int = Field(
+        default=3600, ge=60, le=86_400,
+    )
+    #: Per-pass batch size. Smaller batches = shorter transactions
+    #: at the cost of more passes to drain a backlog. 5_000 is a
+    #: good balance for both SQLite and Postgres on a homelab box.
+    audit_retention_sweep_batch_size: int = Field(
+        default=5_000, ge=100, le=100_000,
+    )
+    #: Hard cap on rows deleted in one sweep pass. Prevents a
+    #: million-row backlog from running as one runaway transaction
+    #: window — the next pass picks up the remaining rows. Audit
+    #: fix MED-18.
+    audit_retention_sweep_max_per_pass: int = Field(
+        default=200_000, ge=1_000, le=10_000_000,
+    )
+    #: SQLite-only periodic ``PRAGMA wal_checkpoint(TRUNCATE)`` cadence
+    #: (1.2.2+). 5 minutes is enough to keep the ``-wal`` sidecar from
+    #: growing unbounded under normal load. The task is a no-op on
+    #: Postgres deployments.
+    wal_checkpoint_interval_seconds: int = Field(
+        default=300, ge=60, le=86_400,
+    )
     command_timeout_seconds: int = Field(default=60, ge=1, le=86_400)
     agent_offline_timeout_seconds: int = Field(default=30, ge=1, le=3600)
     #: Delete agent rows that have been offline for more than this

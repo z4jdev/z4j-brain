@@ -31,6 +31,7 @@ from sqlalchemy import (
     String,
     Text,
     func,
+    text,
 )
 from sqlalchemy.orm import Mapped, mapped_column
 from sqlalchemy.types import Uuid
@@ -69,6 +70,26 @@ class AuditLog(PKMixin, Base):
     user_id: Mapped[uuid.UUID | None] = mapped_column(
         Uuid(as_uuid=True),
         ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    #: Acting API key, if the action was triggered via a bearer
+    #: token (declarative reconciler, deploy script, CI). NULL for
+    #: actions performed via session cookie (dashboard) or for
+    #: legacy rows written before 1.2.2.
+    #:
+    #: NOTE (1.2.2 third-pass audit fix): this column intentionally
+    #: has NO FOREIGN KEY constraint. The HMAC at v4 includes
+    #: ``api_key_id``; an ``ON DELETE SET NULL`` cascade would
+    #: silently rewrite the column on key revoke and break the
+    #: HMAC, marking thousands of audit rows as "tampered" after
+    #: a routine key rotation. ``ON DELETE RESTRICT`` would block
+    #: revoke entirely. Neither is acceptable. Without the FK the
+    #: column is informational only; the audit trail keeps the
+    #: original UUID forever, and ``z4j-brain audit verify``
+    #: continues to validate the row even after the referenced
+    #: api_keys row is gone.
+    api_key_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
         nullable=True,
     )
     action: Mapped[str] = mapped_column(String(80), nullable=False)
@@ -131,6 +152,37 @@ class AuditLog(PKMixin, Base):
         Index(
             "ix_audit_log_action_occurred",
             "action", "occurred_at",
+        ),
+        # Standalone index on occurred_at so the retention
+        # sweeper's ``WHERE occurred_at < ? ORDER BY occurred_at``
+        # range scan doesn't degrade to seq-scan + sort.
+        Index(
+            "ix_audit_log_occurred_at",
+            "occurred_at",
+        ),
+        # Partial UNIQUE index on prev_row_hmac — enforces "one row
+        # per chain link" so a missed advisory lock or a future
+        # bypass of ``AuditService.record`` can't silently fork the
+        # chain. Genesis row carries ``prev_row_hmac=NULL`` and
+        # NULL!=NULL in UNIQUE, so the partial predicate excludes
+        # the genesis row from uniqueness — exactly what we want.
+        Index(
+            "ux_audit_log_prev_row_hmac",
+            "prev_row_hmac",
+            unique=True,
+            postgresql_where=text("prev_row_hmac IS NOT NULL"),
+            sqlite_where=text("prev_row_hmac IS NOT NULL"),
+        ),
+        # Partial index on api_key_id — supports the dashboard's
+        # "filter audit log by API key" view without a sequential
+        # scan once the table grows. Most rows have api_key_id IS
+        # NULL (cookie-session actions), so the partial predicate
+        # keeps the index small.
+        Index(
+            "ix_audit_log_api_key_id",
+            "api_key_id",
+            postgresql_where=text("api_key_id IS NOT NULL"),
+            sqlite_where=text("api_key_id IS NOT NULL"),
         ),
     )
 

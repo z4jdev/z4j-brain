@@ -43,6 +43,7 @@ class AuditLogRepository(BaseRepository[AuditLog]):
         row_hmac: str,
         occurred_at: datetime,
         prev_row_hmac: str | None = None,
+        api_key_id: UUID | None = None,
     ) -> AuditLog:
         """Insert one row with the AuditService-supplied row HMAC.
 
@@ -62,6 +63,7 @@ class AuditLogRepository(BaseRepository[AuditLog]):
             event_id=event_id,
             user_id=user_id,
             project_id=project_id,
+            api_key_id=api_key_id,
             source_ip=source_ip,
             user_agent=user_agent,
             audit_metadata=metadata,

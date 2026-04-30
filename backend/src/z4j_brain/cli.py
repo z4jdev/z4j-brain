@@ -230,6 +230,72 @@ def main(argv: Sequence[str] | None = None) -> int:
         ),
     )
 
+    # projects: operator-initiated project-scoped data operations.
+    # Currently exposes ``rewrite-scheduler`` for the explicit
+    # migration of ``Schedule.scheduler`` values when an operator
+    # has flipped a project's ``default_scheduler_owner`` and wants
+    # to retroactively migrate existing rows. Round-9 audit fix:
+    # we deliberately do NOT auto-rewrite at PATCH time (that path
+    # caused a six-round cascade of concurrency + lock + staleness
+    # bugs). Operators who want migration use this command.
+    projects_cmd = sub.add_parser(
+        "projects",
+        help="project-scoped operations (rewrite-scheduler, ...)",
+    )
+    projects_sub = projects_cmd.add_subparsers(
+        dest="projects_command", required=True,
+    )
+    rewrite_sched = projects_sub.add_parser(
+        "rewrite-scheduler",
+        help=(
+            "rewrite Schedule.scheduler from one value to another "
+            "for declarative-source rows in a project"
+        ),
+        description=(
+            "Explicit operator-initiated migration of stored "
+            "``Schedule.scheduler`` values. Use this AFTER flipping "
+            "a project's ``default_scheduler_owner`` if you want "
+            "existing reconciler-managed rows to move to the new "
+            "owner (otherwise they stay where they are and the "
+            "next reconcile will delete them via "
+            "``replace_for_source``). Targets only declarative- "
+            "and importer-source rows by default; operator-set "
+            "``scheduler`` overrides on dashboard-created rows are "
+            "left alone unless ``--all-sources`` is passed."
+        ),
+    )
+    rewrite_sched.add_argument(
+        "--slug",
+        required=True,
+        help="project slug (URL-safe identifier)",
+    )
+    rewrite_sched.add_argument(
+        "--from",
+        dest="from_scheduler",
+        required=True,
+        help="current scheduler value to rewrite from",
+    )
+    rewrite_sched.add_argument(
+        "--to",
+        dest="to_scheduler",
+        required=True,
+        help="new scheduler value to rewrite to",
+    )
+    rewrite_sched.add_argument(
+        "--all-sources",
+        action="store_true",
+        help=(
+            "rewrite EVERY row matching --from, including "
+            "dashboard-created and operator-set rows. Default is "
+            "to scope to declarative/imported sources only."
+        ),
+    )
+    rewrite_sched.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="print the count of rows that WOULD be rewritten and exit",
+    )
+
     # bootstrap-admin: imperative first-boot admin creation.
     # Complements the Z4J_BOOTSTRAP_ADMIN_* env var path so operators
     # who prefer a CLI step (or want to re-create an admin after
@@ -526,6 +592,42 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="certificate validity in days (default: 365)",
     )
 
+    # upgrade
+    upgrade = sub.add_parser(
+        "upgrade",
+        help="check / apply z4j package upgrades from PyPI",
+        description=(
+            "List the installed z4j-* packages and the latest version "
+            "published on PyPI. With --apply, run `pip install -U` for "
+            "the z4j umbrella (which pulls every adapter to the latest "
+            "compatible version).\n"
+            "\n"
+            "By default this is a check-only dry run: no installs, no\n"
+            "venv mutation. Useful from a scheduled job: a non-zero\n"
+            "exit code means at least one package is behind."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    upgrade.add_argument(
+        "--apply",
+        action="store_true",
+        help=(
+            "run `pip install -U z4j` to apply upgrades. Default is "
+            "check-only (lists outdated packages and exits non-zero)."
+        ),
+    )
+    upgrade.add_argument(
+        "--json",
+        action="store_true",
+        help="emit machine-readable JSON instead of a text table",
+    )
+    upgrade.add_argument(
+        "--timeout",
+        type=float,
+        default=10.0,
+        help="HTTP timeout per PyPI lookup in seconds (default: 10)",
+    )
+
     # version
     sub.add_parser("version", help="print installed z4j-brain version")
 
@@ -543,6 +645,9 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "audit":
         return _run_audit(args)
+
+    if args.command == "projects":
+        return _run_projects(args)
 
     if args.command == "bootstrap-admin":
         return _run_bootstrap_admin(args)
@@ -585,8 +690,186 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "mint-scheduler-cert":
         return _run_mint_scheduler_cert(args)
 
+    if args.command == "upgrade":
+        return _run_upgrade(args)
+
     parser.error(f"unknown command {args.command!r}")
     return 2
+
+
+def _run_upgrade(args: argparse.Namespace) -> int:
+    """Dispatch ``z4j upgrade``.
+
+    Compares installed z4j package versions against PyPI's
+    /pypi/<pkg>/json endpoint and prints a one-row-per-package
+    summary. Exit code is 0 when everything is current, 1 when at
+    least one package is behind, 2 on a hard error (network down,
+    PyPI 5xx). With --apply the umbrella ``z4j`` is upgraded via
+    a child ``pip install -U`` call.
+    """
+    import json as _json
+    import shlex
+    import shutil
+    import subprocess
+
+    from importlib.metadata import PackageNotFoundError, version
+
+    import httpx
+
+    # The ecosystem packages we own. Listed here statically rather
+    # than walking ``pkg_resources`` so an unrelated third-party
+    # package whose name happens to start with "z4j" never gets
+    # confused for one of ours.
+    _Z4J_PACKAGES = (
+        "z4j",
+        "z4j-brain",
+        "z4j-scheduler",
+        "z4j-core",
+        "z4j-bare",
+        "z4j-django",
+        "z4j-flask",
+        "z4j-fastapi",
+        "z4j-celery",
+        "z4j-celerybeat",
+        "z4j-rq",
+        "z4j-arq",
+        "z4j-dramatiq",
+        "z4j-huey",
+        "z4j-taskiq",
+    )
+
+    rows: list[dict[str, str | bool]] = []
+    network_errors: list[str] = []  # audit fix HIGH-12: aggregate
+    behind = 0
+
+    # Audit fix HIGH-12: bound the CLI's wall-clock at
+    # ``args.timeout`` total (not per-call). 15 sequential 10s
+    # timeouts would otherwise let a slow PyPI keep us spinning
+    # for 150s. We give each call ``min(per_pkg, time_remaining)``
+    # so the whole loop fits inside the operator's expectation.
+    import time
+
+    started_at = time.monotonic()
+    walltime_budget = max(5.0, args.timeout * 2)  # 2x timeout for 15 pkgs
+    per_call_timeout = max(2.0, args.timeout / max(1, len(_Z4J_PACKAGES)))
+
+    with httpx.Client(timeout=per_call_timeout) as client:
+        for pkg in _Z4J_PACKAGES:
+            try:
+                installed = version(pkg)
+            except PackageNotFoundError:
+                continue  # not installed in this venv
+
+            elapsed = time.monotonic() - started_at
+            if elapsed > walltime_budget:
+                # Walltime exceeded: don't even try the call.
+                network_errors.append(
+                    f"{pkg}: skipped (walltime budget exhausted)",
+                )
+                rows.append({
+                    "package": pkg,
+                    "installed": installed,
+                    "latest": "(skipped: timeout)",
+                    "behind": False,
+                })
+                continue
+
+            try:
+                resp = client.get(f"https://pypi.org/pypi/{pkg}/json")
+                if resp.status_code == 404:
+                    rows.append({
+                        "package": pkg,
+                        "installed": installed,
+                        "latest": "(not on PyPI)",
+                        "behind": False,
+                    })
+                    continue
+                resp.raise_for_status()
+                latest = resp.json().get("info", {}).get("version", "?")
+            except httpx.HTTPError as exc:  # noqa: BLE001
+                network_errors.append(
+                    f"{pkg}: {type(exc).__name__}: {exc}",
+                )
+                rows.append({
+                    "package": pkg,
+                    "installed": installed,
+                    "latest": "(lookup failed)",
+                    "behind": False,
+                })
+                continue
+
+            is_behind = installed != latest
+            if is_behind:
+                behind += 1
+            rows.append({
+                "package": pkg,
+                "installed": installed,
+                "latest": latest,
+                "behind": is_behind,
+            })
+
+    # Backwards-compat single-string for the JSON shape callers
+    # already test against:
+    network_error = "; ".join(network_errors) if network_errors else None
+
+    if args.json:
+        print(_json.dumps({  # noqa: T201
+            "ok": behind == 0 and network_error is None,
+            "behind_count": behind,
+            "rows": rows,
+            "network_error": network_error,
+        }))
+    else:
+        if not rows:
+            print("z4j upgrade: no z4j packages installed in this venv.")  # noqa: T201
+            return 0
+        col_pkg = max(len(str(r["package"])) for r in rows) + 2
+        col_inst = max(len(str(r["installed"])) for r in rows) + 2
+        col_last = max(len(str(r["latest"])) for r in rows) + 2
+        header = (
+            f"{'PACKAGE':<{col_pkg}}{'INSTALLED':<{col_inst}}"
+            f"{'LATEST':<{col_last}}STATUS"
+        )
+        print(header)  # noqa: T201
+        print("-" * len(header))  # noqa: T201
+        for r in rows:
+            status = "behind" if r["behind"] else "current"
+            print(  # noqa: T201
+                f"{str(r['package']):<{col_pkg}}"
+                f"{str(r['installed']):<{col_inst}}"
+                f"{str(r['latest']):<{col_last}}{status}",
+            )
+        print()  # noqa: T201
+        if network_error:
+            print(  # noqa: T201
+                f"warning: at least one PyPI lookup failed: {network_error}",
+            )
+        if behind:
+            print(  # noqa: T201
+                f"{behind} package(s) behind. Run `z4j upgrade --apply` "
+                "to upgrade the umbrella (and adapters via dependency "
+                "constraints), or pip install each one explicitly.",
+            )
+        else:
+            print("all z4j packages are up to date.")  # noqa: T201
+
+    if not args.apply:
+        if network_error and behind == 0:
+            return 2
+        return 1 if behind else 0
+
+    # --apply: shell out to pip install -U z4j
+    pip_cmd = [sys.executable, "-m", "pip", "install", "-U", "z4j"]
+    print(f"running: {shlex.join(pip_cmd)}")  # noqa: T201
+    if shutil.which(sys.executable) is None:
+        print("error: cannot locate python executable", file=sys.stderr)  # noqa: T201
+        return 2
+    try:
+        proc = subprocess.run(pip_cmd, check=False)
+    except OSError as exc:
+        print(f"error: pip invocation failed: {exc}", file=sys.stderr)  # noqa: T201
+        return 2
+    return proc.returncode
 
 
 def _run_mint_scheduler_cert(args: argparse.Namespace) -> int:
@@ -2067,6 +2350,179 @@ def _run_audit(args: argparse.Namespace) -> int:
         file=sys.stderr,
     )
     return 2
+
+
+def _run_projects(args: argparse.Namespace) -> int:
+    """Dispatch ``z4j-brain projects <subcommand>``."""
+    if args.projects_command == "rewrite-scheduler":
+        return _run_projects_rewrite_scheduler(args)
+    print(  # noqa: T201
+        f"z4j-brain projects: unknown subcommand "
+        f"{args.projects_command!r}",
+        file=sys.stderr,
+    )
+    return 2
+
+
+def _run_projects_rewrite_scheduler(args: argparse.Namespace) -> int:
+    """Rewrite ``Schedule.scheduler`` from one value to another for a project.
+
+    Operator-initiated explicit migration. Use this AFTER flipping
+    ``default_scheduler_owner`` if you want existing reconciler-managed
+    rows to retroactively move to the new owner; otherwise the next
+    reconcile will treat them as absent and (under
+    ``replace_for_source``) delete them.
+
+    Targets only ``declarative*`` and ``imported_*`` source rows by
+    default; pass ``--all-sources`` to widen.
+
+    Audit-logged with the rewrite count + from/to + scope so the
+    forensic trail is preserved.
+
+    Exit codes:
+        0 - success (or 0 rows in dry-run)
+        2 - misconfiguration (bad slug, can't connect to DB)
+    """
+    import asyncio
+    import uuid as _uuid
+
+    _bootstrap_env_for_management_commands()
+
+    from z4j_brain.domain.audit_service import AuditService
+    from z4j_brain.persistence.database import (
+        DatabaseManager,
+        create_engine_from_settings,
+    )
+    from z4j_brain.persistence.repositories import (
+        AuditLogRepository,
+        ProjectRepository,
+    )
+    from z4j_brain.settings import Settings
+
+    try:
+        settings = Settings()  # type: ignore[call-arg]
+    except Exception as exc:  # noqa: BLE001
+        print(  # noqa: T201
+            f"z4j-brain projects rewrite-scheduler: failed to "
+            f"load settings: {type(exc).__name__}",
+            file=sys.stderr,
+        )
+        return 2
+
+    audit_service = AuditService(settings)
+
+    async def _run() -> int:
+        from sqlalchemy import func, or_, update
+
+        from z4j_brain.persistence.models import Schedule
+
+        engine = create_engine_from_settings(settings)
+        db = DatabaseManager(engine)
+        try:
+            async with db.session() as session:
+                projects_repo = ProjectRepository(session)
+                project = await projects_repo.get_by_slug(args.slug)
+                if project is None:
+                    print(  # noqa: T201
+                        f"z4j-brain projects rewrite-scheduler: "
+                        f"project {args.slug!r} not found",
+                        file=sys.stderr,
+                    )
+                    return 2
+
+                # Build the WHERE predicate. ``LOWER(source)`` for
+                # parity between SQLite (case-insensitive LIKE) and
+                # Postgres (case-sensitive LIKE). ``ESCAPE '\\'`` so
+                # the literal underscore in ``declarative_django``
+                # matches a literal ``_`` only.
+                where_clauses = [
+                    Schedule.project_id == project.id,
+                    Schedule.scheduler == args.from_scheduler,
+                ]
+                if not args.all_sources:
+                    source_lower = func.lower(Schedule.source)
+                    where_clauses.append(
+                        or_(
+                            source_lower == "declarative",
+                            source_lower == "imported",
+                            source_lower.like(
+                                "declarative:%", escape="\\",
+                            ),
+                            source_lower.like(
+                                "declarative\\_%", escape="\\",
+                            ),
+                            source_lower.like(
+                                "imported\\_%", escape="\\",
+                            ),
+                        ),
+                    )
+
+                if args.dry_run:
+                    from sqlalchemy import select
+                    count_q = select(func.count()).select_from(
+                        Schedule,
+                    ).where(*where_clauses)
+                    n_rows = (await session.execute(count_q)).scalar() or 0
+                    scope = (
+                        "all sources"
+                        if args.all_sources
+                        else "declarative/imported sources"
+                    )
+                    print(  # noqa: T201
+                        f"z4j-brain projects rewrite-scheduler "
+                        f"(dry-run): would rewrite {n_rows} schedule(s) "
+                        f"in project {args.slug!r} from "
+                        f"{args.from_scheduler!r} → "
+                        f"{args.to_scheduler!r} (scope: {scope})",
+                    )
+                    return 0
+
+                result = await session.execute(
+                    update(Schedule)
+                    .where(*where_clauses)
+                    .values(scheduler=args.to_scheduler),
+                )
+                rewrote_n = result.rowcount or 0
+
+                # Audit-log the explicit migration. ``api_key_id``
+                # is None (CLI invocation, no bearer token);
+                # ``user_id`` is None too (CLI doesn't carry a
+                # user context). The metadata identifies the
+                # operator-initiated nature and records scope.
+                audit_repo = AuditLogRepository(session)
+                await audit_service.record(
+                    audit_repo,
+                    action="project.rewrite_scheduler",
+                    target_type="project",
+                    target_id=str(project.id),
+                    result="success",
+                    outcome="allow",
+                    project_id=project.id,
+                    metadata={
+                        "from": args.from_scheduler,
+                        "to": args.to_scheduler,
+                        "all_sources": bool(args.all_sources),
+                        "rewrote_n": rewrote_n,
+                        "invoked_via": "cli",
+                    },
+                )
+                await session.commit()
+                scope = (
+                    "all sources"
+                    if args.all_sources
+                    else "declarative/imported sources"
+                )
+                print(  # noqa: T201
+                    f"z4j-brain projects rewrite-scheduler: "
+                    f"rewrote {rewrote_n} schedule(s) in project "
+                    f"{args.slug!r} from {args.from_scheduler!r} "
+                    f"→ {args.to_scheduler!r} (scope: {scope})",
+                )
+                return 0
+        finally:
+            await db.dispose()
+
+    return asyncio.run(_run())
 
 
 def _run_audit_verify(args: argparse.Namespace) -> int:

@@ -1,6 +1,6 @@
 [project]
 name = "z4j-brain"
-version = "1.2.1"
+version = "1.3.0"
 description = "z4j brain - server, dashboard, and API (AGPL v3)"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -25,7 +25,14 @@ classifiers = [
     "Typing :: Typed",
 ]
 dependencies = [
-    "z4j-core",
+    # Audit fix HIGH-2 (1.2.2 eighth-pass): explicit version pin
+    # for parity with z4j-django/flask/fastapi (which all pin
+    # ``z4j-core>=1.2.2``). Without the floor, ``pip install
+    # z4j-brain==1.2.2`` would accept ANY z4j-core including
+    # an old version that doesn't have the v4 audit canonical
+    # form; with no upper bound, it would accept a future 2.x
+    # with breaking changes.
+    "z4j-core>=1.3.0,<2",
     "fastapi>=0.136",
     "uvicorn[standard]>=0.45",
     "pydantic[email]>=2.13.3",
@@ -126,6 +133,12 @@ build-backend = "hatchling.build"
 [tool.hatch.build]
 artifacts = [
   "backend/src/z4j_brain/dashboard/**",
+  # Audit fix HIGH-1 (1.2.2 sixth-pass): the drift-guard error
+  # message references audit-canonical-fields.md; ensure it ships
+  # in the wheel so a pip-installed brain that hits the guard can
+  # surface a path that actually exists. Belt-and-suspenders even
+  # though .md files under a packaged dir are normally included.
+  "backend/src/z4j_brain/docs/**",
 ]
 
 [tool.hatch.build.targets.wheel]

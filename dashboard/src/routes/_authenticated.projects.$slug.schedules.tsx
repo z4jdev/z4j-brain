@@ -513,6 +513,16 @@ function useScheduleColumns({
         enableSorting: true,
       },
       {
+        accessorKey: "scheduler",
+        header: "Scheduler",
+        cell: ({ row }: { row: { original: SchedulePublic } }) => (
+          <span className="font-mono text-xs text-muted-foreground">
+            {row.original.scheduler}
+          </span>
+        ),
+        enableSorting: true,
+      },
+      {
         accessorKey: "catch_up",
         header: "Catch-up",
         cell: ({ row }: { row: { original: SchedulePublic } }) => (

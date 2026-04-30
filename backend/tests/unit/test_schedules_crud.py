@@ -247,6 +247,97 @@ class TestCreateSchedule:
 
 
 # =====================================================================
+# 1.2.2 - Per-project default_scheduler_owner fallback
+# =====================================================================
+
+
+class TestDefaultSchedulerOwnerFallback:
+    """When ScheduleCreateIn.scheduler is omitted, the create handler
+    must fall back to the project's ``default_scheduler_owner``.
+    Pre-1.2.2 this defaulted to ``"z4j-scheduler"`` unconditionally.
+    Post-1.2.2 the project owns the default so celery-beat-first
+    shops can flip it without per-create overrides.
+    """
+
+    @pytest.mark.asyncio
+    async def test_create_without_scheduler_uses_project_default(
+        self, settings: Settings, brain_app,
+    ) -> None:
+        seed = await _make_seed(
+            settings=settings, brain_app=brain_app, is_admin=True,
+        )
+        # Flip the project default to "celery-beat" before creating
+        # the schedule.
+        async with brain_app.state.db.session() as s:
+            project = (
+                await s.execute(
+                    select(Project).where(Project.id == seed["project_id"]),
+                )
+            ).scalar_one()
+            project.default_scheduler_owner = "celery-beat"
+            await s.commit()
+
+        body = _create_body("via-default")
+        body.pop("scheduler", None)  # let server pick
+
+        async with _make_client(brain_app, settings, seed) as client:
+            r = await client.post(
+                "/api/v1/projects/default/schedules",
+                json=body,
+            )
+        assert r.status_code == 201, r.text
+        assert r.json()["scheduler"] == "celery-beat"
+
+    @pytest.mark.asyncio
+    async def test_explicit_scheduler_overrides_project_default(
+        self, settings: Settings, brain_app,
+    ) -> None:
+        seed = await _make_seed(
+            settings=settings, brain_app=brain_app, is_admin=True,
+        )
+        # Project default = celery-beat, but body explicitly picks
+        # z4j-scheduler. Body wins.
+        async with brain_app.state.db.session() as s:
+            project = (
+                await s.execute(
+                    select(Project).where(Project.id == seed["project_id"]),
+                )
+            ).scalar_one()
+            project.default_scheduler_owner = "celery-beat"
+            await s.commit()
+
+        body = _create_body("explicit-z4j")
+        body["scheduler"] = "z4j-scheduler"
+
+        async with _make_client(brain_app, settings, seed) as client:
+            r = await client.post(
+                "/api/v1/projects/default/schedules",
+                json=body,
+            )
+        assert r.status_code == 201, r.text
+        assert r.json()["scheduler"] == "z4j-scheduler"
+
+    @pytest.mark.asyncio
+    async def test_fresh_project_defaults_to_z4j_scheduler(
+        self, settings: Settings, brain_app,
+    ) -> None:
+        """Fresh project with no operator override: scheduler='z4j-scheduler'."""
+        seed = await _make_seed(
+            settings=settings, brain_app=brain_app, is_admin=True,
+        )
+        body = _create_body("fresh")
+        body.pop("scheduler", None)
+
+        async with _make_client(brain_app, settings, seed) as client:
+            r = await client.post(
+                "/api/v1/projects/default/schedules",
+                json=body,
+            )
+        assert r.status_code == 201, r.text
+        assert r.json()["scheduler"] == "z4j-scheduler"
+
+
+# =====================================================================
 # UPDATE
 # =====================================================================
 

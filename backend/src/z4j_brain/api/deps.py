@@ -301,9 +301,22 @@ async def get_optional_session(
     )
     if sid is None:
         return None
-    return await auth_service.resolve_session(
+    resolved = await auth_service.resolve_session(
         users=users, sessions=sessions, session_id=sid,
     )
+    # Audit fix HIGH (1.2.2 fourth-pass): mark the auth winner as
+    # "session" so ``resolve_api_key_id`` can correctly distinguish
+    # cookie-authenticated calls from bearer-authenticated calls.
+    # Without this, a request that authenticates via cookie but
+    # ALSO carries a (possibly stale) bearer header would have
+    # ``auth_kind`` left unset and the bearer-set
+    # ``request.state.api_key`` could leak into audit attribution.
+    # The cross-check at ``resolve_api_key_id`` only succeeds when
+    # ``auth_kind == "api_key"``; setting ``"session"`` here makes
+    # the contract explicit.
+    if resolved is not None:
+        request.state.auth_kind = "session"
+    return resolved
 
 
 async def _resolve_bearer_user(
@@ -499,7 +512,18 @@ async def _resolve_bearer_user(
             _release_touch_slot(key_row.id)
 
     request.state.api_key = key_row
-    request.state.auth_kind = "api_key"
+    # Audit fix HIGH-3 (1.2.2 fifth-pass): cookie wins over bearer
+    # for auth attribution. If ``get_optional_session`` already
+    # resolved a cookie session and set ``auth_kind = "session"``,
+    # don't overwrite it — the audit trail should show the cookie
+    # user as the actor, with the bearer header as a defense-in-
+    # depth sidecar (used by ``require_csrf`` to allow stricter
+    # paths). This matches ``require_csrf``'s C4 precedence: a
+    # request with BOTH cookie + bearer is treated as cookie-
+    # authenticated for CSRF + audit, even though the bearer can
+    # still grant elevated scope checks.
+    if getattr(request.state, "auth_kind", None) != "session":
+        request.state.auth_kind = "api_key"
     return user
 
 
@@ -507,6 +531,43 @@ async def get_optional_api_key_user(
     user: "User | None" = Depends(_resolve_bearer_user),
 ) -> "User | None":
     return user
+
+
+def resolve_api_key_id(request: Request) -> UUID | None:
+    """Read the acting API key id off the request scope, if any.
+
+    Returns the UUID of the bearer-token API key that authenticated
+    this request, or None if the call came in via cookie session
+    (or another non-bearer path).
+
+    1.2.2 audit fix HIGH-11 (second pass): every privileged write
+    endpoint that records an audit row should pass the result of
+    this helper into ``AuditService.record(api_key_id=...)`` so
+    the audit trail can distinguish a CI-triggered action from a
+    dashboard-session admin who happens to share the same human
+    user_id.
+
+    1.2.2 audit fix HIGH-2 (third pass): only return the key when
+    ``request.state.auth_kind == "api_key"``. Without this
+    cross-check, a request that authenticated via cookie but ALSO
+    carried a valid bearer header would attribute the audit row
+    to the bearer key — even though cookie was the auth winner.
+    Misattribution. We want the key id only when bearer auth was
+    the path that produced the current ``user_id``.
+    """
+    auth_kind = getattr(request.state, "auth_kind", None)
+    if auth_kind != "api_key":
+        return None
+    bearer_key = getattr(request.state, "api_key", None)
+    if bearer_key is None:
+        return None
+    try:
+        return getattr(bearer_key, "id", None)
+    except Exception:  # noqa: BLE001
+        # Defensive: a detached ORM row could raise on attribute
+        # access. Silent attribution loss is preferable to a
+        # request crash on the audit-write path.
+        return None
 
 
 async def get_optional_user(

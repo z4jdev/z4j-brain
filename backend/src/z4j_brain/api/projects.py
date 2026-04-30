@@ -12,7 +12,7 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
 from fastapi import APIRouter, Depends, Request, status
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import update
 
 from z4j_brain.api.deps import (
@@ -63,8 +63,30 @@ class ProjectPublic(BaseModel):
     timezone: str
     retention_days: int
     is_active: bool
+    # 1.2.2+: which scheduler owns newly-created schedules in this
+    # project when the operator didn't pick explicitly. Free-form
+    # string so future schedulers can be added without a new enum.
+    default_scheduler_owner: str
+    # 1.2.2+: optional allow-list. ``None`` = unrestricted (the
+    # default; backwards-compat with every existing operator).
+    # When set, schedule create/update/import paths reject any
+    # ``scheduler`` value not in the list.
+    allowed_schedulers: list[str] | None = None
     created_at: datetime
     updated_at: datetime
+
+
+# 1.2.2: known scheduler owner values. Free-form strings are also
+# accepted (so future schedulers can be added without a code
+# change), but these four are what the dashboard renders badges
+# for + what the per-project default validator suggests.
+# Audit fix CRIT-4 (1.2.2 seventh-pass): tightened from 64 to 40
+# chars. ``Schedule.scheduler`` is ``String(40)`` (defined long
+# before 1.2.2); a 41+ char value passing the regex but failing
+# the INSERT was a latent inconsistency exposed by 1.2.2's
+# default-resolution path. Both columns now agree at 40.
+_SCHEDULER_OWNER_PATTERN = r"^[a-z][a-z0-9_-]{0,39}$"
+_SCHEDULER_OWNER_REGEX = re.compile(_SCHEDULER_OWNER_PATTERN)
 
 
 # Round-8 audit fix R8-Pyd-LOW (Apr 2026): tighten environment to
@@ -74,6 +96,30 @@ class ProjectPublic(BaseModel):
 # rename. The dashboard's audit-log filter knows the canonical
 # four; anything else still renders as a plain string.
 _ENVIRONMENT_PATTERN = r"^[a-z][a-z0-9_-]{0,39}$"
+
+
+def _validate_allowed_schedulers_elements(
+    value: list[str] | None,
+) -> list[str] | None:
+    """Reject non-conforming entries in ``allowed_schedulers``.
+
+    Pydantic's `list[str]` allows free-form strings; this validator
+    pins each element to the same regex we apply to
+    ``default_scheduler_owner`` so the allow-list can't accumulate
+    junk values like ``"; DROP TABLE"`` or ``"<script>"``. (Not a
+    SQLi vector — the validator does ``==`` comparison — but it
+    would render unsafely in the dashboard.) Audit fix HIGH-8
+    second pass.
+    """
+    if value is None:
+        return value
+    for entry in value:
+        if not isinstance(entry, str) or not _SCHEDULER_OWNER_REGEX.match(entry):
+            raise ValueError(
+                f"allowed_schedulers entries must match "
+                f"{_SCHEDULER_OWNER_PATTERN!r}; got {entry!r}",
+            )
+    return value
 
 
 class CreateProjectRequest(BaseModel):
@@ -87,6 +133,26 @@ class CreateProjectRequest(BaseModel):
     )
     timezone: str = Field(default="UTC", max_length=64)
     retention_days: int = Field(default=30, ge=1, le=3650)
+    default_scheduler_owner: str = Field(
+        default="z4j-scheduler",
+        max_length=40,
+        pattern=_SCHEDULER_OWNER_PATTERN,
+    )
+    # 1.2.2 audit fix MED-13: optional allow-list of scheduler
+    # names that may own schedules in this project. ``None`` =
+    # unrestricted. Cap at 32 entries (a generous fleet count) so
+    # a typo'd config can't bloat the row.
+    allowed_schedulers: list[str] | None = Field(
+        default=None,
+        max_length=32,
+    )
+
+    @field_validator("allowed_schedulers")
+    @classmethod
+    def _validate_allowed_schedulers(
+        cls, v: list[str] | None,
+    ) -> list[str] | None:
+        return _validate_allowed_schedulers_elements(v)
 
 
 class UpdateProjectRequest(BaseModel):
@@ -100,6 +166,22 @@ class UpdateProjectRequest(BaseModel):
     )
     timezone: str | None = Field(default=None, max_length=64)
     retention_days: int | None = Field(default=None, ge=1, le=3650)
+    default_scheduler_owner: str | None = Field(
+        default=None,
+        max_length=40,
+        pattern=_SCHEDULER_OWNER_PATTERN,
+    )
+    allowed_schedulers: list[str] | None = Field(
+        default=None,
+        max_length=32,
+    )
+
+    @field_validator("allowed_schedulers")
+    @classmethod
+    def _validate_allowed_schedulers(
+        cls, v: list[str] | None,
+    ) -> list[str] | None:
+        return _validate_allowed_schedulers_elements(v)
 
 
 def _project_payload(project: "Project") -> ProjectPublic:
@@ -112,6 +194,10 @@ def _project_payload(project: "Project") -> ProjectPublic:
         timezone=project.timezone,
         retention_days=project.retention_days,
         is_active=project.is_active,
+        default_scheduler_owner=getattr(
+            project, "default_scheduler_owner", "z4j-scheduler",
+        ),
+        allowed_schedulers=getattr(project, "allowed_schedulers", None),
         created_at=project.created_at,
         updated_at=project.updated_at,
     )
@@ -212,6 +298,22 @@ async def create_project(
             details={"slug": body.slug},
         )
 
+    # Audit fix HIGH-9 (1.2.2 second-pass): same cross-check as
+    # update_project — if both default_scheduler_owner and
+    # allowed_schedulers are set, the default must be in the list.
+    if (
+        body.allowed_schedulers is not None
+        and body.default_scheduler_owner not in body.allowed_schedulers
+    ):
+        raise ConflictError(
+            "default_scheduler_owner must be in allowed_schedulers "
+            "when both are set",
+            details={
+                "default_scheduler_owner": body.default_scheduler_owner,
+                "allowed_schedulers": list(body.allowed_schedulers),
+            },
+        )
+
     from z4j_brain.persistence.models import Project
 
     project = Project(
@@ -221,6 +323,8 @@ async def create_project(
         environment=body.environment,
         timezone=body.timezone,
         retention_days=body.retention_days,
+        default_scheduler_owner=body.default_scheduler_owner,
+        allowed_schedulers=body.allowed_schedulers,
     )
     await projects.add(project)
 
@@ -255,6 +359,28 @@ async def update_project(
     db_session: "AsyncSession" = Depends(get_session),
     ip: str = Depends(get_client_ip),
 ) -> ProjectPublic:
+    """PATCH the project's mutable settings.
+
+    NOTE on ``default_scheduler_owner`` semantics (1.2.2 round-9):
+    flipping ``default_scheduler_owner`` only affects schedules
+    created AFTER the change. Existing rows keep their stored
+    ``Schedule.scheduler`` value (which was resolved at creation
+    time from the THEN-current default). The next reconciler
+    ``:import`` for those rows will resolve to the NEW default
+    and treat the OLD-default rows as absent — under
+    ``replace_for_source`` mode that means they get DELETED.
+    Operators who want to retroactively migrate stored values
+    use the ``z4j-brain projects rewrite-scheduler --slug X
+    --from A --to B`` CLI command (audit-logged, scoped to
+    declarative-source rows by default).
+
+    Why no auto-rewrite at PATCH time? Earlier 1.2.2 builds tried
+    that and it created a six-round cascade of concurrency / lock
+    / staleness bugs (rounds 3-8 in the audit history). The
+    explicit-CLI design has one mutable knob with predictable
+    semantics, instead of two coupled mutable knobs that need a
+    distributed-systems infrastructure to keep in sync.
+    """
     project = await projects.get_by_slug(slug)
     if project is None:
         raise NotFoundError(
@@ -283,11 +409,51 @@ async def update_project(
         project.slug = body.slug
     for field in (
         "name", "description", "environment", "timezone", "retention_days",
+        "default_scheduler_owner",
     ):
         value = getattr(body, field, None)
         if value is not None:
             changed[field] = value
             setattr(project, field, value)
+    # ``allowed_schedulers`` is special: ``None`` is meaningful
+    # (unrestricted), so we use the body's ``model_fields_set`` to
+    # tell "explicitly omitted" from "explicitly set to None /
+    # explicit empty list". Pydantic v2's ``model_fields_set``
+    # carries exactly that info.
+    if "allowed_schedulers" in body.model_fields_set:
+        # Empty list = strict-deny (no scheduler allowed) — that's
+        # likely a misconfig, so we reject it. ``None`` = unrestricted.
+        if body.allowed_schedulers is not None and len(
+            body.allowed_schedulers,
+        ) == 0:
+            raise ConflictError(
+                "allowed_schedulers cannot be an empty list "
+                "(use null to remove the restriction)",
+                details={"allowed_schedulers": []},
+            )
+        changed["allowed_schedulers"] = body.allowed_schedulers
+        project.allowed_schedulers = body.allowed_schedulers
+    # Audit fix HIGH-9 (1.2.2 second-pass): cross-check that the
+    # post-PATCH ``default_scheduler_owner`` is in the allow-list.
+    # The "default is implicitly allowed" rule means a mismatch
+    # silently widens the allow-list, surprising operators who
+    # set both. Reject so the operator gets an explicit signal.
+    if (
+        project.allowed_schedulers is not None
+        and project.default_scheduler_owner not in project.allowed_schedulers
+    ):
+        raise ConflictError(
+            "default_scheduler_owner must be in allowed_schedulers "
+            "when both are set; the implicit-default-allowed rule "
+            "would otherwise silently widen the allow-list. Add "
+            f"{project.default_scheduler_owner!r} to "
+            "allowed_schedulers, or change the default to one of "
+            f"{sorted(project.allowed_schedulers)}.",
+            details={
+                "default_scheduler_owner": project.default_scheduler_owner,
+                "allowed_schedulers": list(project.allowed_schedulers),
+            },
+        )
     project.updated_at = datetime.now(UTC)
 
     if changed:

@@ -188,3 +188,81 @@ class TestVerify:
             event_id=uuid.uuid4(),
         )
         assert audit.verify_row(row) is True
+
+
+@pytest.mark.asyncio
+class TestApiKeyAttribution:
+    """v4 HMAC + ``audit_log.api_key_id`` (1.2.2 audit fix HIGH-11)."""
+
+    async def test_api_key_id_persisted(
+        self, audit: AuditService, session: AsyncSession,
+    ) -> None:
+        repo = AuditLogRepository(session)
+        key_id = uuid.uuid4()
+        row = await audit.record(
+            repo,
+            action="schedules.import",
+            target_type="project",
+            result="success",
+            user_id=uuid.uuid4(),
+            api_key_id=key_id,
+        )
+        assert row.api_key_id == key_id
+        assert audit.verify_row(row) is True
+
+    async def test_tampering_with_api_key_id_breaks_hmac(
+        self, audit: AuditService, session: AsyncSession,
+    ) -> None:
+        """A DBA who swaps api_key_id without re-signing must fail verify."""
+        repo = AuditLogRepository(session)
+        original_key = uuid.uuid4()
+        row = await audit.record(
+            repo,
+            action="schedules.import",
+            target_type="project",
+            result="success",
+            api_key_id=original_key,
+        )
+        await session.commit()
+        # Simulate raw-DB tamper: rebind api_key_id without re-signing.
+        row.api_key_id = uuid.uuid4()
+        assert audit.verify_row(row) is False
+
+    async def test_pre_1_2_2_row_with_null_api_key_id_verifies(
+        self, audit: AuditService, session: AsyncSession,
+    ) -> None:
+        """A row written without api_key_id (the common cookie-session
+        path AND the pre-1.2.2 historical case) verifies cleanly via
+        the v4 HMAC where ``api_key_id IS NULL``.
+        """
+        repo = AuditLogRepository(session)
+        row = await audit.record(
+            repo,
+            action="schedules.create",
+            target_type="schedule",
+            result="success",
+            # api_key_id intentionally omitted - cookie-session call
+        )
+        assert row.api_key_id is None
+        assert audit.verify_row(row) is True
+
+    async def test_tampered_api_key_id_fails_verify(
+        self, audit: AuditService, session: AsyncSession,
+    ) -> None:
+        """v1.3.0 baseline: api_key_id is part of the v1 canonical
+        form, so swapping it without re-signing must break verify.
+        """
+        repo = AuditLogRepository(session)
+        row = await audit.record(
+            repo,
+            action="audit.test",
+            target_type="schedule",
+            result="success",
+            api_key_id=uuid.uuid4(),
+        )
+        await session.commit()
+        assert audit.verify_row(row) is True
+
+        # Tamper api_key_id in place — verify must fail.
+        row.api_key_id = uuid.uuid4()
+        assert audit.verify_row(row) is False
