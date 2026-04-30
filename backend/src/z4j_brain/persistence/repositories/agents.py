@@ -134,9 +134,17 @@ class AgentRepository(BaseRepository[Agent]):
                         engine_adapters=engine_adapters,
                         scheduler_adapters=scheduler_adapters,
                         capabilities=capabilities,
+                        # Raw SQL refers to the underlying DB column
+                        # name, ``metadata`` (the Python attribute is
+                        # prefixed only because plain ``metadata`` clashes
+                        # with SQLAlchemy's ``Base.metadata``). Pre-1.3.1
+                        # this referenced ``agent_metadata`` which does
+                        # not exist as a real column, raising
+                        # ``UndefinedColumn`` at runtime on every Postgres
+                        # agent connect that supplied a host payload.
                         agent_metadata=_text(
                             "jsonb_set("
-                            "COALESCE(agent_metadata, '{}'::jsonb), "
+                            "COALESCE(metadata, '{}'::jsonb), "
                             "'{host}', :host_json::jsonb, true)"
                         ).bindparams(
                             host_json=__import__("json").dumps(host_payload),

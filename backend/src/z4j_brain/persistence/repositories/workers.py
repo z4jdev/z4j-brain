@@ -17,6 +17,9 @@ from z4j_brain.persistence.repositories._base import BaseRepository
 #: Columns that vary between heartbeats and should be updated on
 #: ON CONFLICT. ``id``, ``project_id``, ``engine``, ``name``,
 #: ``created_at`` are immutable per row; everything else may change.
+#: Names here are the Python ATTRIBUTE names (what callers pass in
+#: ``r``); the upsert machinery below translates them to DB column
+#: names via ``_ATTR_TO_COL`` for ``stmt.excluded`` and ``.values()``.
 _UPSERT_VARIABLE_COLS = (
     "state",
     "last_heartbeat",
@@ -29,6 +32,25 @@ _UPSERT_VARIABLE_COLS = (
     "active_tasks",
     "worker_metadata",
 )
+
+#: Map Worker model attribute name -> actual DB column name. Almost
+#: every column name matches its attribute, except
+#: ``Worker.worker_metadata`` whose DB column is plain ``metadata``
+#: (the attribute is prefixed only because ``metadata`` clashes with
+#: SQLAlchemy's reserved ``Base.metadata``). The dialect-level
+#: ``insert(Worker).values(...)`` and ``stmt.excluded.<col>`` paths
+#: BOTH key off DB column names, so we translate before either
+#: touches SQL. Bug fixed in 1.3.1: pre-1.3.1 the bulk-upsert path
+#: passed the attribute name straight through, hitting
+#: ``AttributeError: worker_metadata`` on every worker heartbeat.
+_ATTR_TO_COL = {
+    "worker_metadata": "metadata",
+}
+
+
+def _to_col(attr: str) -> str:
+    """Return DB column name for a Worker attribute name."""
+    return _ATTR_TO_COL.get(attr, attr)
 
 
 #: Event kinds we count per worker. Source of truth is
@@ -216,7 +238,12 @@ class WorkerRepository(BaseRepository[Worker]):
             }
             # Pass-through optional columns so INSERT carries them
             # if this row is the first observation. Only keys we
-            # whitelist propagate - extra junk gets dropped.
+            # whitelist propagate - extra junk gets dropped. Keys
+            # stay as ATTRIBUTE names here because ``_ins(Worker)``
+            # is mapper-aware: ``.values()`` resolves attribute names
+            # to columns. In the ON CONFLICT branch below we DO
+            # translate to DB column names because ``stmt.excluded``
+            # and the ``set_=`` dict are NOT mapper-aware.
             for col in _UPSERT_VARIABLE_COLS:
                 if col == "state":
                     continue
@@ -236,10 +263,13 @@ class WorkerRepository(BaseRepository[Worker]):
         # Build ON CONFLICT DO UPDATE set_ from the union of columns
         # any input row carried. This preserves "no key, no touch"
         # semantics: a heartbeat carrying only ``last_heartbeat`` +
-        # ``state`` will not write NULL into ``hostname``.
+        # ``state`` will not write NULL into ``hostname``. Both the
+        # set_= keys and ``stmt.excluded.<>`` lookups need the DB
+        # column name (Worker.worker_metadata -> "metadata").
         update_cols: dict[str, Any] = {}
         for col in present_update_cols:
-            update_cols[col] = getattr(stmt.excluded, col)
+            db_col = _to_col(col)
+            update_cols[db_col] = getattr(stmt.excluded, db_col)
 
         if not update_cols:
             # Nothing to update on conflict - degenerate case where

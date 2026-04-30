@@ -318,3 +318,82 @@ class TestBulkUpsertSqlCount:
         )
         w = result.scalar_one()
         assert w.concurrency == 8
+
+
+@pytest.mark.asyncio
+class TestBulkUpsertWorkerMetadata:
+    """Regression: ``Worker.worker_metadata`` is the Python attribute,
+    but the underlying DB column is named ``metadata`` (the prefix
+    avoids clashing with SQLAlchemy's ``Base.metadata``). The bulk
+    upsert path passes column names through to
+    ``insert().values()`` and ``stmt.excluded.<col>`` — both of which
+    key off DB column names, not attribute names. Pre-1.3.1 the
+    bulk path passed the attribute name straight through, hitting
+    ``AttributeError: worker_metadata`` on every worker heartbeat
+    that carried a metadata payload — which is every heartbeat in
+    practice, since the agent always populates it. Caused empty
+    Workers tab on the dashboard until 1.3.1 fixed the translation.
+    """
+
+    async def test_insert_with_worker_metadata(
+        self, session: AsyncSession, project: Project,
+    ) -> None:
+        repo = WorkerRepository(session)
+        now = datetime.now(UTC)
+        await repo.upsert_from_events_bulk([
+            {
+                "project_id": project.id,
+                "engine": "celery",
+                "name": "celery@meta-insert",
+                "state": WorkerState.ONLINE,
+                "last_heartbeat": now,
+                "worker_metadata": {"version": "5.6.3", "platform": "linux"},
+            },
+        ])
+        await session.commit()
+
+        result = await session.execute(
+            select(Worker).where(Worker.name == "celery@meta-insert"),
+        )
+        w = result.scalar_one()
+        assert w.worker_metadata == {"version": "5.6.3", "platform": "linux"}
+
+    async def test_update_with_worker_metadata_on_conflict(
+        self, session: AsyncSession, project: Project,
+    ) -> None:
+        repo = WorkerRepository(session)
+        t1 = datetime.now(UTC) - timedelta(seconds=10)
+        t2 = datetime.now(UTC)
+
+        # First batch lands the worker with v1 metadata.
+        await repo.upsert_from_events_bulk([
+            {
+                "project_id": project.id,
+                "engine": "celery",
+                "name": "celery@meta-update",
+                "state": WorkerState.ONLINE,
+                "last_heartbeat": t1,
+                "worker_metadata": {"version": "5.5.0"},
+            },
+        ])
+        await session.commit()
+
+        # Second batch updates the metadata via ON CONFLICT.
+        await repo.upsert_from_events_bulk([
+            {
+                "project_id": project.id,
+                "engine": "celery",
+                "name": "celery@meta-update",
+                "state": WorkerState.ONLINE,
+                "last_heartbeat": t2,
+                "worker_metadata": {"version": "5.6.3", "newkey": "ok"},
+            },
+        ])
+        await session.commit()
+
+        result = await session.execute(
+            select(Worker).where(Worker.name == "celery@meta-update"),
+        )
+        w = result.scalar_one()
+        # Metadata fully replaced (it's a JSON column, not a merge).
+        assert w.worker_metadata == {"version": "5.6.3", "newkey": "ok"}
