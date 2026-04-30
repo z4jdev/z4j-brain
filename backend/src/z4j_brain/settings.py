@@ -193,6 +193,36 @@ class Settings(BaseSettings):
     #: instead).
     agent_stale_prune_days: int = Field(default=30, ge=0, le=3650)
 
+    #: Source URL for the operator-initiated *Check for updates* button
+    #: in Settings -> System (1.3.4+). The brain ships with a bundled
+    #: ``versions.json`` snapshot generated from
+    #: ``sites/_shared/packages.ts`` at brain release time, so the
+    #: Agents page renders version comparisons WITHOUT any outbound
+    #: HTTP by default. The ``Check for updates`` button lets an
+    #: operator pull a fresher snapshot when they want one.
+    #:
+    #: Default: GitHub raw URL of the umbrella repo's bundled
+    #: ``versions.json`` (committed by ``release-split.sh`` on every
+    #: release wave). Operators can:
+    #:
+    #: - Leave the default and click the button when curious.
+    #: - Set to a private mirror URL for air-gapped fleets that allow
+    #:   internal HTTPS but not raw.githubusercontent.com.
+    #: - Set to empty string to HIDE the button entirely (paranoid /
+    #:   strict no-outbound deploys). The bundled snapshot is then
+    #:   the only source.
+    #:
+    #: This is the ONLY URL the brain ever fetches by default and
+    #: only when a logged-in admin clicks the button. There is no
+    #: background polling. There is no telemetry.
+    version_check_url: str = Field(
+        default=(
+            "https://raw.githubusercontent.com/z4jdev/z4j/main/"
+            "versions.json"
+        ),
+        max_length=2048,
+    )
+
     # ------------------------------------------------------------------
     # Rate limiting
     # ------------------------------------------------------------------

@@ -1,6 +1,6 @@
 [project]
 name = "z4j-brain"
-version = "1.3.3"
+version = "1.3.4"
 description = "z4j brain - server, dashboard, and API (AGPL v3)"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -141,6 +141,13 @@ artifacts = [
   # surface a path that actually exists. Belt-and-suspenders even
   # though .md files under a packaged dir are normally included.
   "backend/src/z4j_brain/docs/**",
+  # 1.3.4 - bundled snapshot of every z4j package's latest known
+  # version, generated from sites/_shared/packages.ts via
+  # scripts/gen-versions-json.py. Read at brain startup so the
+  # dashboard's Agents page can render an "update available" badge
+  # without phoning home. Operators can refresh the snapshot from
+  # GitHub on demand via Settings -> Check for updates.
+  "backend/src/z4j_brain/data/**",
 ]
 
 [tool.hatch.build.targets.wheel]

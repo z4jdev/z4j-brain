@@ -5,6 +5,92 @@ All notable changes to this package are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.4] - 2026-04-30
+
+**Per-agent version visibility on the dashboard, with no telemetry.**
+
+The Agents page now shows each agent's z4j-core version next to
+its name, with a small badge when an *update is available* or
+when the agent is *incompatible* (major version mismatch). All
+comparisons run against a versions snapshot bundled into the
+brain wheel itself - no automatic outbound HTTP, no telemetry.
+An admin-only *Check for updates* button on Settings -> System
+fetches a fresher snapshot from GitHub on demand (configurable,
+disable-able).
+
+### Added
+
+- **Bundled versions snapshot**: every brain wheel now ships
+  `z4j_brain/data/versions.json` listing the latest known version
+  of every z4j package as of this brain's release. Generated from
+  `sites/_shared/packages.ts` (the canonical source the websites
+  also consume) by `scripts/gen-versions-json.py`. Read at brain
+  startup into `app.state.versions_snapshot`.
+- **`agent_version` persistence**: `AgentRepository.mark_online`
+  stores the agent's hello-frame version under
+  `agent_metadata['version']` on every connect. No DB migration
+  (existing JSON column).
+- **Agents API** (`GET /api/v1/projects/{slug}/agents`) now
+  returns `agent_version: str | null` and a computed
+  `version_status: "current" | "outdated" | "newer_than_known" |
+  "incompatible" | "unknown" | null` per agent.
+- **Admin endpoints**:
+  - `GET /api/v1/admin/system/versions` - returns the cached
+    snapshot (bundled or remote-refreshed) + the configured
+    check-for-updates URL.
+  - `POST /api/v1/admin/system/versions/check` - operator-
+    initiated remote refresh. Fetches `Z4J_VERSION_CHECK_URL`
+    (default GitHub raw URL of the umbrella repo's
+    `versions.json`), validates the response, atomic-swaps the
+    in-memory snapshot. Strict failure modes (HTTPS-only,
+    256 KB cap, schema validation) keep a hostile mirror from
+    poisoning the brain.
+- **Setting `version_check_url`** (env: `Z4J_VERSION_CHECK_URL`).
+  Default: `https://raw.githubusercontent.com/z4jdev/z4j/main/versions.json`.
+  Set to empty to hide the *Check for updates* button entirely
+  (paranoid / strict no-outbound deploys keep the bundled
+  snapshot only). Set to a private mirror URL for air-gapped
+  fleets.
+- **Dashboard**:
+  - VERSION column on the Agents page with the per-status badge.
+    Tooltip explains the recommended action (`pip install -U`,
+    *upgrade required*, etc.).
+  - Settings -> System: *Update checks* card showing the
+    snapshot's age, source (`bundled` / `remote`), the configured
+    check URL, and a *Check for updates* button. Toast on
+    success; clean error on any failure mode (URL empty,
+    non-200, oversized, schema invalid).
+- **`scripts/gen-versions-json.py`**: parses
+  `sites/_shared/packages.ts` into the bundled `versions.json`.
+  Hooked into `release-split.sh` so every release wave
+  regenerates automatically.
+
+### Privacy posture
+
+Reaffirmed and tightened: **no automatic background polling, no
+telemetry**. The bundled snapshot is the default source of truth.
+The remote URL is fetched ONLY when an admin explicitly clicks
+*Check for updates*. The default URL is GitHub raw (universally
+allowlisted, tamper-evident in git history, served via GitHub's
+CDN). Operators who want zero outbound HTTP set the env var
+empty and the button disappears.
+
+### Tests
+
+- 36 new tests in `test_version_check.py` covering the SemVer
+  parser, snapshot validator, every `compare()` status branch,
+  bundled-file loader, and every documented `fetch_remote()`
+  failure mode (empty URL, non-https, non-200, invalid JSON,
+  oversized response, invalid schema). Full brain unit suite:
+  738 passed.
+
+### Compatibility
+
+Drop-in upgrade from 1.3.3. Schema unchanged (uses the existing
+`agent_metadata` JSON column). No migration. Floor unchanged
+(`z4j-core>=1.3.1`). Older agents that don't report a version
+render `-` in the VERSION column - no errors.
+
 ## [1.3.3] - 2026-04-30
 
 **Schedule snapshot reconciliation: brain ingests full-inventory

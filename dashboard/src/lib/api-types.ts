@@ -103,6 +103,21 @@ export interface AgentPublic {
    *  when one agent token is shared across multiple workers and you
    *  want per-instance labels. Null if the agent never set it. */
   host_name?: string | null;
+  /** Agent's z4j-core SemVer string from the hello frame
+   *  (1.3.4+). Null when the agent has never connected or runs
+   *  a pre-1.0.3 build. */
+  agent_version?: string | null;
+  /** Computed comparison of `agent_version` against the brain's
+   *  cached versions snapshot. One of: `current`, `outdated`,
+   *  `newer_than_known`, `incompatible`, `unknown`. Null when
+   *  `agent_version` is null. */
+  version_status?:
+    | "current"
+    | "outdated"
+    | "newer_than_known"
+    | "incompatible"
+    | "unknown"
+    | null;
 }
 
 export interface CreateAgentRequest {

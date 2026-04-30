@@ -755,6 +755,17 @@ def create_app(
     app.state.dashboard_hub = dashboard_hub
     app.state.worker_supervisor = supervisor
 
+    # 1.3.4: load the bundled versions snapshot once at startup. The
+    # Agents API + dashboard read from this for the *Update available*
+    # badge logic. Operator-initiated *Check for updates* in Settings
+    # replaces this in-memory snapshot with a fresher one fetched
+    # from GitHub. No background polling, no telemetry.
+    from z4j_brain.domain.version_check import load_bundled
+
+    app.state.versions_snapshot = load_bundled()
+    app.state.versions_snapshot_source = "bundled"
+    app.state.versions_snapshot_fetched_at = None
+
     # ------------------------------------------------------------------
     # Middleware (outermost first)
     # ------------------------------------------------------------------
@@ -812,6 +823,10 @@ def create_app(
     app.include_router(users_api.router, prefix="/api/v1")
     app.include_router(notifications_api.router, prefix="/api/v1")
     app.include_router(user_notifications_api.router, prefix="/api/v1")
+    # 1.3.4: admin-scoped /admin/system endpoints (Check for updates).
+    from z4j_brain.api import system as system_api  # noqa: PLC0415
+
+    app.include_router(system_api.router, prefix="/api/v1")
     app.include_router(agent_longpoll_api.router, prefix="/api/v1")
     # Invitations - two routers (admin project-scoped + public accept).
     app.include_router(invitations_api.admin_router, prefix="/api/v1")

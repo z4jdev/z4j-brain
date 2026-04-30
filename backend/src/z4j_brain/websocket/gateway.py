@@ -213,6 +213,14 @@ async def ws_agent(websocket: WebSocket) -> None:
             # this from the operator's `Z4J_AGENT_NAME` env / settings.Z4J
             # ``agent_name`` field. Persisted under agent_metadata['host'].
             host=dict(first_frame.payload.host) if first_frame.payload.host else None,
+            # 1.3.4: persist the agent's z4j-core version (sent in the
+            # hello frame's ``agent_version`` field) for the dashboard's
+            # per-agent VERSION column + *update available* badge.
+            # Agents older than 1.0.3 may report empty / 0.0.0; the
+            # dashboard renders ``unknown`` in that case.
+            agent_version=(
+                agent_ver if agent_ver and agent_ver != "0.0.0" else None
+            ),
         )
         await db_session.commit()
 

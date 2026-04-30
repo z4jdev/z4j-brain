@@ -96,6 +96,7 @@ class AgentRepository(BaseRepository[Agent]):
         scheduler_adapters: list[str],
         capabilities: dict[str, Any],
         host: dict[str, Any] | None = None,
+        agent_version: str | None = None,
     ) -> None:
         """Set state=online + bump connect/seen + refresh handshake metadata.
 
@@ -104,8 +105,29 @@ class AgentRepository(BaseRepository[Agent]):
         Stored under ``agent_metadata['host']`` so it survives across the
         existing schema without a migration. Dashboards surface
         ``host.name`` next to the mint-time agent name.
+
+        ``agent_version`` (1.3.4+) is the agent's z4j-core version
+        string from the hello frame's ``agent_version`` field. Stored
+        under ``agent_metadata['version']`` for the dashboard's
+        per-agent VERSION column + *update available* badge.
+        Optional - older agents that don't populate the field skip
+        the write and the dashboard renders ``unknown``.
         """
         now = datetime.now(UTC)
+        # Build the set of metadata-keys we want to merge on this
+        # connect. ``host`` and ``agent_version`` are both optional;
+        # if neither is present we skip the metadata write entirely
+        # (the simpler ELSE branch below).
+        metadata_updates: dict[str, Any] = {}
+        if host:
+            metadata_updates["host"] = dict(host)
+        if agent_version:
+            # 1.3.4: persist the hello-frame agent_version so the
+            # Agents page can render the per-agent VERSION column +
+            # *update available* badge against the bundled
+            # ``versions.json`` snapshot.
+            metadata_updates["version"] = str(agent_version)
+
         # Round-7 audit fix R7-LOW (race) (Apr 2026): use Postgres
         # ``jsonb_set`` so the metadata write is a single atomic UPDATE
         # instead of SELECT-then-UPDATE. The previous RMW could lose
@@ -113,8 +135,7 @@ class AgentRepository(BaseRepository[Agent]):
         # sessions read the same baseline, the loser's write overwrites
         # the winner's). On SQLite (no jsonb_set) we fall back to the
         # legacy RMW path — the dev DB is single-writer so no race.
-        if host:
-            host_payload = dict(host)
+        if metadata_updates:
             dialect = (
                 self.session.bind.dialect.name
                 if self.session.bind is not None else ""
@@ -122,6 +143,31 @@ class AgentRepository(BaseRepository[Agent]):
             if dialect == "postgresql":
                 from sqlalchemy import text as _text  # noqa: PLC0415
 
+                # Chain ``jsonb_set`` calls so each metadata key is
+                # set independently in a single SQL statement. Order
+                # is deterministic; later keys see the merged result
+                # of earlier ones. Each call uses
+                # ``COALESCE(metadata, '{}'::jsonb)`` defensively in
+                # case some prior path nulled the column.
+                #
+                # Raw SQL refers to the underlying DB column name,
+                # ``metadata`` (the Python attribute is prefixed
+                # only because plain ``metadata`` clashes with
+                # SQLAlchemy's ``Base.metadata``). Pre-1.3.1 this
+                # referenced ``agent_metadata`` which does not
+                # exist as a real column.
+                expr = "COALESCE(metadata, '{}'::jsonb)"
+                bind_params: dict[str, Any] = {}
+                for i, (key, value) in enumerate(metadata_updates.items()):
+                    pname = f"meta_{i}_value"
+                    expr = (
+                        f"jsonb_set({expr}, "
+                        f"'{{{key}}}', "
+                        f":{pname}::jsonb, true)"
+                    )
+                    bind_params[pname] = (
+                        __import__("json").dumps(value)
+                    )
                 await self.session.execute(
                     update(Agent)
                     .where(Agent.id == agent_id)
@@ -134,21 +180,7 @@ class AgentRepository(BaseRepository[Agent]):
                         engine_adapters=engine_adapters,
                         scheduler_adapters=scheduler_adapters,
                         capabilities=capabilities,
-                        # Raw SQL refers to the underlying DB column
-                        # name, ``metadata`` (the Python attribute is
-                        # prefixed only because plain ``metadata`` clashes
-                        # with SQLAlchemy's ``Base.metadata``). Pre-1.3.1
-                        # this referenced ``agent_metadata`` which does
-                        # not exist as a real column, raising
-                        # ``UndefinedColumn`` at runtime on every Postgres
-                        # agent connect that supplied a host payload.
-                        agent_metadata=_text(
-                            "jsonb_set("
-                            "COALESCE(metadata, '{}'::jsonb), "
-                            "'{host}', :host_json::jsonb, true)"
-                        ).bindparams(
-                            host_json=__import__("json").dumps(host_payload),
-                        ),
+                        agent_metadata=_text(expr).bindparams(**bind_params),
                     ),
                 )
             else:
@@ -157,7 +189,7 @@ class AgentRepository(BaseRepository[Agent]):
                 )
                 current_meta = row.scalar_one_or_none() or {}
                 new_meta = dict(current_meta)
-                new_meta["host"] = host_payload
+                new_meta.update(metadata_updates)
                 await self.session.execute(
                     update(Agent)
                     .where(Agent.id == agent_id)

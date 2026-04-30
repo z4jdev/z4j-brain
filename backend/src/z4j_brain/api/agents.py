@@ -8,7 +8,7 @@ import uuid
 from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Request
 from pydantic import BaseModel, Field
 from sqlalchemy.exc import IntegrityError
 
@@ -84,6 +84,29 @@ class AgentPublic(BaseModel):
             "dashboard. Null if the agent never set Z4J_AGENT_NAME."
         ),
     )
+    agent_version: str | None = Field(
+        default=None,
+        description=(
+            "z4j-core SemVer string the agent advertised in its hello "
+            "frame (1.3.4+). Null when the agent has never connected "
+            "or runs a pre-1.0.3 build that didn't populate the field."
+        ),
+    )
+    version_status: str | None = Field(
+        default=None,
+        description=(
+            "Comparison of ``agent_version`` against the brain's "
+            "bundled (or operator-refreshed) versions snapshot. One "
+            "of: ``current`` (agent matches the snapshot), "
+            "``outdated`` (agent older, same major - update "
+            "available), ``newer_than_known`` (agent newer than the "
+            "snapshot - the brain's snapshot is stale, refresh from "
+            "Settings -> Check for updates), ``incompatible`` (major "
+            "version mismatch), ``unknown`` (no agent_version "
+            "reported, or the package is missing from the snapshot). "
+            "Null if ``agent_version`` is null."
+        ),
+    )
 
 
 class CreateAgentRequest(BaseModel):
@@ -108,7 +131,11 @@ class CreateAgentResponse(BaseModel):
     )
 
 
-def _agent_payload(agent: "Agent") -> AgentPublic:
+def _agent_payload(
+    agent: "Agent",
+    *,
+    versions_snapshot: Any | None = None,
+) -> AgentPublic:
     # Only flag as outdated when the agent has actually connected -
     # never-connected rows carry a placeholder ``protocol_version``
     # (see AgentRepository.insert) and would otherwise show as
@@ -120,8 +147,9 @@ def _agent_payload(agent: "Agent") -> AgentPublic:
     )
     # Pull the operator-supplied host.name out of agent_metadata.host
     # if the agent ever sent one in its hello frame. The metadata blob
-    # is bounded by the gateway (only the host dict is persisted there)
-    # so there's no risk of exposing internal fields.
+    # is bounded by the gateway (only the host dict + agent_version
+    # are persisted there) so there's no risk of exposing internal
+    # fields.
     meta = agent.agent_metadata or {}
     host_blob = meta.get("host") if isinstance(meta, dict) else None
     host_name: str | None = None
@@ -129,6 +157,31 @@ def _agent_payload(agent: "Agent") -> AgentPublic:
         candidate = host_blob.get("name")
         if isinstance(candidate, str) and candidate:
             host_name = candidate
+
+    # 1.3.4: ``agent_version`` and the computed ``version_status``.
+    # Both null for agents that never reported a version (older
+    # builds, never-connected rows). The status is computed against
+    # whatever versions_snapshot the brain has cached (bundled at
+    # build time, optionally refreshed via Settings -> Check for
+    # updates).
+    agent_version_raw: str | None = None
+    if isinstance(meta, dict):
+        v = meta.get("version")
+        if isinstance(v, str) and v:
+            agent_version_raw = v
+    version_status: str | None = None
+    if agent_version_raw is not None:
+        if versions_snapshot is None:
+            version_status = "unknown"
+        else:
+            from z4j_brain.domain.version_check import compare
+
+            # Compare against the agent's z4j-core line (the
+            # ``agent_version`` field carries z4j-core's version).
+            version_status = compare(
+                agent_version_raw, "z4j-core", versions_snapshot,
+            )
+
     return AgentPublic(
         id=agent.id,
         project_id=agent.project_id,
@@ -144,6 +197,8 @@ def _agent_payload(agent: "Agent") -> AgentPublic:
         created_at=agent.created_at,
         is_outdated=is_outdated,
         host_name=host_name,
+        agent_version=agent_version_raw,
+        version_status=version_status,
     )
 
 
@@ -155,6 +210,7 @@ def _agent_payload(agent: "Agent") -> AgentPublic:
 @router.get("", response_model=list[AgentPublic])
 async def list_agents(
     slug: str,
+    request: "Request",
     user: "User" = Depends(get_current_user),
     memberships: "MembershipRepository" = Depends(get_membership_repo),
     projects: "ProjectRepository" = Depends(get_project_repo),
@@ -173,7 +229,8 @@ async def list_agents(
     )
     agents = AgentRepository(db_session)
     rows = await agents.list_for_project(project.id)
-    return [_agent_payload(a) for a in rows]
+    snapshot = getattr(request.app.state, "versions_snapshot", None)
+    return [_agent_payload(a, versions_snapshot=snapshot) for a in rows]
 
 
 @router.post(

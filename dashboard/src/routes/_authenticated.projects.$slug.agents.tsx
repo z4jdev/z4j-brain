@@ -163,6 +163,7 @@ function AgentsPage() {
                   <TableHead>State</TableHead>
                   <TableHead>Framework</TableHead>
                   <TableHead>Engines</TableHead>
+                  <TableHead>Version</TableHead>
                   <TableHead className="text-right">Last seen</TableHead>
                   <TableHead className="text-right"></TableHead>
                 </TableRow>
@@ -191,6 +192,12 @@ function AgentsPage() {
                     </TableCell>
                     <TableCell className="text-xs text-muted-foreground">
                       {agent.engine_adapters.join(", ") || "-"}
+                    </TableCell>
+                    <TableCell>
+                      <AgentVersionCell
+                        version={agent.agent_version ?? null}
+                        status={agent.version_status ?? null}
+                      />
                     </TableCell>
                     <TableCell className="text-right">
                       <DateCell value={agent.last_seen_at} />
@@ -325,5 +332,80 @@ function AgentsPage() {
         </DialogContent>
       </Dialog>
     </>
+  );
+}
+
+
+/**
+ * Render the agent's z4j-core version string with an "update available"
+ * (or "incompatible") badge driven by the brain's bundled
+ * versions.json snapshot. The brain computes ``version_status``
+ * server-side; we only translate it into colors and copy.
+ *
+ * 1.3.4+. Pre-1.3.4 brains return ``agent_version: null`` and
+ * ``version_status: null`` for every row; we render a plain dash.
+ */
+function AgentVersionCell({
+  version,
+  status,
+}: {
+  version: string | null;
+  status: string | null;
+}) {
+  if (!version) {
+    return <span className="text-xs text-muted-foreground/60">-</span>;
+  }
+  let badge: { label: string; className: string; title: string } | null = null;
+  switch (status) {
+    case "outdated":
+      badge = {
+        label: "update available",
+        className:
+          "border-amber-500/40 bg-amber-500/10 text-amber-600 dark:text-amber-400",
+        title:
+          "An update is available. Run pip install --upgrade z4j-bare on the agent box and restart the host process.",
+      };
+      break;
+    case "incompatible":
+      badge = {
+        label: "incompatible",
+        className:
+          "border-destructive/40 bg-destructive/10 text-destructive",
+        title:
+          "Major version mismatch with the brain's snapshot. Upgrade z4j-bare to a compatible major version.",
+      };
+      break;
+    case "newer_than_known":
+      badge = {
+        label: "newer than known",
+        className:
+          "border-muted-foreground/30 bg-muted text-muted-foreground",
+        title:
+          "Agent is newer than the brain's snapshot. The brain itself may be out of date - try Settings → System → Check for updates.",
+      };
+      break;
+    case "unknown":
+      // No badge - just show the version. The reason can be the
+      // package being missing from the snapshot or the agent string
+      // being unparseable; either way an explicit "unknown" badge
+      // would be more confusing than informative.
+      break;
+    case "current":
+    default:
+      // No badge for current. Clean default state.
+      break;
+  }
+  return (
+    <div className="flex items-center gap-2">
+      <span className="font-mono text-sm">{version}</span>
+      {badge ? (
+        <span
+          title={badge.title}
+          className={`inline-flex items-center rounded-full border px-2 py-0.5 text-[10px] font-medium ${badge.className}`}
+        >
+          {badge.label}
+        </span>
+      ) : null}
+    </div>
   );
 }
