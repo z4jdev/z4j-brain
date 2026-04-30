@@ -39,7 +39,7 @@ logger = structlog.get_logger("z4j.brain.startup")
 
 # Round-8 audit fix R8-HIGH-4 (Apr 2026): module-level holder for
 # the bootstrap password supplied via ``z4j-brain serve
-# --admin-password``. Stays in process memory only — never lands in
+# --admin-password``. Stays in process memory only, never lands in
 # ``os.environ`` (where ``/proc/<pid>/environ`` would expose it to
 # other processes under the same UID, AND every subprocess we fork
 # would inherit it). Single-use: ``run_first_boot_check`` consumes

@@ -19,7 +19,7 @@ the WAL file) is reserved for an explicit operator action and
 *not* the periodic loop, because it can stall behind a long-
 running read transaction (audit fix MED-14).
 
-Postgres deployments don't need this — the task detects the
+Postgres deployments don't need this, the task detects the
 dialect at start and exits cleanly if it's not SQLite.
 """
 
@@ -50,7 +50,7 @@ class WalCheckpointTask:
         await task.stop()
 
     On non-SQLite databases :meth:`start` logs once and returns
-    without spawning a task — the operation is a no-op.
+    without spawning a task, the operation is a no-op.
     """
 
     def __init__(self) -> None:
@@ -62,7 +62,7 @@ class WalCheckpointTask:
         # Audit fix MED (second pass): -1 sentinel matches the
         # documented "no useful number" semantics. 0 used to mean
         # "ran once and checkpointed nothing" AND "never run yet"
-        # — distinct states that operators graphing the gauge need
+        #, distinct states that operators graphing the gauge need
         # to distinguish.
         self._last_pages_checkpointed: int = -1
         self._last_error: str | None = None
@@ -146,7 +146,7 @@ class WalCheckpointTask:
         and the ``z4j-brain wal-checkpoint`` CLI subcommand.
 
         Audit fix LOW: raise a clear error if called before
-        ``start()`` — pre-fix this hit ``AssertionError`` (or
+        ``start()``, pre-fix this hit ``AssertionError`` (or
         ``AttributeError`` under ``python -O``).
         """
         if self._db is None or self._settings is None:

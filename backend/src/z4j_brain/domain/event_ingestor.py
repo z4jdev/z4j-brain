@@ -131,7 +131,7 @@ class EventIngestor:
         worker_seen: dict[tuple[str, str], datetime] = {}
         # Round-7 audit fix R7-HIGH (perf) (Apr 2026): same trick
         # for queue touches. Pre-fix every event with a ``queue``
-        # field fired its own ``queue_repo.touch`` round-trip — a
+        # field fired its own ``queue_repo.touch`` round-trip, a
         # 1000-event batch all in one queue did 1000 upserts. Now
         # we collect ``(engine, name)`` while iterating and emit
         # one ``touch`` per unique pair after the loop.
@@ -426,7 +426,7 @@ class EventIngestor:
         # ``schedule.snapshot`` at boot, on its periodic timer, and on
         # demand from a ``schedule.resync`` command. The data carries
         # the full inventory of every schedule its scheduler adapter
-        # observes — we 3-way diff against the DB (insert / update /
+        # observes, we 3-way diff against the DB (insert / update /
         # delete-missing) scoped to (project, scheduler). Added in
         # 1.3.3 to close the gap where existing celery-beat /
         # rq-scheduler / apscheduler schedules were invisible until

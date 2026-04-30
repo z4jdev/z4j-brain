@@ -191,7 +191,7 @@ class SchedulerServiceImpl(pb_grpc.SchedulerServiceServicer):
         # 1. ``asyncio.wait_for(sem.acquire(), 0)`` is documented as
         #    racy when the awaitable completes synchronously: the
         #    timer fires, ``wait_for`` cancels the task, but the
-        #    task already decremented ``_value`` — slot leaked,
+        #    task already decremented ``_value``, slot leaked,
         #    caller sees TimeoutError. Triggered on every successful
         #    acquire under load.
         #
@@ -399,7 +399,7 @@ class SchedulerServiceImpl(pb_grpc.SchedulerServiceServicer):
         #    ``_value`` and returns immediately; the timer fires
         #    in the same tick and ``wait_for`` cancels the task
         #    that just succeeded, raising TimeoutError. The slot
-        #    was DECREMENTED but the caller sees rejection — slot
+        #    was DECREMENTED but the caller sees rejection, slot
         #    leaked permanently. Triggers on every successful
         #    acquire under load. Observed in production: a single
         #    scheduler client with retry-loop reconnects exhausted
@@ -488,7 +488,7 @@ class SchedulerServiceImpl(pb_grpc.SchedulerServiceServicer):
             self._watch_global_count -= 1
             if self._watch_global_count < 0:
                 # Defensive: never let the counter go negative.
-                # If it does, log loud — that's a code bug.
+                # If it does, log loud, that's a code bug.
                 logger.error(
                     "z4j.brain.scheduler_grpc: watch_global_count "
                     "went negative (%d); resetting to 0",
@@ -1383,9 +1383,9 @@ class SchedulerServiceImpl(pb_grpc.SchedulerServiceServicer):
         # split between fire-side and task-side failures
         # (docs/SCHEDULER.md §5.9):
         #
-        # - ``schedule.fire.{succeeded,failed}`` — outcome of the
+        # - ``schedule.fire.{succeeded,failed}``, outcome of the
         #   FireSchedule round-trip itself.
-        # - ``schedule.task_failed`` — emitted in addition to
+        # - ``schedule.task_failed``, emitted in addition to
         #   ``schedule.fire.failed`` whenever the agent reports a
         #   task-side failure. The two are aliases at present
         #   because the brain can't yet distinguish "couldn't

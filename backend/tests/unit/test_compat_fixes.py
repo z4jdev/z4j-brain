@@ -51,7 +51,7 @@ from z4j_brain.startup_version import (
 
 
 # =====================================================================
-# C1 — schema_version skew warns, doesn't raise
+# C1, schema_version skew warns, doesn't raise
 # =====================================================================
 
 
@@ -139,7 +139,7 @@ class TestC1SchemaVersionWarnNotRaise:
 
 
 # =====================================================================
-# C2 — auto_migrate detects unknown DB head, raises clean error
+# C2, auto_migrate detects unknown DB head, raises clean error
 # =====================================================================
 
 
@@ -174,7 +174,7 @@ class TestC2AutoMigrateUnknownRevision:
 
 
 # =====================================================================
-# H1 — scheduler workers gated behind Z4J_SCHEDULER_GRPC_ENABLED
+# H1, scheduler workers gated behind Z4J_SCHEDULER_GRPC_ENABLED
 # =====================================================================
 
 
@@ -216,7 +216,7 @@ class TestH1SchedulerWorkersGated:
 
 
 # =====================================================================
-# H2 — SubscriptionFilters extra=ignore (rolling-upgrade safety)
+# H2, SubscriptionFilters extra=ignore (rolling-upgrade safety)
 # =====================================================================
 
 
@@ -243,7 +243,7 @@ class TestH2SubscriptionFiltersExtraIgnore:
     def test_security_relevant_forbid_kept(self):
         """The audit-finding-driven ``extra=forbid`` schemas
         (BulkDeleteRequest in tasks.py, UserSubscriptionCreate in
-        user_notifications.py) must remain strict — they're not
+        user_notifications.py) must remain strict, they're not
         typo-detection, they're privilege-controlling-field
         defenses.
         """
@@ -268,7 +268,7 @@ class TestH2SubscriptionFiltersExtraIgnore:
 
 
 # =====================================================================
-# M2 — Cache-Control on dashboard SPA fallback
+# M2, Cache-Control on dashboard SPA fallback
 # =====================================================================
 
 

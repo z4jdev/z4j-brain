@@ -22,7 +22,7 @@ broken, the next call returns :data:`grpc.StatusCode.UNAVAILABLE`
 (or ``DEADLINE_EXCEEDED`` if the call times out before the
 connection error surfaces). :meth:`trigger` catches those two codes,
 closes the dead channel, opens a fresh one, and retries the call
-exactly once. Any other status code is re-raised — they're either
+exactly once. Any other status code is re-raised, they're either
 the scheduler's structured rejection (in which case the caller
 already inspects ``response.error_code``) or a hard gRPC failure
 that retry won't fix.
@@ -91,7 +91,7 @@ class TriggerScheduleClient:
         # Round-7 audit fix R7-MED (race) (Apr 2026): serialise
         # connect/close. Without this, two concurrent ``trigger()``
         # callers could both see ``self._channel is None``, both
-        # build a ``secure_channel``, both assign — the loser's
+        # build a ``secure_channel``, both assign, the loser's
         # channel leaks (no ``close()``, no GC because of grpc-aio
         # internal refs).
         self._lock = asyncio.Lock()

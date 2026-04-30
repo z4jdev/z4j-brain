@@ -245,7 +245,7 @@ function FleetRow({ entry }: { entry: FleetEntry }) {
       <TableCell>
         <div>
           <div className="font-mono text-sm">
-            {info.instance_id ?? "—"}
+            {info.instance_id ?? "-"}
           </div>
           <div className="font-mono text-[10px] text-muted-foreground">
             {entry.url}
@@ -254,7 +254,7 @@ function FleetRow({ entry }: { entry: FleetEntry }) {
       </TableCell>
       <TableCell>
         <Badge variant="outline" className="font-mono text-[10px]">
-          {info.version ?? "—"}
+          {info.version ?? "-"}
         </Badge>
       </TableCell>
       <TableCell>
@@ -262,7 +262,7 @@ function FleetRow({ entry }: { entry: FleetEntry }) {
       </TableCell>
       <TableCell>
         <span className="font-mono text-xs text-muted-foreground">
-          {info.brain_grpc_url ?? "—"}
+          {info.brain_grpc_url ?? "-"}
         </span>
       </TableCell>
       <TableCell className="text-right tabular-nums">
@@ -309,7 +309,7 @@ function ReachabilityIcon({ ok }: { ok: boolean | null }) {
 
 function UptimeCell({ seconds }: { seconds?: number }) {
   if (seconds === undefined) {
-    return <span className="text-muted-foreground">—</span>;
+    return <span className="text-muted-foreground">-</span>;
   }
   let value: string;
   if (seconds < 60) value = `${Math.round(seconds)}s`;

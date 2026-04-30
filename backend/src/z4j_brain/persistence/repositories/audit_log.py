@@ -88,7 +88,7 @@ class AuditLogRepository(BaseRepository[AuditLog]):
         Round-9 audit fix R9-Stor-H4 (Apr 2026): the chain anchor
         lock used to be taken HERE, but the caller may then do
         seconds of I/O (signing, audit metadata serialisation,
-        etc.) before the actual INSERT — turning the audit chain
+        etc.) before the actual INSERT, turning the audit chain
         into a global serialisation point. The lock is now taken
         by :meth:`acquire_chain_lock` immediately before the
         INSERT in ``AuditService.record``, holding it for
@@ -129,7 +129,7 @@ class AuditLogRepository(BaseRepository[AuditLog]):
         concurrent racer that bypasses the lock fails at the DB
         level instead of forking the chain silently.
 
-        SQLite no-ops the lock — the dialect doesn't ship
+        SQLite no-ops the lock, the dialect doesn't ship
         ``pg_advisory_xact_lock`` and the dev path is single-writer.
         """
         # Stable magic so the same lock is reused across processes.

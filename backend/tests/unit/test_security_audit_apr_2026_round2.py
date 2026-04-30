@@ -216,7 +216,7 @@ class TestWatchSchedulesCounterUnderLock:
     """Round-10 audit fix R10-Sched-H1 (Apr 2026).
 
     The R7-MED-2 / R8 fix replaced a racy ``locked()`` + ``acquire()``
-    with ``asyncio.wait_for(sem.acquire(), 0)`` — but
+    with ``asyncio.wait_for(sem.acquire(), 0)``, but
     ``wait_for(coro, 0)`` is documented as racy when ``coro``
     completes synchronously: the timer fires in the same tick, the
     task is cancelled AFTER it succeeded, the slot is decremented
@@ -275,7 +275,7 @@ class TestWatchSchedulesCounterUnderLock:
         # The exact pre-fix expression must not reappear in code.
         assert "wait_for(self._watch_global_sem.acquire()" not in code
         # The semaphore attribute itself shouldn't even exist for
-        # the WatchSchedules cap any more — counter under lock is
+        # the WatchSchedules cap any more, counter under lock is
         # the contract.
         assert "_watch_global_sem" not in code
 
@@ -343,7 +343,7 @@ class TestWatchSchedulesCounterUnderLock:
         assert "self._watch_global_count = 0" in helper_body
 
     def test_init_seeds_counter_at_zero(self) -> None:
-        """The constructor must initialise the counter to 0 — a
+        """The constructor must initialise the counter to 0, a
         leftover semaphore-only init would leave the attribute
         missing and the first acquire would AttributeError."""
         from pathlib import Path

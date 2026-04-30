@@ -30,19 +30,19 @@ class ScheduleRepository(BaseRepository[Schedule]):
         """List schedules for a project, ordered by ``(name, id)``.
 
         v1.1.0: gained keyset pagination params. Pre-1.1 the call
-        was unbounded and returned every row in one shot — fine at
+        was unbounded and returned every row in one shot, fine at
         small scale, but a project with 1000+ schedules pulled all
         of them into memory on every dashboard refresh. Operators
         on the new path pass ``limit + cursor`` for fixed-page
         responses; legacy callers omitting both still get the full
-        unbounded list (back-compat — the endpoint layer enforces
+        unbounded list (back-compat, the endpoint layer enforces
         the cap going forward).
 
         The cursor is the ``(name, id)`` of the LAST row of the
         previous page; the next page starts strictly after it. The
         ``id`` tie-breaker prevents skips/dupes when multiple
         schedules share the same name (rare but possible across
-        projects — within one project it's unique by constraint).
+        projects, within one project it's unique by constraint).
         """
         from sqlalchemy import and_, or_
 
@@ -242,7 +242,7 @@ class ScheduleRepository(BaseRepository[Schedule]):
         The agent emits a ``schedule.snapshot`` event at boot, on a
         periodic timer, and on demand via the ``schedule.resync``
         command. The event carries the FULL inventory of every
-        schedule the named scheduler adapter currently observes —
+        schedule the named scheduler adapter currently observes -
         the brain's job here is to make the DB match: insert new
         rows, update existing rows, and delete rows that exist in
         the brain for this (project, scheduler) but are NOT in the
@@ -279,7 +279,7 @@ class ScheduleRepository(BaseRepository[Schedule]):
             observed_names.add(name)
 
             # Force the scheduler name to the snapshot's owning
-            # adapter — the inner schedule dict may be missing it
+            # adapter, the inner schedule dict may be missing it
             # or carry a stale value, but the snapshot's outer
             # ``scheduler`` field is the canonical source.
             enriched = dict(raw)

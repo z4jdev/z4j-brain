@@ -70,7 +70,7 @@ class ScheduleCircuitBreakerWorker:
         # ran ``recent_failures`` per-schedule. At 10k enabled
         # schedules (the comment below admitted this was the design
         # ceiling) that was 10k sessions + 10k SELECTs per breaker
-        # tick — burning a connection-pool slot per tick second and
+        # tick, burning a connection-pool slot per tick second and
         # blocking unrelated request paths on enterprise installs.
         #
         # New shape: ONE session, ONE listing of enabled schedules,

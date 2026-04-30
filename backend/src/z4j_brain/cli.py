@@ -1402,20 +1402,20 @@ def _write_secret_env_atomic(path: Path, payload: bytes) -> None:
 
     Round-8 audit fix R8-HIGH-1 (Apr 2026): pre-fix the file was
     written with the process umask (typically 0o644) and chmod'd
-    afterward — on a multi-user host any local UID could read the
+    afterward, on a multi-user host any local UID could read the
     secrets in the brief window before chmod, and on Windows chmod
     is a no-op so the file stayed world-readable.
 
     Strategy:
 
     1. Write to ``path.tmp`` via ``O_CREAT | O_EXCL | O_WRONLY |
-       O_NOFOLLOW`` with mode 0o600 — the kernel applies the mode
+       O_NOFOLLOW`` with mode 0o600, the kernel applies the mode
        atomically and rejects any pre-existing symlink at the
        filename. ``O_EXCL`` blocks a colocated user who pre-creates
        the temp as a symlink to e.g. ``/etc/cron.d/x``.
     2. ``os.replace`` is an atomic rename within the same FS, so
        the final ``path`` exists with mode 0o600 from the moment
-       it appears — no chmod window.
+       it appears, no chmod window.
     3. On Windows ``O_NOFOLLOW`` doesn't exist (no symlinks in the
        traditional sense); we drop the flag and rely on NTFS ACLs.
        A best-effort ``unlink`` of the temp on failure prevents
@@ -1456,7 +1456,7 @@ def _append_secret_env_atomic(path: Path, payload: bytes) -> None:
     Strategy: read existing payload, mint a fresh file via
     :func:`_write_secret_env_atomic` with the appended line, then
     ``os.replace`` swaps it in. The brief read-then-write race
-    matters less than the symlink/mode hardening — an attacker
+    matters less than the symlink/mode hardening, an attacker
     who could write into ``~/.z4j`` already has the box.
     """
     flags = os.O_RDONLY
@@ -1465,7 +1465,7 @@ def _append_secret_env_atomic(path: Path, payload: bytes) -> None:
     try:
         fd = os.open(str(path), flags)
     except OSError:
-        # File missing or symlink rejected — fall through to
+        # File missing or symlink rejected, fall through to
         # caller. Caller handles missing-file by minting fresh.
         raise
     try:
@@ -1669,7 +1669,7 @@ def _run_serve(args: argparse.Namespace) -> int:
             # Round-8 audit fix R8-HIGH-1 (Apr 2026): atomic mode-0o600
             # mint via O_CREAT|O_EXCL|O_NOFOLLOW. Pre-fix the file was
             # written with the process umask (typically 0o644) and
-            # chmod'd afterward — on a multi-user host any local UID
+            # chmod'd afterward, on a multi-user host any local UID
             # could read all three secrets in the brief window before
             # chmod, and on Windows chmod is a no-op so the file stayed
             # world-readable. ``O_EXCL`` blocks a colocated user who
@@ -2970,7 +2970,7 @@ def _bootstrap_env_for_management_commands() -> None:
     different secret (silent verification mismatches).
 
     New behavior: management commands READ an existing secret.env
-    if present, but REFUSE to mint when missing — they exit with a
+    if present, but REFUSE to mint when missing, they exit with a
     clear error pointing the operator at ``z4j-brain serve`` (which
     mints + prints the visible setup banner).
     """
@@ -2996,7 +2996,7 @@ def _bootstrap_env_for_management_commands() -> None:
         else:
             raise SystemExit(
                 "z4j-brain: refusing to mint Z4J_SECRET from a management "
-                "command — secret minting must happen via `z4j-brain serve`"
+                "command, secret minting must happen via `z4j-brain serve`"
                 " so the operator sees the persisted-secret banner. Run "
                 "`z4j-brain serve` once first (or set Z4J_SECRET + "
                 "Z4J_SESSION_SECRET explicitly via env vars).",

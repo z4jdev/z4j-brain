@@ -7,13 +7,13 @@ The 1.3.2 hotfix story:
 - ``GET /api/v1/auth/me`` synthesises an admin-grade membership row
   for every active project for global admins, so the dashboard's
   project switcher and the ``/settings/memberships`` page list them
-  with full admin badges. The synthesis is a UI affordance — no row
+  with full admin badges. The synthesis is a UI affordance, no row
   is written to the ``memberships`` table.
 - ``POST /api/v1/user/subscriptions`` (the New Subscription modal)
   pre-1.3.2 queried the ``memberships`` table directly via
   ``MembershipRepository.get_for_user_project``. For a global admin
   the query returned ``None`` and the endpoint 403'd with
-  *you are not a member of this project* — directly contradicting
+  *you are not a member of this project*, directly contradicting
   the dashboard, which had just rendered them as admin.
 - The sibling ``GET /api/v1/user/subscriptions`` endpoint already
   used the ``not user.is_admin`` short-circuit. The POST had drifted
@@ -189,7 +189,7 @@ class TestSubscriptionCreateGlobalAdmin:
         self, settings: Settings, brain_app,
     ) -> None:
         """Sanity check: the bypass is gated on ``is_admin``. A regular
-        user with no Membership row MUST still be blocked — otherwise
+        user with no Membership row MUST still be blocked, otherwise
         we've turned the membership check into a no-op for everyone.
         """
         db = brain_app.state.db
@@ -239,7 +239,7 @@ class TestSubscriptionCreateGlobalAdmin:
                 },
             )
             # Either 403 (auth error path) or 401 (deps decided session
-            # was anonymous) is acceptable here — the point is that the
+            # was anonymous) is acceptable here, the point is that the
             # 1.3.2 fix MUST NOT have widened the door to non-admins.
             assert resp.status_code in (401, 403), (
                 f"non-admin non-member POST /user/subscriptions "

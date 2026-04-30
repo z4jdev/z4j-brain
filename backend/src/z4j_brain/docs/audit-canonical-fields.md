@@ -1,4 +1,4 @@
-# Audit canonical fields — contract
+# Audit canonical fields, contract
 
 The audit-log row HMAC is computed from a stable JSON
 canonicalization of the row's content. Changing what goes into
@@ -9,12 +9,12 @@ us evolve the canonical without breaking historical rows.
 
 ## Files
 
-- `src/z4j_brain/domain/audit_service.py` —
-  - `_CANONICAL_FIELDS` — the tuple of field names that participate
-  - `_HMAC_VERSION` — the current canonical version int
-  - `AuditEntry` — the dataclass shape (one field per canonical entry)
-  - `AuditService._canonicalize` — the per-version payload builder
-  - `verify_canonical_fields_emitted` — startup-time round-trip check
+- `src/z4j_brain/domain/audit_service.py` -
+  - `_CANONICAL_FIELDS`, the tuple of field names that participate
+  - `_HMAC_VERSION`, the current canonical version int
+  - `AuditEntry`, the dataclass shape (one field per canonical entry)
+  - `AuditService._canonicalize`, the per-version payload builder
+  - `verify_canonical_fields_emitted`, startup-time round-trip check
 
 ## Versioning rule
 
@@ -43,10 +43,10 @@ Every change to `_CANONICAL_FIELDS` or `_canonicalize` is one of:
 Two guards live in `audit_service.py`:
 
 - **Module-load membership checks** (`_check_canonical_field("id", "v2")`
-  etc.) — fire `RuntimeError` at import time if a field has
+  etc.), fire `RuntimeError` at import time if a field has
   been deleted from the tuple. Cheap; survives `python -O`.
 
-- **Startup round-trip check** (`verify_canonical_fields_emitted`) —
+- **Startup round-trip check** (`verify_canonical_fields_emitted`) -
   called by `create_app` (1.2.2 fifth-pass audit fix CRIT-3). Builds
   a sample `AuditEntry` and asserts every `_CANONICAL_FIELDS` entry
   appears in `_canonicalize`'s JSON output. Catches the inverse
@@ -77,7 +77,7 @@ If you see `RuntimeError: audit canonical drift: ...`:
 
 - At brain boot: a developer changed `_CANONICAL_FIELDS` or
   `_canonicalize` without following the contract above.
-- During `z4j-brain audit verify`: same — module import is
+- During `z4j-brain audit verify`: same, module import is
   blocked. Roll back the brain version OR push a fix forward.
 
 The error message names the offending field and points at

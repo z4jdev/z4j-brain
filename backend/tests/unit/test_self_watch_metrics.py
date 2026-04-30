@@ -46,7 +46,7 @@ class TestSelfWatchProvider:
         """A counter reset (sweeper restart) is reflected as-is.
 
         With the Gauge-based design, a restart from 100 -> 0 just
-        sets the gauge back to 0 — no negative-delta gymnastics.
+        sets the gauge back to 0, no negative-delta gymnastics.
         """
         register_self_watch_provider(lambda: {"audit_pruned_total": 100})
         _refresh_self_watch_gauges()

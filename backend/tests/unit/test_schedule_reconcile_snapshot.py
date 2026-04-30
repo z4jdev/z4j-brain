@@ -8,7 +8,7 @@ gap where existing celery-beat / rq-scheduler / apscheduler schedules
 were invisible until the operator edited each one. The agent emits
 one snapshot per scheduler adapter at boot, on a periodic timer
 (default 15 min), and on demand from the brain's ``schedule.resync``
-command — the brain reconciles each into the DB scoped to
+command, the brain reconciles each into the DB scoped to
 ``(project, scheduler)``.
 """
 
@@ -57,7 +57,7 @@ def _schedule_dict(
     is_enabled: bool = True,
 ) -> dict[str, object]:
     """Shape that an agent's ``CeleryBeatSchedulerAdapter.list_schedules``
-    yields — what arrives in the snapshot event's ``data.schedules``."""
+    yields, what arrives in the snapshot event's ``data.schedules``."""
     return {
         "name": name,
         "task_name": task_name,

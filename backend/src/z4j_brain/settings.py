@@ -172,7 +172,7 @@ class Settings(BaseSettings):
     )
     #: Hard cap on rows deleted in one sweep pass. Prevents a
     #: million-row backlog from running as one runaway transaction
-    #: window — the next pass picks up the remaining rows. Audit
+    #: window, the next pass picks up the remaining rows. Audit
     #: fix MED-18.
     audit_retention_sweep_max_per_pass: int = Field(
         default=200_000, ge=1_000, le=10_000_000,
@@ -588,7 +588,7 @@ class Settings(BaseSettings):
         default=600.0, ge=1.0, le=1_000_000.0,
     )
     #: Sustained refill rate (tokens/second). Default 10 fires/sec
-    #: per cert — well above any normal scheduler workload; the cap
+    #: per cert, well above any normal scheduler workload; the cap
     #: only bites on runaway / hostile traffic. Operators with very
     #: high-volume single-cert deployments raise this; operators with
     #: a leaked-cert scenario in mind lower it.

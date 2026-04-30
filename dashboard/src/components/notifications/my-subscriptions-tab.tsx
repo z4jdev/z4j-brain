@@ -382,7 +382,7 @@ function SubscriptionDialog({
   const { data: projectChannels } = useChannels(currentProjectSlug);
 
   // Wrap setProjectId to also clear the project-channel selection
-  // when the project changes — channel IDs from project A don't
+  // when the project changes, channel IDs from project A don't
   // exist in project B and would 409 on save. EDIT mode disables
   // the picker so this only fires in CREATE mode.
   const handleProjectChange = (newProjectId: string) => {
@@ -548,7 +548,7 @@ function SubscriptionDialog({
           </Select>
         </div>
 
-        {/* Priority filter — v1.0.18 added the inline help line so
+        {/* Priority filter, v1.0.18 added the inline help line so
             users know it requires @z4j_meta annotation on the task. */}
         <div
           className="space-y-2"

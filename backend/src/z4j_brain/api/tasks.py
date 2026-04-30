@@ -380,7 +380,7 @@ class BulkDeleteRequest(BaseModel):
 
     # Round-8 audit fix R8-Pyd-H4 (Apr 2026): cap the explicit list.
     # The handler slices to :1000 below the validator, but Pydantic
-    # parses + UUID-validates the whole list first — a 10M-element
+    # parses + UUID-validates the whole list first, a 10M-element
     # list still OOM-walks the validator before the slice. The cap
     # matches the handler's existing trim ceiling.
     task_ids: list[uuid.UUID] | None = Field(default=None, max_length=1000)

@@ -134,7 +134,7 @@ class AgentRepository(BaseRepository[Agent]):
         # concurrent updates from a NAT-bounce double-reconnect (both
         # sessions read the same baseline, the loser's write overwrites
         # the winner's). On SQLite (no jsonb_set) we fall back to the
-        # legacy RMW path — the dev DB is single-writer so no race.
+        # legacy RMW path, the dev DB is single-writer so no race.
         if metadata_updates:
             dialect = (
                 self.session.bind.dialect.name

@@ -128,7 +128,7 @@ class SchedulesListPublic(BaseModel):
     """Paged list of schedules (v1.1.0 N+1 fix).
 
     Pre-1.1 ``GET /schedules`` returned a bare ``list[SchedulePublic]``
-    with no LIMIT — a project with 1000+ schedules pulled every row
+    with no LIMIT, a project with 1000+ schedules pulled every row
     on every dashboard refresh. v1.1.0 adds keyset pagination on
     ``(name, id)``; the response envelope mirrors the existing
     deliveries / audit / commands list shape.
@@ -137,7 +137,7 @@ class SchedulesListPublic(BaseModel):
     AND the result set fits inside the default page (50), the
     response is structurally compatible with anything that just
     iterates ``items``. A consumer that previously did
-    ``response.json()`` and got a list now gets a dict — bumping
+    ``response.json()`` and got a list now gets a dict, bumping
     the response_model is a v1.0 → v1.1 contract change documented
     in the brain CHANGELOG.
     """
@@ -1378,7 +1378,7 @@ def _validate_scheduler_in_allowlist(
     """Reject schedulers outside the project's allow-list (1.2.2+).
 
     When ``project.allowed_schedulers`` is ``None`` (the default
-    for every existing operator) we accept any value — backwards-
+    for every existing operator) we accept any value, backwards-
     compat. When it's a list we enforce membership; the project's
     own ``default_scheduler_owner`` is implicitly allowed so
     flipping the setting never strands existing schedules.
@@ -1584,7 +1584,7 @@ async def import_schedules(
     # ``replace_for_source`` branch (because the source-specific
     # lock only matters for replace), but the PATCH-vs-import race
     # affects EVERY import that touches declarative-source rows
-    # under the OLD scheduler — including ``upsert_only``. Hoist
+    # under the OLD scheduler, including ``upsert_only``. Hoist
     # the project-wide lock outside the mode check; keep the
     # source-specific lock inside (it's finer-grained
     # reconcile-vs-reconcile serialization, only meaningful for
@@ -1647,7 +1647,7 @@ async def import_schedules(
         from z4j_brain.persistence.models import Schedule  # noqa: PLC0415
 
         # The pre-flight existing-row lookup is keyed by the
-        # resolved (scheduler, name) tuple — the same key the
+        # resolved (scheduler, name) tuple, the same key the
         # upsert uses. Pre-1.2.2-stored rows that were saved
         # under the legacy hardcoded default ``"z4j-scheduler"``
         # in projects whose ``default_scheduler_owner`` has been
@@ -1656,7 +1656,7 @@ async def import_schedules(
         # See migration ``2026_05_01_0019_legacy_scheduler_migrate``.
         # That migration runs at upgrade time so the lookup here
         # finds them under the new key without runtime dual-key
-        # logic (which had a double-firing bug — see round-4
+        # logic (which had a double-firing bug, see round-4
         # audit fix CRIT).
         batch_keys = [
             (_resolve_scheduler(row.scheduler), row.name)
@@ -1691,7 +1691,7 @@ async def import_schedules(
             _validate_scheduler_in_allowlist(project, row_scheduler)
             # Force the resolved scheduler into the upsert payload
             # so the persisted row matches the allowlist-validated
-            # value (and the surviving_ids tuple — see below).
+            # value (and the surviving_ids tuple, see below).
             row_data = row.model_dump()
             row_data["scheduler"] = row_scheduler
             outcome, schedule_row = await upsert_imported_schedule(

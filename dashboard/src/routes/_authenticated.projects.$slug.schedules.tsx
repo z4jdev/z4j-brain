@@ -242,7 +242,7 @@ function SchedulesPage() {
           {rows.some((r) => r.source !== "dashboard") && (
             <>
               <strong>Heads up:</strong> some selected rows have a
-              non-dashboard source — they may be re-created on the
+              non-dashboard source, they may be re-created on the
               next reconcile pass unless you also remove them
               upstream.
             </>

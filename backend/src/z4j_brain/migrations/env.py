@@ -31,7 +31,7 @@ from z4j_brain.settings import Settings
 # loading the models as a side effect) and
 # ``Base.metadata.create_all`` silently creates zero tables.
 # This was exactly the bug the 1.3.0 release-discipline smoke
-# test caught — easy to miss without a clean-venv run.
+# test caught, easy to miss without a clean-venv run.
 
 config = context.config
 

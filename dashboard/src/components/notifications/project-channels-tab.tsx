@@ -1081,7 +1081,7 @@ function ChannelDialog({ slug, mode, channel, onClose }: ChannelDialogProps) {
             />
             <p className="text-xs text-muted-foreground">
               In Discord: Server Settings → Integrations → Webhooks → New
-              Webhook. Paste the canonical URL — z4j auto-appends{" "}
+              Webhook. Paste the canonical URL, z4j auto-appends{" "}
               <span className="font-mono">/slack</span> at dispatch time.
             </p>
           </div>

@@ -24,7 +24,7 @@ How it works:
   batch's GUC scope is contained. A
   ``pg_try_advisory_lock(hashtext('z4j.audit_sweep'))`` at the
   top of the pass means only one brain replica holds the sweep
-  at a time — the others see the lock fail and skip the pass
+  at a time, the others see the lock fail and skip the pass
   cleanly. (Audit fix MED-15.)
 - SQLite: no trigger; plain DELETE. Most homelabs run SQLite,
   so this is the common path. SQLite is single-writer so the
@@ -64,7 +64,7 @@ logger = logging.getLogger("z4j.brain.audit_retention")
 
 
 #: Postgres advisory-lock key for cross-worker sweep coordination.
-#: Computed from ``hashtext('z4j.audit_sweep')`` — any int32 will
+#: Computed from ``hashtext('z4j.audit_sweep')``, any int32 will
 #: do, but using ``hashtext`` keeps it readable in the migration's
 #: comments. Audit fix MED-15.
 _SWEEP_ADVISORY_LOCK_KEY: int = 0x7A346A41  # "z4jaA" stable seed
@@ -139,7 +139,7 @@ class AuditRetentionSweeper:
 
         Audit fix CRIT-2: ``CancelledError`` raised into ``stop()``
         from the outer lifespan (e.g. uvicorn shutdown timeout)
-        propagates up — it MUST NOT be swallowed, otherwise the
+        propagates up, it MUST NOT be swallowed, otherwise the
         cancellation never reaches the parent and shutdown stalls.
         We catch ``TimeoutError`` (the wait_for budget elapsed) and
         broad ``Exception`` (the task itself raised) but explicitly
@@ -151,7 +151,7 @@ class AuditRetentionSweeper:
         try:
             await asyncio.wait_for(self._task, timeout=5.0)
         except asyncio.CancelledError:
-            # Outer scope is cancelling us — try a clean cancel of
+            # Outer scope is cancelling us, try a clean cancel of
             # the inner task, then re-raise so the cancellation
             # propagates.
             self._task.cancel()
@@ -247,14 +247,14 @@ class AuditRetentionSweeper:
 
         # Pre-flight: on Postgres only one worker should sweep at a
         # time. Use an xact-scoped advisory lock that auto-releases
-        # at COMMIT/ROLLBACK — no explicit unlock needed.
+        # at COMMIT/ROLLBACK, no explicit unlock needed.
         #
         # Audit fix CRIT-3 (1.2.2 third-pass): the previous design
         # used ``pg_try_advisory_lock`` (session-scoped) with an
         # explicit ``pg_advisory_unlock`` in a ``finally`` block
         # INSIDE ``async with session.begin()``. If the unlock
         # itself failed, the begin's __aexit__ rolled back the
-        # entire transaction — including the legitimate batched
+        # entire transaction, including the legitimate batched
         # DELETEs from earlier in the pass. By switching to
         # ``pg_try_advisory_xact_lock`` we eliminate the unlock
         # call entirely; the lock auto-releases on the same

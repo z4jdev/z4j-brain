@@ -253,7 +253,7 @@ async def mint_invitation(
     # ``Ｕｓｅｒ@example.com`` (full-width) while ``user@example.com``
     # already existed got a "no existing user" response, the invite
     # was minted, and accept-time TOCTOU re-canonicalization
-    # eventually 409'd — wasted invite + confusing UX. Canonicalize
+    # eventually 409'd, wasted invite + confusing UX. Canonicalize
     # before the dup-check AND store the canonical form on the row
     # so the accept path sees consistent state.
     from z4j_brain.domain.auth_service import canonicalize_email  # noqa: PLC0415
@@ -320,7 +320,7 @@ async def mint_invitation(
         token=plaintext,
         # Round-9 audit fix R9-Auth-MED (Apr 2026): URL fragment
         # not query string. See auth.py password-reset accept_url
-        # for the threat model — fragment isn't sent in Referer
+        # for the threat model, fragment isn't sent in Referer
         # headers, isn't written to access logs, and isn't synced
         # by most browser history mechanisms.
         accept_url_path=f"/invite#token={plaintext}",

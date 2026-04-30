@@ -424,7 +424,7 @@ function FireStatusBadge({ status }: { status: ScheduleFireStatus }) {
 
 function FireLatency({ latencyMs }: { latencyMs: number | null }) {
   if (latencyMs === null) {
-    return <span className="text-xs text-muted-foreground">—</span>;
+    return <span className="text-xs text-muted-foreground">-</span>;
   }
   // Sub-second rendered as ms; multi-second rendered as seconds with
   // one decimal so the column is scannable for both fast successes
@@ -469,5 +469,5 @@ function FireDetailCell({ fire }: { fire: ScheduleFirePublic }) {
       </span>
     );
   }
-  return <span className="text-xs text-muted-foreground">—</span>;
+  return <span className="text-xs text-muted-foreground">-</span>;
 }

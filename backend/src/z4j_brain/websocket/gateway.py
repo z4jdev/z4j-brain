@@ -273,7 +273,7 @@ async def ws_agent(websocket: WebSocket) -> None:
     # newly-minted session_id into the signer + verifier so the
     # HMAC envelope binds to this specific session. A captured
     # frame from a previous session can't be replayed inside this
-    # one — the verifier reconstitutes the envelope with THIS
+    # one, the verifier reconstitutes the envelope with THIS
     # session_id and the bytes signed under the prior session's
     # binding fail HMAC.
     signer = FrameSigner(

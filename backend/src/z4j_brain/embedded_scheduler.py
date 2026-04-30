@@ -189,7 +189,7 @@ def mint_loopback_pki(out_dir: Path) -> LoopbackPKI:
     ``Z4J_EMBEDDED_SCHEDULER_PKI_DIR=/etc`` and brain would
     happily overwrite ``/etc/ca.crt`` + reduce ``/etc`` to
     mode 0o700, breaking the host. The allow-list below is
-    deliberately conservative — operators with legitimate need
+    deliberately conservative, operators with legitimate need
     for an exotic path should set a path under one of these
     prefixes (e.g. ``/var/lib/z4j/scheduler-pki``).
 
@@ -495,18 +495,18 @@ class EmbeddedSchedulerSupervisor:
 
         Returns one of:
 
-        - ``"running"`` — subprocess is alive and accepting work.
-        - ``"restarting"`` — subprocess is currently down but the
+        - ``"running"``, subprocess is alive and accepting work.
+        - ``"restarting"``, subprocess is currently down but the
           watchdog has not yet exhausted its restart budget. /health
           probes should treat this as transient (do NOT page).
-        - ``"failed"`` — watchdog gave up; only a brain restart
+        - ``"failed"``, watchdog gave up; only a brain restart
           will recover. /health probes should treat as critical.
 
         Pre-fix the only signal was ``is_running`` (instantaneous)
         and ``permanently_failed`` (set after the cap). A k8s
         readiness probe checking ``is_running`` flapped red on
         every transient crash during the backoff window even
-        though the watchdog was about to respawn — paging
+        though the watchdog was about to respawn, paging
         operators on harmless restarts.
         """
         if self._permanently_failed:
@@ -583,7 +583,7 @@ class EmbeddedSchedulerSupervisor:
         # Round-9 audit fix R9-Sched-H2 (Apr 2026): validate every
         # element of ``embedded_scheduler_argv`` against an allow-list.
         # Pre-fix the operator-controlled list was splatted straight
-        # into ``create_subprocess_exec`` — a misconfigured operator,
+        # into ``create_subprocess_exec``, a misconfigured operator,
         # a future Settings loader that exposed this via dashboard /
         # API, or a compromised .env file could inject arbitrary
         # arguments into the trusted subprocess (e.g. swap to a
@@ -689,11 +689,11 @@ class EmbeddedSchedulerSupervisor:
 
         - ``PATH`` / ``PYTHONPATH`` / ``LANG`` / ``LC_*`` / ``TZ``
           / ``HOME`` / ``USER`` / ``LOGNAME`` / ``TERM`` /
-          ``TMPDIR`` — runtime essentials.
-        - ``Z4J_SCHEDULER_*`` — the scheduler's own config
+          ``TMPDIR``, runtime essentials.
+        - ``Z4J_SCHEDULER_*``, the scheduler's own config
           surface (env vars consumed by ``z4j_scheduler.settings``).
         - On Windows: ``SYSTEMROOT``, ``COMSPEC``, ``PATHEXT``,
-          ``USERPROFILE``, ``APPDATA``, ``LOCALAPPDATA`` — Python
+          ``USERPROFILE``, ``APPDATA``, ``LOCALAPPDATA``, Python
           + uvloop need these to start.
         """
         # Whitelist of env-var prefixes / exact names the subprocess

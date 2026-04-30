@@ -11,7 +11,7 @@ The verifier (:meth:`verify_row`) recomputes the HMAC and
 constant-time-compares. Combined with the database append-only
 trigger, this gives us tamper evidence for any party who does
 NOT also hold the master secret. A privileged DBA who DOES hold
-the secret can still forge rows — that scenario is out of scope
+the secret can still forge rows, that scenario is out of scope
 (addressed by operational controls: secret in env, not on disk).
 
 Secret rotation is supported transparently: callers add the old
@@ -95,7 +95,7 @@ class AuditEntry:
     #: Prior row's ``row_hmac`` at the moment THIS row was written.
     #: ``None`` for the very first row (genesis). Folded into the
     #: HMAC input so deleting any row breaks the next row's
-    #: ``prev_row_hmac`` anchor — detectable by ``verify_chain``.
+    #: ``prev_row_hmac`` anchor, detectable by ``verify_chain``.
     prev_row_hmac: str | None = None
     #: Bearer-token attribution. ``None`` for cookie-session
     #: actions (most dashboard work) or for actions taken via a
@@ -110,7 +110,7 @@ class AuditService:
     - the master secret (for HMAC computation)
     - the rotation-window secrets (for verifying pre-rotation rows)
 
-    It does NOT hold a session — callers pass the repository in
+    It does NOT hold a session, callers pass the repository in
     per-request, so the audit row participates in the caller's
     transaction. An audit row that "would have been written but
     the caller's transaction rolled back" is the wrong outcome
@@ -157,12 +157,12 @@ class AuditService:
         row_id = uuid.uuid4()
         # Take the chain advisory lock immediately before the head
         # read + insert. The lock window is "head read → HMAC
-        # compute → INSERT" — microseconds.
+        # compute → INSERT", microseconds.
         await repo.acquire_chain_lock()
         # Fetch the prior row's hmac so we can fold it into this
         # row's input. A subsequent DELETE of any row then leaves
         # the next row's ``prev_row_hmac`` referencing a prior row
-        # whose hmac no longer matches — detectable by
+        # whose hmac no longer matches, detectable by
         # ``verify_chain``.
         prev_row_hmac = await repo.get_latest_row_hmac()
         entry = AuditEntry(
@@ -245,11 +245,11 @@ class AuditService:
         Expects rows ordered by insert order (``id`` UUIDv7 or
         ``occurred_at`` ascending). Returns ``(ok, reasons)``
         where ``reasons`` is a list of human-readable descriptions
-        of any chain break — "row X: prev_row_hmac mismatch" or
+        of any chain break, "row X: prev_row_hmac mismatch" or
         "row X: bad row_hmac".
 
         A clean chain returns ``(True, [])``. A single deleted row
-        produces a visible mismatch at the next chained row —
+        produces a visible mismatch at the next chained row -
         that's the tamper-evidence the chain is designed to surface.
         """
         reasons: list[str] = []

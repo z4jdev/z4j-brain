@@ -38,7 +38,7 @@ class SchemaVersionError(RuntimeError):
     this from :func:`check_and_update_schema_version`).
 
     From v1.0.19 onward, the schema-version check logs a warning
-    instead of raising — see the module docstring for the
+    instead of raising, see the module docstring for the
     bidirectional-compat contract. This class is retained so any
     downstream code that catches the exception name doesn't break,
     but the brain itself never raises it anymore.

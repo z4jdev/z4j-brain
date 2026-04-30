@@ -11,7 +11,7 @@ rows in the DB.
 This test was added in 1.3.1 after a regression escaped 1.3.0:
 ``Worker.worker_metadata`` is the Python attribute, but the DB column
 is ``metadata``. The bulk-upsert path used the attribute name in
-``stmt.excluded.<>`` lookups, which key off DB column names — every
+``stmt.excluded.<>`` lookups, which key off DB column names, every
 heartbeat raised ``AttributeError: worker_metadata`` and the workers
 list silently stayed empty on every dashboard. The unit-level
 :mod:`test_workers_repo_bulk_upsert` tests didn't catch it because
@@ -84,7 +84,7 @@ def _build_celery_worker_details_payload() -> str:
     """Mirror the shape z4j-celery's ``CeleryEngine.get_worker_details``
     emits: dict keyed by hostname, each value carrying stats / active /
     active_queues / registered / conf. Encoded as a JSON string because
-    ``HeartbeatFrame.adapter_health`` is typed ``dict[str, str]`` —
+    ``HeartbeatFrame.adapter_health`` is typed ``dict[str, str]`` -
     agents serialise structured values to JSON before stuffing them
     in.
     """

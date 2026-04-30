@@ -51,7 +51,7 @@ async def health_ready(
 
     Round-8 audit fix R8-Bootstrap-MED (Apr 2026): also gate on
     ``app.state.lifespan_ready``. Pre-fix the brain returned 200
-    the moment uvicorn bound the port — but lifespan startup
+    the moment uvicorn bound the port, but lifespan startup
     (run_first_boot_check, registry.start, supervisor.start)
     runs AFTER the routes are mounted, so a k8s readiness probe
     flipped "ready" while the brain was still pre-bootstrap. The

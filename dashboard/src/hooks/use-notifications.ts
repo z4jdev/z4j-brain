@@ -677,7 +677,7 @@ export function useDeliveries(slug: string, limit = 50, cursor?: string | null) 
 
 /**
  * Personal delivery history across all the user's projects (v1.0.18).
- * Mirror of `useDeliveries` but unscoped — joins to the user's
+ * Mirror of `useDeliveries` but unscoped, joins to the user's
  * personal subscriptions on the backend. Optional `projectSlug`
  * narrows the view to one project; deliveries from projects the
  * user is no longer a member of still surface (audit data outlives

@@ -160,7 +160,7 @@ def _make_client(brain_app, settings: Settings, seed: dict):
 
 @pytest.mark.asyncio
 class TestSchedulesPagination:
-    """``GET /api/v1/projects/{slug}/schedules`` — keyset on (name, id)."""
+    """``GET /api/v1/projects/{slug}/schedules``, keyset on (name, id)."""
 
     async def test_envelope_shape_when_empty(
         self, settings: Settings, brain_app,
@@ -270,7 +270,7 @@ class TestSchedulesPagination:
     async def test_invalid_cursor_treated_as_no_cursor(
         self, settings: Settings, brain_app,
     ) -> None:
-        """A garbage cursor must not 500 — return the first page instead."""
+        """A garbage cursor must not 500, return the first page instead."""
         seed = await _seed_user_in_project(
             settings=settings, brain_app=brain_app,
         )
@@ -304,7 +304,7 @@ class TestSchedulesPagination:
 
 @pytest.mark.asyncio
 class TestUserSubscriptionsPagination:
-    """``GET /api/v1/user/subscriptions`` — keyset on (project_id, trigger, id)."""
+    """``GET /api/v1/user/subscriptions``, keyset on (project_id, trigger, id)."""
 
     async def test_envelope_shape_when_empty(
         self, settings: Settings, brain_app,

@@ -352,7 +352,7 @@ class TestReconnectOnStaleChannel:
         self, tmp_path: Path,
     ) -> None:
         """PERMISSION_DENIED is NOT a stale-channel signal; the client
-        must not retry — propagate to the caller.
+        must not retry, propagate to the caller.
         """
         import grpc
 
@@ -399,5 +399,5 @@ class TestReconnectOnStaleChannel:
                 )
 
         assert exc.value.code() == grpc.StatusCode.PERMISSION_DENIED
-        # Must not retry — exactly one call.
+        # Must not retry, exactly one call.
         assert denied.call_count == 1

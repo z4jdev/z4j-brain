@@ -263,6 +263,6 @@ class TestApiKeyAttribution:
         await session.commit()
         assert audit.verify_row(row) is True
 
-        # Tamper api_key_id in place — verify must fail.
+        # Tamper api_key_id in place, verify must fail.
         row.api_key_id = uuid.uuid4()
         assert audit.verify_row(row) is False

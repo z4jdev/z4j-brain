@@ -326,11 +326,11 @@ class TestBulkUpsertWorkerMetadata:
     but the underlying DB column is named ``metadata`` (the prefix
     avoids clashing with SQLAlchemy's ``Base.metadata``). The bulk
     upsert path passes column names through to
-    ``insert().values()`` and ``stmt.excluded.<col>`` — both of which
+    ``insert().values()`` and ``stmt.excluded.<col>``, both of which
     key off DB column names, not attribute names. Pre-1.3.1 the
     bulk path passed the attribute name straight through, hitting
     ``AttributeError: worker_metadata`` on every worker heartbeat
-    that carried a metadata payload — which is every heartbeat in
+    that carried a metadata payload, which is every heartbeat in
     practice, since the agent always populates it. Caused empty
     Workers tab on the dashboard until 1.3.1 fixed the translation.
     """

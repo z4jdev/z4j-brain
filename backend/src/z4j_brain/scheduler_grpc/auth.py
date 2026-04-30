@@ -272,7 +272,7 @@ def _normalise_cn(cn: str) -> str:
 
     **Important**: uses ``removeprefix`` (NOT ``lstrip``). ``lstrip``
     takes a SET of characters and would strip any leading combination
-    of ``D``, ``N``, ``S``, ``:`` — so a legitimate CN like
+    of ``D``, ``N``, ``S``, ``:``, so a legitimate CN like
     ``"DNS-Scheduler-1"`` or ``"Scheduler-1"`` would silently lose
     its leading characters and fail the allow-list. Pinned by
     ``tests/unit/test_scheduler_grpc.py::TestNormaliseCnDoesNotMangle``.
@@ -281,7 +281,7 @@ def _normalise_cn(cn: str) -> str:
     ``URI:``, ``email:`` general-name prefixes. Pre-fix the embedded
     server's IP-SAN (``127.0.0.1``, ``::1``) was returned as the
     literal string ``"IP:127.0.0.1"`` so allow-list operators had
-    to list the prefixed form — undocumented and a footgun.
+    to list the prefixed form, undocumented and a footgun.
     """
     bare = cn
     for prefix in ("DNS:", "IP:", "URI:", "email:"):

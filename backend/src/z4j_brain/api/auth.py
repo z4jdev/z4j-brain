@@ -872,7 +872,7 @@ async def _send_password_reset_email(
     # access logs, and is excluded from most browser-history
     # sync mechanisms. The reset page's JS reads it via
     # ``window.location.hash`` and POSTs it with the form. Same
-    # 256-bit token, same TTL — just shifted to a header / cache
+    # 256-bit token, same TTL, just shifted to a header / cache
     # surface that doesn't leak.
     accept_url = (
         f"{settings.public_url.rstrip('/')}/reset#token={plaintext_token}"
@@ -980,7 +980,7 @@ async def password_reset_confirm(
     # (``setup_service.complete``, ``change_password``,
     # ``invitations.accept``) called ``validate_policy`` first. An
     # attacker who phished a reset link could land any 8-char
-    # password on the account — Pydantic enforced ``min_length=8``
+    # password on the account, Pydantic enforced ``min_length=8``
     # but nothing else. Now mirrors ``change_password`` exactly.
     hasher.validate_policy(body.new_password)
     new_hash = hasher.hash(body.new_password)

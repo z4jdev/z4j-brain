@@ -160,12 +160,12 @@ class AuditLog(PKMixin, Base):
             "ix_audit_log_occurred_at",
             "occurred_at",
         ),
-        # Partial UNIQUE index on prev_row_hmac — enforces "one row
+        # Partial UNIQUE index on prev_row_hmac, enforces "one row
         # per chain link" so a missed advisory lock or a future
         # bypass of ``AuditService.record`` can't silently fork the
         # chain. Genesis row carries ``prev_row_hmac=NULL`` and
         # NULL!=NULL in UNIQUE, so the partial predicate excludes
-        # the genesis row from uniqueness — exactly what we want.
+        # the genesis row from uniqueness, exactly what we want.
         Index(
             "ux_audit_log_prev_row_hmac",
             "prev_row_hmac",
@@ -173,7 +173,7 @@ class AuditLog(PKMixin, Base):
             postgresql_where=text("prev_row_hmac IS NOT NULL"),
             sqlite_where=text("prev_row_hmac IS NOT NULL"),
         ),
-        # Partial index on api_key_id — supports the dashboard's
+        # Partial index on api_key_id, supports the dashboard's
         # "filter audit log by API key" view without a sequential
         # scan once the table grows. Most rows have api_key_id IS
         # NULL (cookie-session actions), so the partial predicate

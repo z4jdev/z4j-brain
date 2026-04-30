@@ -132,7 +132,7 @@ def create_app(
 
     # Audit fix CRIT-3 (1.2.2 fifth-pass): run the canonical-fields
     # round-trip drift guard at startup so a future regression is
-    # caught early — but BEFORE we've started the brain proper, so
+    # caught early, but BEFORE we've started the brain proper, so
     # the operator sees a clean error rather than a half-booted
     # brain. The cheap membership check ran at module import; this
     # is the deeper "field is in tuple but not emitted" check.

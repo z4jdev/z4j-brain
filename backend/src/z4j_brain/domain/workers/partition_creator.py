@@ -63,12 +63,12 @@ class PartitionCreatorWorker:
           windows; a row landing there means either the
           pre-creator missed a tick or an agent supplied a wildly
           out-of-range timestamp. Either way it requires operator
-          attention — non-empty default partition silently blocks
+          attention, non-empty default partition silently blocks
           ``ATTACH PARTITION`` for that range later.
         - **R9-Stor-H2**: refuse to ``DROP`` a partition whose
           MAX(occurred_at) is past the cutoff. Pre-fix the worker
           parsed the partition NAME for the date and dropped on
-          name alone — clock skew between worker and DB hosts, or
+          name alone, clock skew between worker and DB hosts, or
           a manually re-attached partition with rows from a
           different range, would silently destroy live data.
         - **R9-Stor-H3**: set ``lock_timeout='2s'`` before each
@@ -137,7 +137,7 @@ class PartitionCreatorWorker:
                         "z4j partition creator: events_default has rows; "
                         "investigate clock skew, missed pre-create ticks, "
                         "or agent-supplied out-of-range occurred_at "
-                        "timestamps — a non-empty default blocks ATTACH "
+                        "timestamps, a non-empty default blocks ATTACH "
                         "PARTITION for that range",
                         rows=int(default_count),
                     )
@@ -179,7 +179,7 @@ class PartitionCreatorWorker:
                         continue
                     # R9-Stor-H2: probe MAX(occurred_at) before drop.
                     # Refuse if any row in the partition is newer
-                    # than the cutoff — name-based parsing alone
+                    # than the cutoff, name-based parsing alone
                     # can't catch clock skew or manually re-attached
                     # partitions covering a different range.
                     try:
@@ -207,7 +207,7 @@ class PartitionCreatorWorker:
                         if max_occurred.date() >= cutoff:
                             logger.warning(
                                 "z4j partition creator: refusing drop "
-                                "of %s — max(occurred_at)=%s exceeds "
+                                "of %s, max(occurred_at)=%s exceeds "
                                 "cutoff %s; investigate name vs "
                                 "content drift",
                                 partition_name,

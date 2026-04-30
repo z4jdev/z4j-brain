@@ -49,7 +49,7 @@ function GlobalNotificationsLayout() {
     <div className="space-y-6">
       <PageHeader
         title="Global Notifications"
-        description="Personal notification settings that follow you across every project — your channels, your subscriptions, and the full log of notifications that landed in your inbox."
+        description="Personal notification settings that follow you across every project, your channels, your subscriptions, and the full log of notifications that landed in your inbox."
       />
       <div className="border-b">
         <nav className="-mb-px flex gap-4" aria-label="Notification settings">

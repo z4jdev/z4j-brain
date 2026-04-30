@@ -764,7 +764,7 @@ class NotificationDeliveryRepository(BaseRepository[NotificationDelivery]):
         deleted (``subscription_id`` orphaned). Those rows still
         belong to the user historically; the dashboard renders them
         with a "subscription deleted" hint rather than hiding them.
-        Same principle for the user leaving the project — historical
+        Same principle for the user leaving the project, historical
         audit data survives membership changes.
         """
         if limit <= 0 or limit > 501:

@@ -784,7 +784,7 @@ async def test_user_channel_config(
     Round-6 audit fix Notif-HIGH (Apr 2026): the project-channel test
     endpoints already record a ``notifications.channel.test`` audit
     row (data-exfil pivot via attacker-controlled webhook URL); the
-    user-scoped variant was missing it. Same threat model — a
+    user-scoped variant was missing it. Same threat model, a
     compromised user account can dial out arbitrary HTTP / SMTP
     payloads to attacker infrastructure carrying brain test content.
     """
@@ -970,12 +970,12 @@ async def create_user_subscription(
     # bypass this membership check. /auth/me synthesises an admin
     # membership for them on every project (so the project switcher
     # renders), but the Membership table itself has no row for a
-    # global admin who hasn't been explicitly added — and pre-1.3.2
+    # global admin who hasn't been explicitly added, and pre-1.3.2
     # this endpoint queried the table directly and 403'd. The
     # ``list_user_subscriptions`` GET handler at the top of this file
     # already used the ``not user.is_admin`` short-circuit; this POST
     # had drifted out of sync with it. Switching to the canonical
-    # ``policy.require_member`` helper closes the drift permanently —
+    # ``policy.require_member`` helper closes the drift permanently -
     # it returns a synthesised admin-grade Membership for global
     # admins without touching the DB.
     from z4j_brain.domain.policy_engine import PolicyEngine

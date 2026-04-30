@@ -54,7 +54,7 @@ async def resolve_agent_by_bearer(
     secret. The token row in the DB was hashed with whatever was the
     master secret at mint time; without this loop a rotation would
     immediately invalidate every live agent token until each agent
-    re-mints one — which itself requires a working bearer.
+    re-mints one, which itself requires a working bearer.
     """
     if not bearer:
         return None

@@ -72,7 +72,7 @@ class Project(PKMixin, TimestampsMixin, Base):
     # gate (``_SCHEDULER_OWNER_PATTERN``) caps incoming values at
     # 40 chars to match ``Schedule.scheduler``; the column being
     # wider is harmless headroom. (We considered narrowing to 40
-    # in 1.2.2 round 8 via migration 0021 — reverted in round 9
+    # in 1.2.2 round 8 via migration 0021, reverted in round 9
     # along with the broader cascade revert.)
     default_scheduler_owner: Mapped[str] = mapped_column(
         String(64),
@@ -84,7 +84,7 @@ class Project(PKMixin, TimestampsMixin, Base):
     # ``allowed_schedulers`` (1.2.2+, audit fix MED-13): optional
     # JSON array of scheduler names this project may assign on
     # schedule create/update/import. ``NULL`` = unrestricted
-    # (backwards-compat default — existing operators see no
+    # (backwards-compat default, existing operators see no
     # behaviour change). When set, the schedule mutation paths
     # reject any value not in the list. Always allows
     # ``default_scheduler_owner`` so toggling the project setting

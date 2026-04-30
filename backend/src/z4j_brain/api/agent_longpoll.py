@@ -213,7 +213,7 @@ async def _get_or_create_session(
         # session-nonce B since both sessions reset seq=0 + have
         # independent nonce windows. Binding makes the HMAC fail.
         # The legacy sentinel (no-nonce client) gets an empty
-        # binding string — those clients are documented as
+        # binding string, those clients are documented as
         # "remain susceptible to H1/H2".
         binding = (
             session_nonce if isinstance(session_nonce, str)
@@ -295,7 +295,7 @@ class FrameUploadBody(BaseModel):
     def _cap_per_frame_size(cls, v: list[str]) -> list[str]:
         """Round-8 audit fix R8-Pyd-MED (Apr 2026): per-frame size cap.
 
-        Pre-fix the 500-element list cap was the only bound — each
+        Pre-fix the 500-element list cap was the only bound, each
         string was unlimited, so a single request could carry
         500 × 100 MB and OOM the brain before any downstream
         validator ran. Per-frame ceiling matches the wire frame

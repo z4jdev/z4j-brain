@@ -390,7 +390,7 @@ function DefaultSubscriptionDialog({
           </Select>
         </div>
 
-        {/* v1.0.18 — filter parity with personal subscriptions.
+        {/* v1.0.18, filter parity with personal subscriptions.
             Optional narrowing so a default can scope to e.g.
             "only critical task.failed in queue=billing". Empty
             = no filter (matches all). */}

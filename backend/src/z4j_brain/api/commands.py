@@ -130,7 +130,7 @@ class RetryTaskRequest(BaseModel):
 
         Pre-fix a 50 MB ``override_kwargs`` was parsed, persisted
         into ``commands.payload`` JSONB, HMAC-signed, and pushed
-        over the wire to the agent — a single retry request could
+        over the wire to the agent, a single retry request could
         OOM the brain or wedge the WS frame cap downstream. The
         64 KiB ceiling matches the ``_validate_args_kwargs_size``
         cap already used on schedule create/update.

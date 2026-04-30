@@ -515,7 +515,7 @@ async def _resolve_bearer_user(
     # Audit fix HIGH-3 (1.2.2 fifth-pass): cookie wins over bearer
     # for auth attribution. If ``get_optional_session`` already
     # resolved a cookie session and set ``auth_kind = "session"``,
-    # don't overwrite it — the audit trail should show the cookie
+    # don't overwrite it, the audit trail should show the cookie
     # user as the actor, with the bearer header as a defense-in-
     # depth sidecar (used by ``require_csrf`` to allow stricter
     # paths). This matches ``require_csrf``'s C4 precedence: a
@@ -551,7 +551,7 @@ def resolve_api_key_id(request: Request) -> UUID | None:
     ``request.state.auth_kind == "api_key"``. Without this
     cross-check, a request that authenticated via cookie but ALSO
     carried a valid bearer header would attribute the audit row
-    to the bearer key — even though cookie was the auth winner.
+    to the bearer key, even though cookie was the auth winner.
     Misattribution. We want the key id only when bearer auth was
     the path that produced the current ``user_id``.
     """

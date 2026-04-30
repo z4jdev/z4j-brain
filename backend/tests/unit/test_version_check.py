@@ -2,11 +2,11 @@
 
 Covers:
 
-- ``ParsedVersion.parse`` — SemVer extraction, tolerant of suffixes
-- ``VersionsSnapshot.from_dict`` — schema validation + forward-compat
-- ``compare`` — every status branch including the corner cases
-- ``load_bundled`` — the file-shipped-with-the-wheel path
-- ``fetch_remote`` — happy path + every documented failure mode
+- ``ParsedVersion.parse``, SemVer extraction, tolerant of suffixes
+- ``VersionsSnapshot.from_dict``, schema validation + forward-compat
+- ``compare``, every status branch including the corner cases
+- ``load_bundled``, the file-shipped-with-the-wheel path
+- ``fetch_remote``, happy path + every documented failure mode
 """
 
 from __future__ import annotations
@@ -64,7 +64,7 @@ class TestParsedVersion:
         assert ParsedVersion.parse(raw) is None
 
     def test_core_tuple_ignores_pre_release(self) -> None:
-        """``1.3.0`` and ``1.3.0rc1`` rank equal for our purposes —
+        """``1.3.0`` and ``1.3.0rc1`` rank equal for our purposes -
         the dashboard would otherwise flag every operator running
         a stable release as ``newer_than_known`` after we ship an rc."""
         a = ParsedVersion.parse("1.3.0")
@@ -181,7 +181,7 @@ class TestCompare:
 
     def test_pre_release_does_not_create_outdated_noise(self) -> None:
         """Operator runs ``1.3.1`` against a snapshot of ``1.3.1``.
-        Pre-release agent at ``1.3.1rc1`` should rank ``current`` —
+        Pre-release agent at ``1.3.1rc1`` should rank ``current`` -
         not ``outdated``. (Edge case after a future rc cycle.)"""
         assert compare(
             "1.3.1rc1", "z4j-core", self._snap(),
@@ -197,11 +197,11 @@ class TestLoadBundled:
     def test_bundled_file_loads_and_lists_z4j_brain(self) -> None:
         snap = load_bundled()
         # Even if the file is missing or malformed the function
-        # returns an empty snapshot rather than crashing — but the
+        # returns an empty snapshot rather than crashing, but the
         # repo's checked-in copy SHOULD be valid.
         assert snap.schema_version == 1
         assert "z4j-brain" in snap.packages, (
-            f"z4j-brain missing from bundled snapshot — regenerate "
+            f"z4j-brain missing from bundled snapshot, regenerate "
             f"with ``python scripts/gen-versions-json.py``. "
             f"Loaded packages: {sorted(snap.packages.keys())}"
         )

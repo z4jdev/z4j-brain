@@ -565,7 +565,7 @@ async def setup_form(
     ``complete()`` commit and the user row becoming visible to a
     parallel reader (Postgres replica lag), ``users.count() == 0``
     could still be True even though the setup is conceptually done.
-    The form would render referencing a stale URL — confusing UX
+    The form would render referencing a stale URL, confusing UX
     and a small information leak about install state. Tying
     visibility to "active token AND users empty" closes the gap.
     """
@@ -576,7 +576,7 @@ async def setup_form(
         )
     active_token = await tokens.get_active(lock=False)
     if active_token is None:
-        # No mintable token — operator hasn't restarted the brain
+        # No mintable token, operator hasn't restarted the brain
         # since the prior token expired or was consumed. Render 404
         # so the page doesn't claim "first boot" with no path
         # forward.

@@ -4,7 +4,7 @@ Round-4 audit fix (Apr 2026). The error middleware writes a
 tamper-evident audit row for every denial / validation failure on
 schedule-endpoint mutations (round-2 audit-on-denial fix). Pre-fix
 the write opened a NEW DB session synchronously inside the request
-scope — under attack (IDOR enumeration), every 4xx doubled the
+scope, under attack (IDOR enumeration), every 4xx doubled the
 per-request connection demand and starved the connection pool,
 turning the audit safety net into a self-DoS amplifier.
 

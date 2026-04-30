@@ -238,7 +238,7 @@ _ALLOWED_SCHEMES = frozenset({"https", "http"})
 #:
 #: Round-7 audit fix R7-HIGH (Apr 2026): the prior list was
 #: enumeration-based and missed IPv4-mapped IPv6 (``::ffff:127.0.0.1``,
-#: ``::ffff:169.254.169.254``) — those addresses do NOT match the
+#: ``::ffff:169.254.169.254``), those addresses do NOT match the
 #: ``127.0.0.0/8`` / ``169.254.0.0/16`` IPv4 networks, so an attacker
 #: who controlled a public AAAA record could resolve to a v6-mapped
 #: loopback / link-local and bypass the entire SSRF guard. Also
@@ -276,7 +276,7 @@ def _ip_is_blocked(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> str | N
     checks the codebase used to repeat per-callsite. Always:
 
     1. Unwrap an IPv4-mapped IPv6 address (``::ffff:1.2.3.4``) into
-       its 4-byte twin and recurse — without this, ``::ffff:127.0.0.1``
+       its 4-byte twin and recurse, without this, ``::ffff:127.0.0.1``
        passes every ``v4_address in v4_network`` check.
     2. Reject anything ``is_loopback`` / ``is_private`` /
        ``is_link_local`` / ``is_multicast`` / ``is_reserved`` /

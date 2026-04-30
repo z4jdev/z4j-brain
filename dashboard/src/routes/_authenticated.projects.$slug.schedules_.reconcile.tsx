@@ -290,7 +290,7 @@ function ReconcilePage() {
               {diff.isPending ? "Running..." : "Run diff"}
             </Button>
             <span className="text-xs text-muted-foreground">
-              No side effects — this never writes to brain.
+              No side effects, this never writes to brain.
             </span>
           </div>
         </CardContent>
@@ -536,7 +536,7 @@ function DiffEntryCard({
       <div className="mb-2 font-mono text-xs font-semibold">{entry.name}</div>
       {diffs.length === 0 && (
         <p className="text-xs text-muted-foreground">
-          (source_hash differs but tracked fields are equal — operator
+          (source_hash differs but tracked fields are equal, operator
           regenerated the hash without semantic change)
         </p>
       )}
@@ -599,7 +599,7 @@ function computeFieldDiffs(
 }
 
 function formatValue(value: unknown): string {
-  if (value === null || value === undefined) return "—";
+  if (value === null || value === undefined) return "-";
   if (typeof value === "string") return value;
   if (typeof value === "boolean" || typeof value === "number") {
     return String(value);

@@ -107,7 +107,7 @@ def _validate_allowed_schedulers_elements(
     pins each element to the same regex we apply to
     ``default_scheduler_owner`` so the allow-list can't accumulate
     junk values like ``"; DROP TABLE"`` or ``"<script>"``. (Not a
-    SQLi vector — the validator does ``==`` comparison — but it
+    SQLi vector, the validator does ``==`` comparison, but it
     would render unsafely in the dashboard.) Audit fix HIGH-8
     second pass.
     """
@@ -299,7 +299,7 @@ async def create_project(
         )
 
     # Audit fix HIGH-9 (1.2.2 second-pass): same cross-check as
-    # update_project — if both default_scheduler_owner and
+    # update_project, if both default_scheduler_owner and
     # allowed_schedulers are set, the default must be in the list.
     if (
         body.allowed_schedulers is not None
@@ -367,7 +367,7 @@ async def update_project(
     ``Schedule.scheduler`` value (which was resolved at creation
     time from the THEN-current default). The next reconciler
     ``:import`` for those rows will resolve to the NEW default
-    and treat the OLD-default rows as absent — under
+    and treat the OLD-default rows as absent, under
     ``replace_for_source`` mode that means they get DELETED.
     Operators who want to retroactively migrate stored values
     use the ``z4j-brain projects rewrite-scheduler --slug X
@@ -421,7 +421,7 @@ async def update_project(
     # explicit empty list". Pydantic v2's ``model_fields_set``
     # carries exactly that info.
     if "allowed_schedulers" in body.model_fields_set:
-        # Empty list = strict-deny (no scheduler allowed) — that's
+        # Empty list = strict-deny (no scheduler allowed), that's
         # likely a misconfig, so we reject it. ``None`` = unrestricted.
         if body.allowed_schedulers is not None and len(
             body.allowed_schedulers,

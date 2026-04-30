@@ -1,7 +1,7 @@
-"""z4j 1.3.0 initial schema — full consolidated reset.
+"""z4j 1.3.0 initial schema, full consolidated reset.
 
 Revision ID: v1_3_0_initial
-Revises: (none — first migration of 1.3.x line)
+Revises: (none, first migration of 1.3.x line)
 Create Date: 2026-05-15
 
 This is the FIRST migration of the 1.3.x line. It contains the
@@ -13,7 +13,7 @@ WHY ONE FILE? z4j 1.3.0 is a clean-slate reset. The 1.0/1.1/1.2
 versions on PyPI were yanked (not deleted) when 1.3.0 shipped;
 operators upgrading from any 1.x version are expected to
 backup-then-fresh-restore. There is no in-place upgrade path
-from 1.2.x — the 1.3.x migration history starts here.
+from 1.2.x, the 1.3.x migration history starts here.
 
 WHAT'S IN HERE (sourced from 1.2.x migrations 0001-0020 minus
 the deleted 0019/0021):
@@ -32,22 +32,22 @@ the deleted 0019/0021):
 - 0012 audit_chain_unique partial index (Postgres+SQLite, lifted)
 - 0013 agent_workers (in model)
 - 0014 projects.default_scheduler_owner (in model)
-- 0015 audit_log_sweep_bypass (Postgres trigger function — the
+- 0015 audit_log_sweep_bypass (Postgres trigger function, the
   GUC-bypass version is installed here from the start)
 - 0016 ix_audit_log_occurred_at (in model)
-- 0017 audit_log.api_key_id (in model — NO foreign key by design;
+- 0017 audit_log.api_key_id (in model, NO foreign key by design;
   see audit_service.py for rationale)
 - 0018 projects.allowed_schedulers (in model)
 - 0020 ix_audit_log_api_key_id partial index (Postgres+SQLite,
   lifted here)
 
 WHAT'S NOT INCLUDED:
-- 0019 legacy_scheduler_migrate — was a one-shot 1.2.2 data
+- 0019 legacy_scheduler_migrate, was a one-shot 1.2.2 data
   migration that turned out to be a no-op. Operators who flip
   ``default_scheduler_owner`` after a project has stored
   schedules use the ``z4j-brain projects rewrite-scheduler``
   CLI for explicit migration.
-- 0021 narrow_default_scheduler_owner — was a 1.2.2 column
+- 0021 narrow_default_scheduler_owner, was a 1.2.2 column
   narrowing that we backed out. The Pydantic regex caps incoming
   values at 40 chars; the column staying at String(64) is
   harmless headroom.
@@ -89,15 +89,15 @@ depends_on: str | Sequence[str] | None = None
 # Read by ``z4j_brain.main.create_app`` at startup AND by the
 # ``z4j-brain migrate check`` CLI. The brain refuses to start if
 # its own version is below ``min_z4j_version`` for ANY migration
-# in the chain — operators can never accidentally apply a
+# in the chain, operators can never accidentally apply a
 # migration their brain doesn't understand.
 #
-# - ``min_z4j_version`` — earliest brain that can apply this migration
-# - ``max_z4j_version`` — latest brain that can apply this migration
+# - ``min_z4j_version``, earliest brain that can apply this migration
+# - ``max_z4j_version``, latest brain that can apply this migration
 #   (use ``"1.99.99"`` to mean "the entire 1.x line"; we will never
 #   ship a 2.0 unless we genuinely re-architect)
-# - ``upgrade_from`` — the previous revision id (None = initial)
-# - ``downgrade_to`` — the revision this can downgrade to (None = initial)
+# - ``upgrade_from``, the previous revision id (None = initial)
+# - ``downgrade_to``, the revision this can downgrade to (None = initial)
 
 compat = {
     "min_z4j_version": "1.3.0",
@@ -111,7 +111,7 @@ compat = {
 # Postgres-only DDL fragments (lifted from the 1.2.x migrations)
 # ---------------------------------------------------------------------------
 
-#: ``audit_log_forbid_mutation`` trigger function — GUC-bypass
+#: ``audit_log_forbid_mutation`` trigger function, GUC-bypass
 #: variant from migration 0015. Installed from the start in 1.3.0
 #: because the audit retention sweeper depends on it.
 _AUDIT_FORBID_MUTATION_FN_SQL = """
@@ -127,7 +127,7 @@ END;
 $$ LANGUAGE plpgsql;
 """
 
-#: ``z4j_schedules_notify`` trigger function — from migration 0007.
+#: ``z4j_schedules_notify`` trigger function, from migration 0007.
 #: Used by the brain's gRPC ``WatchSchedules`` handler to push
 #: row-level INSERT/UPDATE/DELETE events to live schedulers.
 _SCHEDULES_NOTIFY_FN_SQL = """
@@ -176,7 +176,7 @@ def upgrade() -> None:
     if is_postgres:
         _install_extensions()
 
-    # ORM model is the source of truth — it captures every table,
+    # ORM model is the source of truth, it captures every table,
     # column, single + multi-column index declared via
     # ``__table_args__``, and FK constraint. SQLAlchemy emits the
     # right CREATE TABLE per dialect.
@@ -192,12 +192,12 @@ def upgrade() -> None:
     # partial index on ``audit_log.api_key_id`` are declared in the
     # AuditLog model's ``__table_args__`` (with ``postgresql_where=``
     # / ``sqlite_where=`` predicates). ``Base.metadata.create_all``
-    # handles them in both dialects — no separate ``op.execute``
+    # handles them in both dialects, no separate ``op.execute``
     # needed here.
 
 
 def downgrade() -> None:
-    """Reverse the upgrade — drop everything."""
+    """Reverse the upgrade, drop everything."""
     bind = op.get_bind()
     is_postgres = bind.dialect.name == "postgresql"
 
@@ -259,7 +259,7 @@ def downgrade() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Postgres helpers — dialect-guarded so SQLite tests skip them.
+# Postgres helpers, dialect-guarded so SQLite tests skip them.
 # ---------------------------------------------------------------------------
 
 
@@ -287,7 +287,7 @@ def _install_audit_log_triggers() -> None:
 
     Uses the GUC-bypass variant from the start (1.2.x migration 0015):
     DELETE is permitted only when ``current_setting('z4j.audit_sweep')
-    = 'on'`` — the audit retention sweeper sets this per-batch.
+    = 'on'``, the audit retention sweeper sets this per-batch.
     """
     op.execute(sa.text(_AUDIT_FORBID_MUTATION_FN_SQL))
     op.execute(
@@ -346,7 +346,7 @@ def _drop_schedules_notify_trigger() -> None:
 
 
 # ---------------------------------------------------------------------------
-# events partitioning (Postgres-only) — lifted from migration 0001
+# events partitioning (Postgres-only), lifted from migration 0001
 # ---------------------------------------------------------------------------
 
 #: Number of daily ``events`` partitions to pre-create at install
@@ -364,7 +364,7 @@ def _install_events_partitioning() -> None:
     drop the empty regular table and recreate it as partitioned.
     Then pre-create N daily partitions starting today.
     """
-    # Refuse to drop a non-empty events table — defensive guard
+    # Refuse to drop a non-empty events table, defensive guard
     # only matters in contrived scenarios but cheap to add.
     bind = op.get_bind()
     rows = list(bind.execute(sa.text("SELECT COUNT(*) FROM events")).fetchall())
@@ -390,7 +390,7 @@ def _install_events_partitioning() -> None:
             ") PARTITION BY RANGE (occurred_at)",
         ),
     )
-    # Indexes on the parent — Postgres propagates them to partitions.
+    # Indexes on the parent, Postgres propagates them to partitions.
     op.execute(
         sa.text(
             "CREATE INDEX ix_events_agent_occurred ON events "
@@ -436,7 +436,7 @@ def _install_events_partitioning() -> None:
 
 
 def _drop_events_partitioning() -> None:
-    """Drop the partitioned events parent — partitions cascade."""
+    """Drop the partitioned events parent, partitions cascade."""
     op.execute(sa.text("DROP TABLE IF EXISTS events CASCADE"))
 
 
