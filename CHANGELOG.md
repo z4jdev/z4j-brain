@@ -5,6 +5,61 @@ All notable changes to this package are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.2] - 2026-04-30
+
+**Hotfix: global admin can't create per-user subscriptions.**
+
+A global brain admin (`user.is_admin=True`, the kind created by
+`z4j bootstrap-admin`) was being rejected by
+`POST /api/v1/user/subscriptions` with **403 *you are not a member
+of this project***, even though `/api/v1/auth/me` synthesises an
+admin-grade membership for them on every project (so the dashboard
+project switcher and the `/settings/memberships` page list them
+with full admin badges). Direct contradiction between the two
+endpoints. The "New Subscription" modal in the dashboard was
+unusable for global admins on any project they hadn't been
+explicitly added to with a `Membership` row.
+
+### Fixed
+
+- `api/user_notifications.py::create_user_subscription` now uses
+  the canonical `PolicyEngine.require_member` helper (with
+  `min_role=ProjectRole.VIEWER`), which already handles the
+  `is_admin` bypass uniformly. The sibling list endpoint already
+  short-circuited on `not user.is_admin`; the create endpoint
+  had drifted out of sync.
+
+### Tests
+
+- `test_subscription_create_global_admin.py` — two new
+  regression tests:
+  1. A `is_admin=True` user with NO `Membership` row on a project
+     can `POST /user/subscriptions` against it (returns 201, was
+     403 pre-1.3.2).
+  2. A regular `is_admin=False` non-member is STILL blocked (the
+     bypass is gated on `is_admin`, not opened up to everyone).
+
+### Audit scope
+
+- Verified the bug was confined to `create_user_subscription`.
+  Every other endpoint that consults the `Membership` table on
+  behalf of the *caller* (not a target user being invited / added)
+  goes through `PolicyEngine.require_member`, which has handled
+  `is_admin` since v1.0.x. `list_user_subscriptions`,
+  `import_user_channel_from_project`, `audit.py`, etc., are all
+  correct.
+- `update_user_subscription`, `delete_user_subscription`,
+  `list_user_deliveries`, channel CRUD endpoints are scoped by
+  `user.id` (owner-only by design) and don't perform project
+  membership checks at all — also correct.
+
+### Compatibility
+
+Drop-in upgrade from 1.3.1. Schema unchanged. Floors unchanged.
+No migration. Restart the brain after `pip install --upgrade
+z4j-brain` and global admins can create per-user subscriptions
+on any project they see in the switcher.
+
 ## [1.3.1] - 2026-04-30
 
 **Hotfix for the heartbeat → worker upsert path.**

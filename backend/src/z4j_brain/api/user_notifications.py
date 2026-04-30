@@ -958,13 +958,6 @@ async def create_user_subscription(
     memberships: "MembershipRepository" = Depends(get_membership_repo),
     db_session: "AsyncSession" = Depends(get_session),
 ) -> UserSubscriptionPublic:
-    # Pre-existing bug fix (rolled into v1.0.14): this used to import
-    # ``ForbiddenError`` from ``z4j_brain.errors`` which does not
-    # exist - the brain reuses ``z4j_core.errors.AuthorizationError``
-    # (HTTP 403) for "authenticated but not allowed". Every call to
-    # POST /user/subscriptions on a project the caller is not a member
-    # of produced HTTP 500 instead of 403.
-    from z4j_brain.errors import AuthorizationError
     from z4j_brain.persistence.models.notification import UserSubscription
     from z4j_brain.persistence.repositories import (
         NotificationChannelRepository,
@@ -973,14 +966,26 @@ async def create_user_subscription(
     )
 
     # User must be a member of the project they're subscribing to.
-    membership = await memberships.get_for_user_project(
-        user_id=user.id, project_id=body.project_id,
+    # Bug fixed in 1.3.2: global brain admins (``user.is_admin``) MUST
+    # bypass this membership check. /auth/me synthesises an admin
+    # membership for them on every project (so the project switcher
+    # renders), but the Membership table itself has no row for a
+    # global admin who hasn't been explicitly added — and pre-1.3.2
+    # this endpoint queried the table directly and 403'd. The
+    # ``list_user_subscriptions`` GET handler at the top of this file
+    # already used the ``not user.is_admin`` short-circuit; this POST
+    # had drifted out of sync with it. Switching to the canonical
+    # ``policy.require_member`` helper closes the drift permanently —
+    # it returns a synthesised admin-grade Membership for global
+    # admins without touching the DB.
+    from z4j_brain.domain.policy_engine import PolicyEngine
+
+    await PolicyEngine().require_member(
+        memberships,
+        user=user,
+        project_id=body.project_id,
+        min_role=ProjectRole.VIEWER,
     )
-    if membership is None:
-        raise AuthorizationError(
-            "you are not a member of this project",
-            details={"project_id": str(body.project_id)},
-        )
 
     # Validate channel ids: project channels must belong to the
     # project, user channels must be owned by this user.
