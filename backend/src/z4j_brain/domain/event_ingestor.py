@@ -422,6 +422,51 @@ class EventIngestor:
                 task_repo=task_repo,
             )
 
+        # 5b) Snapshot reconciliation. The agent emits
+        # ``schedule.snapshot`` at boot, on its periodic timer, and on
+        # demand from a ``schedule.resync`` command. The data carries
+        # the full inventory of every schedule its scheduler adapter
+        # observes — we 3-way diff against the DB (insert / update /
+        # delete-missing) scoped to (project, scheduler). Added in
+        # 1.3.3 to close the gap where existing celery-beat /
+        # rq-scheduler / apscheduler schedules were invisible until
+        # they were edited (signal-based only).
+        if kind_value == EventKind.SCHEDULE_SNAPSHOT.value:
+            schedules_in = (
+                data.get("schedules") if isinstance(data, dict) else None
+            )
+            scheduler_name = (
+                str(data.get("scheduler") or engine)
+                if isinstance(data, dict) else engine
+            )
+            if isinstance(schedules_in, list):
+                try:
+                    from z4j_brain.persistence.repositories import (
+                        ScheduleRepository,
+                    )
+
+                    schedule_repo = ScheduleRepository(task_repo.session)
+                    summary = await schedule_repo.reconcile_snapshot(
+                        project_id=project_id,
+                        scheduler=scheduler_name,
+                        schedules=schedules_in,
+                    )
+                    logger.info(
+                        "z4j event_ingestor: schedule snapshot reconciled",
+                        project_id=str(project_id),
+                        scheduler=scheduler_name,
+                        reason=str(data.get("reason", "unknown"))
+                            if isinstance(data, dict) else "unknown",
+                        inserted=summary["inserted"],
+                        updated=summary["updated"],
+                        deleted=summary["deleted"],
+                    )
+                except Exception:  # noqa: BLE001
+                    logger.exception(
+                        "z4j event_ingestor: schedule snapshot reconcile failed",
+                        scheduler=scheduler_name,
+                    )
+
         # 5) Project schedule events onto the schedules table.
         if kind_value in (
             EventKind.SCHEDULE_CREATED.value,

@@ -230,6 +230,93 @@ class ScheduleRepository(BaseRepository[Schedule]):
         return result.rowcount or 0
 
 
+    async def reconcile_snapshot(
+        self,
+        *,
+        project_id: UUID,
+        scheduler: str,
+        schedules: list[dict[str, Any]],
+    ) -> dict[str, int]:
+        """Reconcile every schedule the agent observes on one scheduler.
+
+        The agent emits a ``schedule.snapshot`` event at boot, on a
+        periodic timer, and on demand via the ``schedule.resync``
+        command. The event carries the FULL inventory of every
+        schedule the named scheduler adapter currently observes —
+        the brain's job here is to make the DB match: insert new
+        rows, update existing rows, and delete rows that exist in
+        the brain for this (project, scheduler) but are NOT in the
+        snapshot. Scoped to ``(project_id, scheduler)`` so a brain
+        with multiple scheduler adapters in the same project (e.g.
+        celery-beat AND apscheduler) does not cross-prune.
+
+        Added in 1.3.3 alongside the new ``EventKind.SCHEDULE_SNAPSHOT``
+        and the dashboard "Sync now" button. Closes the long-standing
+        gap where existing celery-beat / rq-scheduler / apscheduler
+        schedules were invisible to the dashboard until they were
+        edited (because the agent's signal-based path only saw
+        post-connect changes).
+
+        Returns a summary dict ``{"inserted": N, "updated": M,
+        "deleted": K}`` so the caller can log / report counts.
+        """
+        from sqlalchemy import delete as sa_delete
+
+        summary = {"inserted": 0, "updated": 0, "deleted": 0}
+
+        # 1) Upsert each schedule in the snapshot. Reuses the same
+        # (project, name) key as ``upsert_from_event`` so the two
+        # paths converge on the same row when both arrive (e.g.
+        # the agent's signal-based ``schedule.created`` raced the
+        # boot snapshot).
+        observed_names: set[str] = set()
+        for raw in schedules:
+            if not isinstance(raw, dict):
+                continue
+            name = str(raw.get("name", "")).strip()
+            if not name:
+                continue
+            observed_names.add(name)
+
+            # Force the scheduler name to the snapshot's owning
+            # adapter — the inner schedule dict may be missing it
+            # or carry a stale value, but the snapshot's outer
+            # ``scheduler`` field is the canonical source.
+            enriched = dict(raw)
+            enriched["scheduler"] = scheduler
+            enriched.setdefault("engine", scheduler.split("-")[0] or scheduler)
+
+            existed = await self.session.execute(
+                select(Schedule.id).where(
+                    Schedule.project_id == project_id,
+                    Schedule.name == name,
+                ),
+            )
+            had_row = existed.scalar_one_or_none() is not None
+            await self.upsert_from_event(
+                project_id=project_id, data=enriched,
+            )
+            if had_row:
+                summary["updated"] += 1
+            else:
+                summary["inserted"] += 1
+
+        # 2) Delete every (project, scheduler) row whose name is NOT
+        # in the snapshot. Catches schedules deleted directly via
+        # Django admin / SQL while the agent was offline (the
+        # ``schedule.deleted`` event would have been lost).
+        stmt = sa_delete(Schedule).where(
+            Schedule.project_id == project_id,
+            Schedule.scheduler == scheduler,
+        )
+        if observed_names:
+            stmt = stmt.where(Schedule.name.notin_(observed_names))
+        result = await self.session.execute(stmt)
+        summary["deleted"] = result.rowcount or 0
+
+        await self.session.flush()
+        return summary
+
     async def upsert_from_event(
         self,
         *,

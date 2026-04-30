@@ -21,7 +21,7 @@ from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
 from fastapi import APIRouter, Depends, Query, Request
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from z4j_brain.api.deps import (
     get_audit_log_repo,
@@ -2068,12 +2068,206 @@ async def diff_schedules(
     )
 
 
+class ResyncSchedulesResponse(BaseModel):
+    """Response from the project-scoped ``:resync`` action."""
+
+    model_config = ConfigDict(extra="forbid")
+    agents_dispatched: int = Field(
+        description=(
+            "Number of online agents the brain dispatched a "
+            "``schedule.resync`` command to. Each agent will, on "
+            "receipt, drain every scheduler adapter it has registered "
+            "and emit one ``schedule.snapshot`` event per adapter."
+        ),
+    )
+    schedulers_observed: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Distinct scheduler-adapter names advertised by the "
+            "online agents at dispatch time (informational - the "
+            "real reconciliation arrives via the snapshot events)."
+        ),
+    )
+
+
+@router.post(
+    ":resync",
+    response_model=ResyncSchedulesResponse,
+    status_code=202,
+    dependencies=[
+        Depends(require_csrf),
+        Depends(require_bulk_action_throttle),
+    ],
+)
+async def resync_schedules(
+    slug: str,
+    request: "Request",
+    user: "User" = Depends(get_current_user),
+    memberships: "MembershipRepository" = Depends(get_membership_repo),
+    projects: "ProjectRepository" = Depends(get_project_repo),
+    audit_log: "AuditLogRepository" = Depends(get_audit_log_repo),
+    audit: "AuditService" = Depends(get_audit_service),
+    dispatcher: "CommandDispatcher" = Depends(get_command_dispatcher),
+    db_session: "AsyncSession" = Depends(get_session),
+    ip: str = Depends(get_client_ip),
+) -> ResyncSchedulesResponse:
+    """Force every online agent in the project to re-emit a full
+    schedule inventory snapshot.
+
+    This is the dashboard's *Sync now* button. The brain dispatches a
+    ``schedule.resync`` command to each online agent that advertises
+    at least one scheduler adapter. On receipt, the agent calls
+    ``list_schedules()`` on every registered scheduler adapter
+    (celery-beat, apscheduler, rq-scheduler, arqcron, hueyperiodic,
+    taskiqscheduler) and emits one
+    :class:`~z4j_core.models.event.EventKind.SCHEDULE_SNAPSHOT` event
+    per adapter. The brain's event ingestor reconciles each snapshot
+    against the DB (insert / update / delete-missing) scoped to
+    ``(project, scheduler)``.
+
+    Use cases:
+
+    - First-time onboarding: existing celery-beat ``PeriodicTask``
+      rows that pre-date the agent install show up immediately
+      instead of waiting for the operator to edit-and-save each one.
+    - Recovery: schedules created via Django admin / SQL while the
+      agent was offline get reconciled the moment the operator
+      clicks the button (no Django reload needed).
+    - Drift checks: operator suspects the dashboard is stale →
+      one click re-asserts the agent's view as the source of truth.
+
+    Note that the agent ALSO does this on a periodic timer
+    (default 15 minutes) and at every reconnect, so most operators
+    never need to hit this endpoint by hand. It exists for the
+    *I want it now* case.
+
+    Returns immediately with HTTP 202. The actual snapshot events
+    arrive asynchronously and the dashboard's existing schedule
+    list query will reflect them on the next refetch.
+    """
+    from z4j_brain.domain.policy_engine import PolicyEngine
+    from z4j_brain.persistence.repositories import (
+        AgentRepository,
+        CommandRepository,
+    )
+
+    policy = PolicyEngine()
+    project = await policy.get_project_or_404(projects, slug)
+    # Admin role: resync may DELETE schedule rows from the DB if the
+    # agent reports that they no longer exist on its side. That's a
+    # destructive write at the operator's discretion - same gate as
+    # the existing import / reconcile-diff path.
+    await policy.require_member(
+        memberships,
+        user=user,
+        project_id=project.id,
+        min_role=ProjectRole.ADMIN,
+    )
+
+    online_agents = await AgentRepository(
+        db_session,
+    ).list_online_for_project(project.id)
+    eligible = [
+        agent for agent in online_agents
+        if agent.scheduler_adapters
+    ]
+
+    if not eligible:
+        # Audit the failed attempt so an operator clicking the
+        # button repeatedly leaves a trail.
+        await audit.record(
+            audit_log,
+            action="schedule.resync",
+            target_type="project",
+            target_id=slug,
+            result="failure",
+            outcome="deny",
+            user_id=user.id,
+            project_id=project.id,
+            api_key_id=resolve_api_key_id(request),
+            source_ip=ip,
+            metadata={
+                "reason": (
+                    "no_online_agent_with_scheduler"
+                    if online_agents
+                    else "no_online_agent"
+                ),
+                "online_agent_count": len(online_agents),
+            },
+        )
+        await db_session.commit()
+        raise NotFoundError(
+            (
+                "no online agent advertises a scheduler adapter; "
+                "start an agent that has z4j-celerybeat / "
+                "z4j-apscheduler / z4j-rqscheduler / z4j-arqcron / "
+                "z4j-hueyperiodic / z4j-taskiqscheduler installed"
+            ),
+            details={
+                "online_agent_count": len(online_agents),
+                "reason": (
+                    "no_online_agent_with_scheduler"
+                    if online_agents
+                    else "no_online_agent"
+                ),
+            },
+        )
+
+    schedulers_seen: set[str] = set()
+    commands_repo = CommandRepository(db_session)
+    for agent in eligible:
+        for adapter_name in agent.scheduler_adapters or ():
+            schedulers_seen.add(str(adapter_name))
+        await dispatcher.issue(
+            commands=commands_repo,
+            audit_log=audit_log,
+            project_id=project.id,
+            agent_id=agent.id,
+            action="schedule.resync",
+            target_type="project",
+            target_id=slug,
+            payload={
+                # Empty payload: the agent drains EVERY scheduler
+                # adapter it has registered. We could narrow to a
+                # specific adapter via payload["scheduler"] in a
+                # future patch but the V1 surface is "all of them".
+            },
+            issued_by=user.id,
+            ip=ip,
+            user_agent=None,
+        )
+
+    await audit.record(
+        audit_log,
+        action="schedule.resync",
+        target_type="project",
+        target_id=slug,
+        result="success",
+        outcome="allow",
+        user_id=user.id,
+        project_id=project.id,
+        api_key_id=resolve_api_key_id(request),
+        source_ip=ip,
+        metadata={
+            "agents_dispatched": len(eligible),
+            "schedulers_observed": sorted(schedulers_seen),
+        },
+    )
+    await db_session.commit()
+
+    return ResyncSchedulesResponse(
+        agents_dispatched=len(eligible),
+        schedulers_observed=sorted(schedulers_seen),
+    )
+
+
 __all__ = [
     "DiffEntry",
     "DiffSchedulesResponse",
     "ImportSchedulesRequest",
     "ImportSchedulesResponse",
     "ImportedScheduleIn",
+    "ResyncSchedulesResponse",
     "SchedulePublic",
     "router",
 ]

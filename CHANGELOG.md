@@ -5,6 +5,63 @@ All notable changes to this package are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.3] - 2026-04-30
+
+**Schedule snapshot reconciliation: brain ingests full-inventory
+events from agents and surfaces a *Sync now* button on the
+Schedules page.**
+
+Closes the onboarding gap where existing celery-beat /
+rq-scheduler / apscheduler / arqcron / hueyperiodic /
+taskiqscheduler schedules were invisible to the dashboard until
+the operator edited each one. Companion agent-side feature in
+z4j-bare 1.3.1.
+
+### Added
+
+- `EventIngestor` handles `EventKind.SCHEDULE_SNAPSHOT`. The event
+  payload carries `{scheduler, schedules, reason}`; the ingestor
+  delegates to `ScheduleRepository.reconcile_snapshot` for the
+  3-way diff against the DB.
+- `ScheduleRepository.reconcile_snapshot(project_id, scheduler,
+  schedules) -> {inserted, updated, deleted}`. Inserts new rows,
+  updates existing rows, deletes rows present in the brain for
+  this `(project, scheduler)` but missing from the snapshot.
+  Per-scheduler scope: a celery-beat snapshot never prunes
+  apscheduler rows in the same project.
+- `POST /api/v1/projects/{slug}/schedules:resync` — admin-only,
+  requires CSRF and bulk-action throttle. Dispatches a
+  `schedule.resync` command to every online agent in the project
+  that advertises at least one scheduler adapter; agents respond
+  by draining their adapters and emitting fresh
+  `SCHEDULE_SNAPSHOT` events. Returns 202 with a count of
+  agents dispatched + the distinct scheduler adapter names
+  observed; the actual reconciliation arrives async via the
+  event pipeline.
+- Dashboard *Sync now* button on `/projects/{slug}/schedules`
+  (next to *Refresh* and *Reconcile diff*). Visible to admins
+  only. Calls the new endpoint, then auto-refetches the schedule
+  list at 0 s and 3 s so the user sees the reconciled view
+  without a manual refresh. The hook is exposed as
+  `useScheduleResync(slug)` for any other place that wants to
+  trigger a sync.
+
+### Tests
+
+- 7 new tests under `test_schedule_reconcile_snapshot.py` covering
+  insert / update / delete-missing / empty snapshot deletes-all /
+  per-scheduler scoping (celery-beat doesn't prune apscheduler) /
+  per-project scoping (one project's snapshot doesn't touch
+  another's rows). Full brain unit suite: 702 passed.
+
+### Compatibility
+
+Drop-in upgrade from 1.3.2. No DB migration. Floor bumped to
+`z4j-core>=1.3.1` for the new `EventKind` value. Agents on
+z4j-bare 1.3.0 keep working — they don't emit the snapshot kind,
+the brain just doesn't surface anything new for them. Upgrade
+agents to z4j-bare 1.3.1 to light up the feature end-to-end.
+
 ## [1.3.2] - 2026-04-30
 
 **Hotfix: global admin can't create per-user subscriptions.**

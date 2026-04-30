@@ -137,6 +137,43 @@ export function useScheduleImport(slug: string) {
   });
 }
 
+// Sync now (POST /projects/{slug}/schedules:resync). Forces every
+// online agent in the project to re-emit a full schedule inventory
+// snapshot. Each agent drains EVERY scheduler adapter it has
+// registered (celery-beat, apscheduler, rq-scheduler, arqcron,
+// hueyperiodic, taskiqscheduler) and emits one schedule.snapshot
+// event per adapter. The brain's event ingestor 3-way diffs each
+// snapshot against the DB scoped to (project, scheduler) - inserts
+// new rows, updates existing rows, deletes rows missing from the
+// snapshot. Added in 1.3.3 to close the long-standing onboarding
+// gap where existing celery-beat schedules were invisible until
+// the operator edited each one.
+export interface ScheduleResyncResponse {
+  agents_dispatched: number;
+  schedulers_observed: string[];
+}
+
+export function useScheduleResync(slug: string) {
+  const qc = useQueryClient();
+  return useMutation<ScheduleResyncResponse, Error, void>({
+    mutationFn: () =>
+      api.post<ScheduleResyncResponse>(
+        `/projects/${slug}/schedules:resync`,
+        {},
+      ),
+    onSuccess: () => {
+      // Snapshot events arrive asynchronously through the WS event
+      // pipeline. Refetch immediately AND again after a short delay
+      // so the dashboard reflects the reconciliation without the
+      // operator hitting Refresh.
+      qc.invalidateQueries({ queryKey: ["schedules", slug] });
+      setTimeout(() => {
+        qc.invalidateQueries({ queryKey: ["schedules", slug] });
+      }, 3000);
+    },
+  });
+}
+
 // CRUD mutations - the dashboard's "manage schedules from a real
 // UI" promise (docs/SCHEDULER.md §3.2 wish #3). Each one invalidates
 // the schedule list + any open detail page so the dashboard reflects

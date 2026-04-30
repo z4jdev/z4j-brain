@@ -17,6 +17,7 @@ import {
   Pencil,
   Play,
   Plus,
+  RefreshCcwDot,
   RefreshCw,
   Search,
   Trash2,
@@ -44,6 +45,7 @@ import { Switch } from "@/components/ui/switch";
 import { useCan } from "@/hooks/use-memberships";
 import {
   useDeleteSchedule,
+  useScheduleResync,
   useSchedules,
   useToggleSchedule,
   useTriggerSchedule,
@@ -67,6 +69,7 @@ function SchedulesPage() {
   const toggle = useToggleSchedule(slug);
   const trigger = useTriggerSchedule(slug);
   const deleteSched = useDeleteSchedule(slug);
+  const resync = useScheduleResync(slug);
   const { confirm, dialog: confirmDialog } = useConfirm();
 
   // Form-dialog state. Single component handles both create and
@@ -139,6 +142,35 @@ function SchedulesPage() {
   function onCreate() {
     setEditing(undefined);
     setFormOpen(true);
+  }
+
+  // Sync now: ask every online agent to drain their scheduler
+  // adapters (celery-beat, apscheduler, rq-scheduler, arqcron,
+  // hueyperiodic, taskiqscheduler) and re-emit a full inventory
+  // snapshot. The brain reconciles each snapshot against the DB
+  // (insert / update / delete-missing) scoped to (project,
+  // scheduler). Used for first-time onboarding (existing celery-
+  // beat schedules show up without editing each one) and drift
+  // recovery (schedules added directly via SQL while the agent
+  // was offline). Returns 202 - the snapshot events arrive
+  // async; the hook auto-refetches at 0s and 3s.
+  async function onResync() {
+    try {
+      const result = await resync.mutateAsync();
+      const adapters =
+        result.schedulers_observed.length > 0
+          ? result.schedulers_observed.join(", ")
+          : "no scheduler adapters";
+      toast.success(
+        `Sync requested - ${result.agents_dispatched} agent${result.agents_dispatched === 1 ? "" : "s"} (${adapters}). Schedules will refresh in a moment.`,
+      );
+    } catch (err) {
+      const msg =
+        err instanceof ApiError
+          ? err.message
+          : "failed to dispatch sync command";
+      toast.error(msg);
+    }
   }
 
   // ---------------------------------------------------------------
@@ -341,6 +373,27 @@ function SchedulesPage() {
               <Button size="sm" onClick={onCreate}>
                 <Plus className="size-4" />
                 New schedule
+              </Button>
+            )}
+            {canManage && (
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={onResync}
+                disabled={resync.isPending}
+                title={
+                  "Force every online agent to re-emit a full schedule " +
+                  "inventory (boot snapshot). Use after first-time " +
+                  "install to surface existing celery-beat / aps / rq " +
+                  "schedules, or to recover from drift."
+                }
+              >
+                <RefreshCcwDot
+                  className={
+                    resync.isPending ? "size-4 animate-spin" : "size-4"
+                  }
+                />
+                Sync now
               </Button>
             )}
             {canManage && (
