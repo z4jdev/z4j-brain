@@ -1,157 +1,60 @@
 [project]
 name = "z4j-brain"
-version = "1.3.4"
-description = "z4j brain - server, dashboard, and API (AGPL v3)"
+version = "1.4.0"
+description = "Compatibility shim. Install z4j instead."
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "AGPL-3.0-or-later" }
 authors = [{ name = "z4j contributors" }]
-keywords = ["z4j", "brain", "task", "control-plane", "celery"]
+keywords = ["z4j", "shim", "compatibility"]
 classifiers = [
-    "Development Status :: 5 - Production/Stable",
-    "Framework :: FastAPI",
-    "Intended Audience :: Developers",
-    "Intended Audience :: System Administrators",
+    "Development Status :: 7 - Inactive",
     "License :: OSI Approved :: GNU Affero General Public License v3 or later (AGPLv3+)",
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.11",
-    "Programming Language :: Python :: 3.12",
-    "Programming Language :: Python :: 3.13",
-    "Programming Language :: Python :: 3.14",
     "Topic :: System :: Distributed Computing",
-    "Topic :: System :: Monitoring",
-    "Topic :: System :: Systems Administration",
-    "Typing :: Typed",
-]
-dependencies = [
-    # Audit fix HIGH-2 (1.2.2 eighth-pass): explicit version pin
-    # for parity with z4j-django/flask/fastapi (which all pin
-    # ``z4j-core>=1.2.2``). Without the floor, ``pip install
-    # z4j-brain==1.2.2`` would accept ANY z4j-core including
-    # an old version that doesn't have the v4 audit canonical
-    # form; with no upper bound, it would accept a future 2.x
-    # with breaking changes.
-    # 1.3.3: brain consumes the SCHEDULE_SNAPSHOT EventKind that
-    # ships in z4j-core 1.3.1. Pre-1.3.1 the kind doesn't exist.
-    "z4j-core>=1.3.1,<2",
-    "fastapi>=0.136",
-    "uvicorn[standard]>=0.45",
-    "pydantic[email]>=2.13.3",
-    "pydantic-settings>=2.14",
-    "sqlalchemy[asyncio]>=2.0.49",
-    "alembic>=1.18.4",
-    "websockets>=16",
-    "httpx>=0.28.1",
-    "argon2-cffi>=25.1",
-    "structlog>=25.5",
-    "prometheus-client>=0.25",
-    "python-multipart>=0.0.26",
-    "itsdangerous>=2.2",
-    "aiosqlite>=0.22.1",
-    # Async SMTP client for the email notification channel. Supports
-    # STARTTLS (587, the Gmail app-password path) and implicit TLS
-    # (465). v3.0+ exposes the ``tls_hostname`` kwarg the channel
-    # dispatcher uses so DNS-pinned delivery still verifies the
-    # original hostname against the server cert. Declared here (not
-    # optional-deps) because email is a first-class channel type -
-    # ``pip install z4j-brain`` should have it from day one; the
-    # runtime fallback message "aiosmtplib is not installed" was a
-    # latent packaging bug.
-    "aiosmtplib>=3.0",
-    # Tasks-page xlsx export. Pure Python, write-only, ~1 MB, no
-    # native deps, no optional extra needed - operators who want
-    # xlsx output just get it. We specifically do NOT use
-    # ``openpyxl`` (read+write, ~5 MB with et_xmlfile / jdcal)
-    # because z4j's use case is export-only; xlsxwriter is the
-    # boring choice pandas itself ships as its default xlsx
-    # engine.
-    "xlsxwriter>=3.2.9",
 ]
 
-[project.optional-dependencies]
-postgres = [
-    "asyncpg>=0.31",
-]
-# Brain-side z4j-scheduler gRPC service. Operators install with
-# ``pip install z4j[scheduler-grpc]`` once they decide to deploy a
-# scheduler companion process; the default install footprint stays
-# slim for everyone else.
-scheduler-grpc = [
-    "grpcio>=1.71",
-    "grpcio-tools>=1.71",
-    "cryptography>=44",
-]
-test = [
-    "pytest>=9.0.3",
-    "pytest-asyncio>=1.3.0",
-    "pytest-cov>=7.1.0",
-    "httpx>=0.28.1",
-    "aiosqlite>=0.22.1",
-    "freezegun>=1.5.5",
-    "hypothesis>=6.152.1",
-]
-test-integration = [
-    "testcontainers[postgres]>=4.14.2",
-    "psycopg[binary]>=3.3.3",
-]
-
-[project.scripts]
-# ``z4j`` is the primary command (matches the package name on
-# pypi.org/project/z4j and the brand at z4j.com / z4j.dev). It's
-# what new docs lead with: ``z4j serve``, ``z4j check``, etc.
+# 1.4.0 (the consolidation cut): ``z4j-brain`` is now a metadata-only
+# compatibility shim. The brain server source moved into the ``z4j``
+# distribution. Operators on the legacy install path
+# (``pip install z4j-brain``) get the brain transitively via this
+# dependency, so existing Dockerfiles / requirements.txt / CI
+# scripts keep working.
 #
-# ``z4j-brain`` is kept as a back-compat alias for users on the
-# 1.0.0-1.0.4 docs. Both scripts call the SAME entry point - they
-# are bit-identical, no behavior difference. Either can be used
-# interchangeably. May be removed in a future major version once
-# all docs/installs have migrated to ``z4j``.
-z4j = "z4j_brain.cli:main"
-z4j-brain = "z4j_brain.cli:main"
+# This shim ships at 1.4.0 once and is then frozen. Future versions
+# of the brain land at ``pip install z4j``.
+#
+# The Python import path stays ``import z4j_brain`` -- it has always
+# been (and remains) the namespace marker for the brain's source
+# code. Adapter packages and any third-party code that imports
+# ``z4j_brain.*`` keep working unchanged.
+dependencies = [
+    "z4j>=1.4.0,<2",
+]
 
 [project.urls]
 Homepage = "https://z4j.com"
-Source = "https://github.com/z4jdev/z4j-brain"
+Source = "https://github.com/z4jdev/z4j"
 Documentation = "https://z4j.dev"
-Issues = "https://github.com/z4jdev/z4j-brain/issues"
-Changelog = "https://github.com/z4jdev/z4j-brain/blob/main/CHANGELOG.md"
 
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
-# Bundle the built dashboard SPA into BOTH the sdist and the wheel.
-# ``make dash-bundle`` copies ``packages/z4j-brain/dashboard/dist``
-# into ``backend/src/z4j_brain/dashboard/dist`` before build, but
-# ``dist/`` is gitignored repo-wide so hatchling filters it by
-# default. The build-wide ``artifacts`` directive lifts that filter
-# for both the sdist and the wheel, which matters because
-# ``uv build`` goes sdist-first (wheel from extracted sdist) - the
-# dashboard has to survive the sdist for the wheel to see it.
-# Without this, ``pip install z4j-brain`` lands Python code only
-# and ``z4j-brain serve`` 404s on ``/`` because there's no SPA to
-# serve. The brain's main.py has a fallback that looks for the
-# bundled dist next to the installed z4j_brain module.
-[tool.hatch.build]
-artifacts = [
-  "backend/src/z4j_brain/dashboard/**",
-  # Audit fix HIGH-1 (1.2.2 sixth-pass): the drift-guard error
-  # message references audit-canonical-fields.md; ensure it ships
-  # in the wheel so a pip-installed brain that hits the guard can
-  # surface a path that actually exists. Belt-and-suspenders even
-  # though .md files under a packaged dir are normally included.
-  "backend/src/z4j_brain/docs/**",
-  # 1.3.4 - bundled snapshot of every z4j package's latest known
-  # version, generated from sites/_shared/packages.ts via
-  # scripts/gen-versions-json.py. Read at brain startup so the
-  # dashboard's Agents page can render an "update available" badge
-  # without phoning home. Operators can refresh the snapshot from
-  # GitHub on demand via Settings -> Check for updates.
-  "backend/src/z4j_brain/data/**",
-]
-
+# Metadata-only wheel. The actual code ships in z4j (see
+# dependencies above). Hatchling needs at least one path under
+# ``packages`` or it refuses to build, so we ship a tiny marker
+# module under ``z4j_brain_shim`` that does nothing.
 [tool.hatch.build.targets.wheel]
-packages = ["backend/src/z4j_brain"]
+packages = ["src/z4j_brain_shim"]
 
-[tool.hatch.build.targets.wheel.sources]
-"backend/src" = ""
+[tool.hatch.build.targets.sdist]
+include = [
+  "src/z4j_brain_shim",
+  "README.md",
+  "CHANGELOG.md",
+  "LICENSE",
+  "SECURITY.md",
+  "pyproject.toml",
+]

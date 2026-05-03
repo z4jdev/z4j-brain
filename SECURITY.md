@@ -2,7 +2,7 @@
 
 ## Reporting a vulnerability
 
-If you believe you have found a security vulnerability in `z4j-brain`,
+If you believe you have found a security vulnerability in `z4j`,
 **do not open a public GitHub issue**. Email `security@z4j.com` instead.
 
 We follow the [disclose.io](https://disclose.io) baseline:
