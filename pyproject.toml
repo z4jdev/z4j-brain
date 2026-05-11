@@ -1,0 +1,60 @@
+[project]
+name = "z4j-brain"
+version = "1.5.0"
+description = "Compatibility shim. Install z4j instead."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "AGPL-3.0-or-later" }
+authors = [{ name = "z4j contributors" }]
+keywords = ["z4j", "shim", "compatibility"]
+classifiers = [
+    "Development Status :: 7 - Inactive",
+    "License :: OSI Approved :: GNU Affero General Public License v3 or later (AGPLv3+)",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Topic :: System :: Distributed Computing",
+]
+
+# 1.4.0 (the consolidation cut): ``z4j-brain`` is now a metadata-only
+# compatibility shim. The brain server source moved into the ``z4j``
+# distribution. Operators on the legacy install path
+# (``pip install z4j-brain``) get the brain transitively via this
+# dependency, so existing Dockerfiles / requirements.txt / CI
+# scripts keep working.
+#
+# This shim ships at 1.4.0 once and is then frozen. Future versions
+# of the brain land at ``pip install z4j``.
+#
+# The Python import path stays ``import z4j_brain`` -- it has always
+# been (and remains) the namespace marker for the brain's source
+# code. Adapter packages and any third-party code that imports
+# ``z4j_brain.*`` keep working unchanged.
+dependencies = [
+    "z4j>=1.4.0,<2",
+]
+
+[project.urls]
+Homepage = "https://z4j.com"
+Source = "https://github.com/z4jdev/z4j"
+Documentation = "https://z4j.dev"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+# Metadata-only wheel. The actual code ships in z4j (see
+# dependencies above). Hatchling needs at least one path under
+# ``packages`` or it refuses to build, so we ship a tiny marker
+# module under ``z4j_brain_shim`` that does nothing.
+[tool.hatch.build.targets.wheel]
+packages = ["src/z4j_brain_shim"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+  "src/z4j_brain_shim",
+  "README.md",
+  "CHANGELOG.md",
+  "LICENSE",
+  "SECURITY.md",
+  "pyproject.toml",
+]
